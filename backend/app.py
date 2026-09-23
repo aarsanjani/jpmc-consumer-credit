@@ -494,7 +494,7 @@ def eval_reconcile():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5060))
+    port = int(os.environ.get("PORT", 5055))
     log.info("configuration: %s", SETTINGS.redacted())
     log.info("engine: %s", SETTINGS.agent_engine_resource)
     app.run(host="0.0.0.0", port=port, debug=False)
