@@ -69,6 +69,24 @@
                 </div>
             </div>
 
+            <!-- 8-Agent Mesh Interactive Launcher (01..08 wired to KC + MB + BQ Golden Queries) -->
+            <div style="background:rgba(15,23,42,0.88); border:1px solid rgba(168,85,247,0.35); border-radius:8px; padding:8px 10px; margin-bottom:10px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                    <span style="font-size:0.73rem; font-weight:800; color:#c084fc;">🤖 8-AGENT MESH (Click Any Agent to Execute Its Live MB + KC + BQ Golden Query Scope)</span>
+                    <button id="run-governance-adherence-btn" class="btn-primary btn-sm" style="font-size:0.65rem; padding:2px 7px; background:#7c3aed; border-color:#a855f7;">🛡️ Test KC Governance &amp; Ad-Hoc SQL</button>
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px;" id="left-eight-agents-grid">
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="fraud_monitoring_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px;">01 · fraud_monitoring_agent (GQ 03,04 + KC)</button>
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="telephony_ivr_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px;">02 · telephony_ivr_agent (GQ 02 + IVR MB)</button>
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="mobile_app_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px;">03 · mobile_app_agent (GQ 10 + Wallet MB)</button>
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="web_portal_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px;">04 · web_portal_agent (GQ 07,08 + Reg E/Z)</button>
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="branch_support_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px;">05 · branch_support_agent (GQ 01 + SSN Refuse)</button>
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="claim_veracity_validator_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px;">06 · claim_veracity_validator_agent</button>
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="memory_bank_audit_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px;">07 · memory_bank_audit_agent (GQ 11 + Sweep)</button>
+                    <button class="agent-probe-btn btn-secondary btn-sm" data-agent="consumer_credit_synthesizer_agent" style="text-align:left; font-size:0.66rem; padding:4px 6px; border-color:#38bdf8; color:#38bdf8;">08 · consumer_credit_synthesizer_agent (Hub)</button>
+                </div>
+            </div>
+
             <!-- Live Subsystems / Channel Event Cards (Populated dynamically from BigQuery & Memory Bank) -->
             <div class="subsystems-feed" id="subsystems-feed">
                 <div class="system-event-card border-red" id="card-fraud">

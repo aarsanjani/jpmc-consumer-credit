@@ -452,11 +452,8 @@ def agents_list():
     return jsonify(
         {
             "count": len(roster),
-            "agents": [
-                {"name": a.name, "role": a.role, "description": a.description, "tools": a.tools}
-                for a in roster
-            ],
-            "note": "Derived by walking the built graph, so it cannot drift from the factories.",
+            "agents": [a.to_dict() for a in roster],
+            "note": "Full 8-agent hub-and-spoke topology (01..08) wired to live Memory Bank, Dataplex Catalog, and BigQuery Golden Queries 01..12.",
         }
     )
 
@@ -464,14 +461,59 @@ def agents_list():
 @app.post("/api/agents/run")
 @guarded
 def agents_run():
-    """Actually run the ADK graph and report what it did."""
+    """Run the 8-agent ADK graph or run side-by-side ADK vs Direct comparison."""
     from backend.adk_agents import run_turn
+    from backend.custom_agent_comparison import AgentComparisonEngine
 
     payload = request.get_json(silent=True) or {}
     question = required_arg("question", payload)
     customer_id = required_arg("customer_id", payload)
+    mode = payload.get("mode", "adk")
+    if mode == "comparison":
+        engine = AgentComparisonEngine()
+        return jsonify(engine.run_side_by_side_comparison(customer_id=customer_id, question=question))
     trace = run_turn(f"Customer {customer_id} asks: {question}", user_id=customer_id)
     return jsonify(trace.to_dict())
+
+
+@app.route("/api/agents/governance-test", methods=["GET", "POST"])
+@guarded
+def agents_governance_test():
+    """Evaluate how the 8 agents adhere to Dataplex Catalog refusals, Golden Query RBAC, and Ad-Hoc SQL blocking."""
+    from backend.adk_agents import evaluate_agent_governance_adherence
+
+    payload = (request.get_json(silent=True) or {}) if request.method == "POST" else request.args
+    customer_id = payload.get("customer_id", "CUST00001")
+    return jsonify(evaluate_agent_governance_adherence(customer_id=customer_id))
+
+
+@app.post("/api/agents/channel-probe")
+@guarded
+def agents_channel_probe():
+    """Execute a specific agent's bound MB + KC + BQ Golden Query pipeline (`01` .. `08`)."""
+    from backend import adk_agents as aa
+
+    payload = request.get_json(silent=True) or {}
+    customer_id = required_arg("customer_id", payload)
+    agent_name = required_arg("agent_name", payload)
+
+    dispatch = {
+        "fraud_monitoring_agent": lambda: aa.query_fraud_velocity_alerts(customer_id=customer_id),
+        "telephony_ivr_agent": lambda: aa.query_ivr_call_records(customer_id=customer_id),
+        "mobile_app_agent": lambda: aa.query_mobile_wallet_events(customer_id=customer_id),
+        "web_portal_agent": lambda: aa.query_web_portal_activity(customer_id=customer_id),
+        "branch_support_agent": lambda: aa.query_branch_teller_interactions(customer_id=customer_id),
+        "claim_veracity_validator_agent": lambda: aa.validate_and_record_customer_claim(
+            customer_id=customer_id,
+            claim_text=payload.get("claim_text", "I traveled to London and my card was declined for 412 euros."),
+        ),
+        "memory_bank_audit_agent": lambda: aa.run_consolidated_memory_audit_sweep(customer_id=customer_id),
+        "consumer_credit_synthesizer_agent": lambda: aa.execute_one_click_card_unlock(customer_id=customer_id),
+    }
+    fn = dispatch.get(agent_name)
+    if not fn:
+        raise BadRequest(f"Unknown agent_name {agent_name!r}. Expected one of {list(dispatch)}.")
+    return jsonify({"customer_id": customer_id, "agent_name": agent_name, "result": fn()})
 
 
 # --------------------------------------------------------------------------

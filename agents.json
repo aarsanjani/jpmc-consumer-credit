@@ -1,67 +1,127 @@
 {
   "agents": [
     {
-      "name": "orchestrator",
+      "agent_id": "01 · fraud_monitoring_agent",
+      "name": "fraud_monitoring_agent",
       "path": "backend/adk_agents.py",
-      "factory": "create_orchestrator",
-      "role": "root",
-      "description": "Routes a fraud-desk question to the specialist agents, then synthesises their findings. Holds no tools of its own so that every fact in an answer is traceable to a sub-agent's tool call.",
-      "sub_agents": [
-        "memory_context",
-        "data_governance",
-        "warehouse_evidence",
-        "policy_and_vocabulary"
+      "factory": "create_fraud_monitoring_agent",
+      "role": "CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND",
+      "description": "Monitors cross-border velocity anomalies and stolen-card POS attempts using Memory Bank (`TRAVEL_STATUS`, `CARD_LIFECYCLE`), Dataplex Catalog (`catalog_discover_tables` & `catalog_authorize_table` to refuse `authorizations_deprecated_v1` and `cards.pan_full`), and BigQuery Golden Queries 03 & 04.",
+      "tools": [
+        "query_fraud_velocity_alerts",
+        "catalog_discover_tables",
+        "catalog_authorize_table",
+        "catalog_authorize_column",
+        "search_customer_memory"
       ]
     },
     {
-      "name": "memory_context",
+      "agent_id": "02 · telephony_ivr_agent",
+      "name": "telephony_ivr_agent",
       "path": "backend/adk_agents.py",
-      "factory": "create_memory_agent",
-      "role": "sub_agent",
-      "description": "Reads the customer's conversational history from Vertex AI Agent Engine Memory Bank. Read-only: it retrieves and lists, it never generates memories, so an inspection turn cannot mutate the corpus it is inspecting.",
+      "factory": "create_telephony_ivr_agent",
+      "role": "CHANNEL_PRODUCER · TELEPHONY_IVR",
+      "description": "Retrieves inbound call sessions and dropped-2FA recollections from Memory Bank (`AGENT_COMMITMENTS`, `CONTACT_PREFERENCE`) and verifies declined authorizations and call timestamps via BigQuery Golden Query 02 and `contact_history` under Dataplex governance.",
       "tools": [
+        "query_ivr_call_records",
+        "catalog_authorize_table",
+        "catalog_authorize_column",
+        "search_customer_memory"
+      ]
+    },
+    {
+      "agent_id": "03 · mobile_app_agent",
+      "name": "mobile_app_agent",
+      "path": "backend/adk_agents.py",
+      "factory": "create_mobile_app_agent",
+      "role": "CHANNEL_PRODUCER · MOBILE_APP",
+      "description": "Inspects Apple Pay / Google Pay token states and mobile travel check-ins using Memory Bank (`DEVICE_WALLET_INVENTORY`, `TRAVEL_STATUS`), Dataplex Catalog, and BigQuery Golden Query 10 + `travel_notices`.",
+      "tools": [
+        "query_mobile_wallet_events",
+        "catalog_authorize_table",
+        "search_customer_memory"
+      ]
+    },
+    {
+      "agent_id": "04 · web_portal_agent",
+      "name": "web_portal_agent",
+      "path": "backend/adk_agents.py",
+      "factory": "create_web_portal_agent",
+      "role": "CHANNEL_PRODUCER · WEB_PORTAL",
+      "description": "Reconciles online dispute claims (`DISPUTE_HISTORY`) against BigQuery Golden Queries 07, 08, 09 and resolves Regulation E (Debit) vs Regulation Z (Credit) rules from the Dataplex Business Glossary.",
+      "tools": [
+        "query_web_portal_activity",
+        "glossary_lookup",
+        "glossary_search",
+        "catalog_authorize_table",
+        "search_customer_memory"
+      ]
+    },
+    {
+      "agent_id": "05 · branch_support_agent",
+      "name": "branch_support_agent",
+      "path": "backend/adk_agents.py",
+      "factory": "create_branch_support_agent",
+      "role": "CHANNEL_PRODUCER · BRANCH_SUPPORT",
+      "description": "Handles in-person branch verification and standing instructions using Memory Bank (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`), BigQuery Golden Query 01 (`v_customer_360`), and Dataplex column governance (`customers.ssn_last4` REFUSE).",
+      "tools": [
+        "query_branch_teller_interactions",
+        "catalog_authorize_table",
+        "catalog_authorize_column",
         "list_memory_topics",
-        "search_customer_memory",
+        "search_customer_memory"
+      ]
+    },
+    {
+      "agent_id": "06 · claim_veracity_validator_agent",
+      "name": "claim_veracity_validator_agent",
+      "path": "backend/adk_agents.py",
+      "factory": "create_claim_veracity_validator_agent",
+      "role": "PRE_WRITE_VALIDATOR",
+      "description": "Validates customer claims against BigQuery ground truth (`disputed_amounts`, `travel_notices`) before Memory Bank write-back and audits agent adherence to Dataplex Catalog refusals.",
+      "tools": [
+        "validate_and_record_customer_claim",
+        "evaluate_agent_governance_adherence",
+        "catalog_authorize_table",
+        "catalog_authorize_column"
+      ]
+    },
+    {
+      "agent_id": "07 · memory_bank_audit_agent",
+      "name": "memory_bank_audit_agent",
+      "path": "backend/adk_agents.py",
+      "factory": "create_memory_bank_audit_agent",
+      "role": "CONSOLIDATED_AUDITOR",
+      "description": "Sweeps all stored customer memories in Vertex AI Memory Bank against BigQuery ground truth and Golden Query 11 (`dispute_event_timeline`), surfacing travel distractors and euro/dollar amount discrepancies.",
+      "tools": [
+        "run_consolidated_memory_audit_sweep",
         "list_all_customer_memory"
       ]
     },
     {
-      "name": "data_governance",
+      "agent_id": "08 · consumer_credit_synthesizer_agent",
+      "name": "consumer_credit_synthesizer_agent",
       "path": "backend/adk_agents.py",
-      "factory": "create_governance_agent",
-      "role": "sub_agent",
-      "description": "Asks Dataplex Universal Catalog whether a table or column may be read before anything reads it, and discovers sibling tables. Acts on the aspect's agent_behavior field, never on its sensitivity level.",
+      "factory": "create_consumer_credit_synthesizer_agent",
+      "role": "LEAD_SYNTHESIZER",
+      "description": "Hub of the 8-agent mesh. Coordinates the 5 channel producer agents (01..05), the Pre-Write Veracity Validator (06), and the Memory Bank Auditor (07); enforces Dataplex Catalog governance & Glossary definitions; reconciles Memory Bank recollections against BigQuery ground truth; and drives zero-question resolution.",
+      "sub_agents": [
+        "fraud_monitoring_agent",
+        "telephony_ivr_agent",
+        "mobile_app_agent",
+        "web_portal_agent",
+        "branch_support_agent",
+        "claim_veracity_validator_agent",
+        "memory_bank_audit_agent"
+      ],
       "tools": [
-        "catalog_authorize_table",
-        "catalog_authorize_column",
-        "catalog_discover_tables"
-      ]
-    },
-    {
-      "name": "warehouse_evidence",
-      "path": "backend/adk_agents.py",
-      "factory": "create_warehouse_agent",
-      "role": "sub_agent",
-      "description": "Runs named, parameterised golden queries against BigQuery for authoritative figures. Ad-hoc SQL is not reachable from the model, so the query surface is auditable and fixed.",
-      "tools": [
-        "list_warehouse_queries",
-        "run_warehouse_query"
-      ]
-    },
-    {
-      "name": "policy_and_vocabulary",
-      "path": "backend/adk_agents.py",
-      "factory": "create_policy_agent",
-      "role": "sub_agent",
-      "description": "Resolves business vocabulary and regulatory terminology against the Dataplex business glossary rather than relying on the model's priors.",
-      "tools": [
-        "glossary_lookup",
-        "glossary_search"
+        "list_memory_topics",
+        "read_customer_memory_bank",
+        "glossary_search",
+        "run_warehouse_query",
+        "execute_one_click_card_unlock",
+        "evaluate_agent_governance_adherence"
       ]
     }
-  ],
-  "notes": {
-    "topology_source": "backend/adk_agents.py::list_all_agents walks the constructed graph at runtime; this file documents it but is not the source of truth.",
-    "execution": "backend/adk_agents.py::run_turn drives a real ADK Runner. Tool calls reported anywhere in the UI come from the observed RunTrace."
-  }
+  ]
 }
