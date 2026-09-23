@@ -1,14 +1,19 @@
 /**
- * CCB Fraud Desk v2.0 — V1 Black Bar Trace Navigation & Live GCP Testbed Controller
- * Canonical Use Case: CUST00001 (Lauren Morrison / Priya Vantalis — Lisbon Reg E + Reg Z)
+ * CCB Fraud Desk — black-bar trace navigation and live backend wiring.
  *
- * Wired to live backend endpoints:
- *   - GET  /api/testbed?customer_id=CUST00001
+ * Endpoints this file calls (see reports/wiring.md for the full audit):
+ *   - GET  /api/testbed?customer_id=...
  *   - GET  /api/eval-scorecard
  *   - POST /api/chat
- *   - GET  /api/card-oversight?customer_id=CUST00001
+ *   - GET  /api/chat/stream           (EventSource, A2UI frames)
+ *   - GET  /api/card-oversight?customer_id=...
  *   - POST /api/card-oversight/decide
  *   - POST /api/compaction/run
+ *
+ * One rule runs through every render function below: a value the backend did
+ * not send is drawn as the literal string "n/r". Never a zero, never a
+ * remembered default. Nothing on this page is computed client-side to cover a
+ * gap in the response.
  */
 
 (function () {
@@ -19,16 +24,76 @@
   window.__ccbV1TraceBound = true;
 
   const DEFAULT_CUSTOMER_ID = "CUST00001";
+  const NOT_RECORDED = "n/r";
 
   const STATE = {
     customerId: DEFAULT_CUSTOMER_ID,
-    channel: "WEB_CHAT",
+    // Must be a member of backend.models.BankChannel. "WEB_CHAT" was not one,
+    // so every turn silently arrived tagged MOBILE_APP.
+    channel: "WEB_PORTAL",
     replayRunning: false,
     replayTimers: [],
     currentTraceKey: "policy",
     testbedData: null,
     scorecardData: null,
+    stream: null,
   };
+
+  // =========================================================================
+  // 0. PROVENANCE
+  // Backend values arrive as {value, _provenance:{tag, source}}. Both halves
+  // are rendered: a number with no origin is exactly the thing this UI used to
+  // show and nobody could check.
+  // =========================================================================
+  function pvValue(item) {
+    if (item === null || item === undefined) return NOT_RECORDED;
+    if (typeof item === "object" && !Array.isArray(item) && "value" in item) {
+      const v = item.value;
+      return v === null || v === undefined || v === "" ? NOT_RECORDED : v;
+    }
+    return item;
+  }
+
+  function pvTag(item) {
+    if (item && typeof item === "object" && item._provenance && item._provenance.tag) {
+      return String(item._provenance.tag);
+    }
+    return NOT_RECORDED;
+  }
+
+  function pvSource(item) {
+    if (item && typeof item === "object" && item._provenance && item._provenance.source) {
+      return String(item._provenance.source);
+    }
+    return NOT_RECORDED;
+  }
+
+  function pvText(item) {
+    const v = pvValue(item);
+    return v === NOT_RECORDED ? NOT_RECORDED : String(v);
+  }
+
+  /** A value with its origin next to it. The tag is the audit trail. */
+  function pvChip(item) {
+    const tag = pvTag(item);
+    const cls = tag === "LIVE_API" ? "ok" : tag === "STATIC" ? "no" : "on";
+    return (
+      '<span class="tag ' +
+      cls +
+      '" title="' +
+      escapeHtml(pvSource(item)) +
+      '">' +
+      escapeHtml(tag) +
+      "</span>"
+    );
+  }
+
+  /** Writes value + provenance into one element, leaving "n/r" verbatim. */
+  function renderMetric(el, item) {
+    if (!el) return;
+    el.innerHTML = escapeHtml(pvText(item)) + " " + pvChip(item);
+    el.title = pvTag(item) + " · " + pvSource(item);
+  }
 
   // =========================================================================
   // 1. 6-AGENT BLACK BAR TRACE NAVIGATION (AGENTS, buildMenu, headline, readout, pick, renderTrace, openMenu, closeMenu, setTrace)
@@ -662,52 +727,141 @@
   // =========================================================================
   async function loadLiveTestbed(customerId) {
     const cid = customerId || DEFAULT_CUSTOMER_ID;
+    const memListEl = $("liveMemoriesList");
     try {
       const resp = await fetch(`/api/testbed?customer_id=${encodeURIComponent(cid)}`);
-      if (!resp.ok) return;
       const data = await resp.json();
       STATE.testbedData = data;
 
-      const memListEl = $("liveMemoriesList");
-      const memories =
-        (data.vertex_memory_bank && data.vertex_memory_bank.memories) ||
-        data.memories ||
-        [];
-      if (memListEl && memories.length > 0) {
-        const activeMems = memories.slice(0, 3);
-        memListEl.innerHTML = activeMems
-          .map((m) => {
-            const id = escapeHtml(m.memory_id || m.id || "MEM");
-            const fact = escapeHtml(m.fact || m.memory_text || m.text || "");
-            const sup = m.supersedes_memory_id
-              ? ` <em>(supersedes <code>${escapeHtml(m.supersedes_memory_id)}</code>)</em>`
-              : "";
-            return `<div style="margin-bottom:4px;"><code>${id}</code>: ${fact}${sup}</div>`;
-          })
-          .join("");
+      if (!resp.ok) {
+        // A failed upstream call is shown, not hidden behind stale markup.
+        if (memListEl) {
+          memListEl.innerHTML = `<div class="bad">Testbed unavailable — ${escapeHtml(
+            data.error || resp.status
+          )}</div>`;
+        }
+        return;
+      }
+
+      // Backend key is vertex_memory_bank_live_memories, and it is provenance
+      // wrapped. The old reads (vertex_memory_bank.memories / memories) never
+      // matched anything, so this panel was always empty.
+      const block = data.vertex_memory_bank_live_memories;
+      const memories = pvValue(block);
+      if (memListEl) {
+        if (!Array.isArray(memories) || memories.length === 0) {
+          memListEl.innerHTML = `<div><code>${NOT_RECORDED}</code> — no memories in scope ${escapeHtml(
+            cid
+          )} ${pvChip(block)}</div>`;
+        } else {
+          memListEl.innerHTML = memories
+            .slice(0, 3)
+            .map((m) => {
+              const id = escapeHtml(m.memory_id || NOT_RECORDED);
+              const fact = escapeHtml(m.fact || NOT_RECORDED);
+              const when = escapeHtml(m.update_time || NOT_RECORDED);
+              return `<div style="margin-bottom:4px;"><code>${id}</code>: ${fact} <small>${when}</small></div>`;
+            })
+            .join("") + `<div style="margin-top:6px;">${pvChip(block)}</div>`;
+        }
       }
     } catch (err) {
-      console.warn("Testbed fetch notice:", err);
+      console.error("Testbed fetch failed:", err);
+      if (memListEl) {
+        memListEl.innerHTML = `<div class="bad">Testbed fetch failed — ${escapeHtml(
+          err.message
+        )}</div>`;
+      }
     }
   }
 
+  /** Finds one metric row inside a scorecard layer by its id. */
+  function metricById(layer, id) {
+    const rows = (layer && layer.metrics) || [];
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].id === id) return rows[i];
+    }
+    return null;
+  }
+
   async function loadEvalScorecard() {
+    const fineEl = $("scoreFineNote");
     try {
       const resp = await fetch("/api/eval-scorecard");
-      if (!resp.ok) return;
       const data = await resp.json();
       STATE.scorecardData = data;
 
-      if ($("scoreLeakage") && data.memory_layer) {
-        $("scoreLeakage").textContent = String(data.memory_layer.cross_scope_leakage ?? 0);
+      if (!resp.ok) {
+        if (fineEl) {
+          fineEl.innerHTML = `Scorecard unavailable — ${escapeHtml(data.error || resp.status)}`;
+        }
+        return;
       }
-      if ($("scoreContradictions") && data.memory_layer) {
-        $("scoreContradictions").textContent =
-          data.memory_layer.contradiction_handling || "10/10";
+
+      // Every row reads {value, _provenance}. A metric the harness did not
+      // record arrives as "n/r" and is drawn as "n/r" — never as 0, and never
+      // recomputed here to make the row look populated.
+      const l1 = data.layer_1_memory || {};
+      const leakage = metricById(l1, "cross_scope_leakage");
+      const contradiction = metricById(l1, "staleness_penalty");
+      const recall = metricById(l1, "recall_at_k");
+
+      renderMetric($("scoreLeakage"), leakage && leakage.display);
+      renderMetric($("scoreContradictions"), contradiction && contradiction.display);
+      renderMetric($("scoreRecall"), recall && recall.display);
+
+      const fill = $("scoreRecallFill");
+      if (fill) {
+        const width = recall ? pvValue(recall.width_pct) : NOT_RECORDED;
+        // No bar at all when there is no measurement. A 0%-wide bar reads as a
+        // score of zero, which is a different claim from "not measured".
+        fill.style.width = typeof width === "number" ? `${width}%` : "0%";
+        fill.style.opacity = typeof width === "number" ? "1" : "0.25";
       }
+      const recallRow = $("scoreRecallRow");
+      if (recallRow && recall) {
+        const measured = pvValue(recall.width_pct) !== NOT_RECORDED;
+        recallRow.classList.toggle("skip", !measured);
+      }
+
+      if (fineEl) {
+        const srcOn = (data.sources && data.sources.memory_on) || {};
+        const err = srcOn.error && srcOn.error !== NOT_RECORDED ? ` — ${escapeHtml(srcOn.error)}` : "";
+        fineEl.innerHTML =
+          `Every figure above carries the tag of where it came from. Source: <code>${escapeHtml(
+            srcOn.file || NOT_RECORDED
+          )}</code>${err}. Anything reading <code>${NOT_RECORDED}</code> was not measured, ` +
+          `which is not the same as scoring zero.`;
+      }
+
+      renderAbComparison(data.ab_comparison);
     } catch (err) {
-      console.warn("Scorecard fetch notice:", err);
+      console.error("Scorecard fetch failed:", err);
+      if (fineEl) {
+        fineEl.innerHTML = `Scorecard fetch failed — ${escapeHtml(err.message)}`;
+      }
     }
+  }
+
+  function renderAbComparison(ab) {
+    if (!ab) return;
+    const rows = [
+      ["Tokens / session", ab.memory_off_tokens_per_session, ab.memory_on_tokens_per_session],
+      ["Questions re-asked", ab.questions_reasked_off, ab.questions_reasked_on],
+    ];
+    const draw = (el, index) => {
+      if (!el) return;
+      el.innerHTML = rows
+        .map(
+          (r) =>
+            `<div class="kv"><span>${escapeHtml(r[0])}</span><b>${escapeHtml(
+              pvText(r[index])
+            )}</b> ${pvChip(r[index])}</div>`
+        )
+        .join("");
+    };
+    draw($("abCardOff"), 1);
+    draw($("abCardOn"), 2);
   }
 
   // =========================================================================
@@ -718,7 +872,7 @@
     if (!query) return;
 
     const customerId = DEFAULT_CUSTOMER_ID;
-    const channel = STATE.channel || "WEB_CHAT";
+    const channel = STATE.channel || "WEB_PORTAL";
 
     const askBtn = $("btnAskSend");
     if (askBtn) {
@@ -727,7 +881,10 @@
     }
 
     openOpsDrawer();
-    openTrace("1", "policy");
+    // Was openTrace("1","policy") — a function that does not exist anywhere in
+    // this bundle. It threw a ReferenceError here, so the /api/chat fetch below
+    // never ran and the console appeared to hang on every single question.
+    setTrace(true);
     setStampText("Run 0412 · WORKING");
 
     if ($("askAnswerTitle")) {
@@ -739,7 +896,11 @@
     }
     if ($("askAnswerBody")) {
       $("askAnswerBody").innerHTML =
-        "Querying BigQuery golden queries (<code>jpmc_ccb_fraud</code>), Dataplex glossary <code>ccb-fraud-disputes</code>, and Vertex AI Memory Bank <code>4277754991222980608</code>...";
+        "Querying BigQuery golden queries, the Dataplex glossary, and Vertex AI " +
+        "Memory Bank...";
+      // The engine id, dataset and glossary are deployment config. The page used
+      // to print one project's literals here, which read as status but was just
+      // a string. /api/session returns the live status if they need showing.
     }
 
     try {
@@ -754,7 +915,20 @@
       });
 
       const data = await resp.json();
-      const replyHtml = formatAgentReply(data.response || data.reply || "No response returned.");
+
+      if (!resp.ok) {
+        // 502 and 503 carry the real upstream reason. Show it.
+        if ($("askAnswerTag")) {
+          $("askAnswerTag").className = "tag no";
+          $("askAnswerTag").textContent = String(data.status || resp.status);
+        }
+        if ($("askAnswerBody")) {
+          $("askAnswerBody").innerHTML = `<span style="color:var(--bad);">${escapeHtml(
+            data.error || "Request failed"
+          )}</span>${data.needs ? ` <small>(needs ${escapeHtml(data.needs)})</small>` : ""}`;
+        }
+        return;
+      }
 
       if ($("askAnswerTitle")) {
         $("askAnswerTitle").textContent = `Governed response · ${customerId}`;
@@ -764,28 +938,38 @@
         $("askAnswerTag").textContent = "CATALOG + MEMORY";
       }
       if ($("askAnswerBody")) {
-        $("askAnswerBody").innerHTML = replyHtml;
+        // The narrative is streamed, not returned by /api/chat. This route's
+        // agent_resolution says so and carries its own provenance.
+        const resolution = data.agent_resolution;
+        $("askAnswerBody").innerHTML =
+          pvValue(resolution) === NOT_RECORDED
+            ? `<code>${NOT_RECORDED}</code> — narrative arrives on <code>/api/chat/stream</code>. ${pvChip(
+                resolution
+              )}`
+            : formatAgentReply(pvText(resolution));
       }
 
-      const tools = data.tool_sequence || [
-        "freeze_card",
-        "revoke_wallet_token",
-        "issue_virtual_card",
-        "order_replacement_card",
-      ];
+      // Backend key is tool_trajectory. The old read of data.tool_sequence
+      // never matched, so the UI drew a hardcoded four-tool list on every
+      // answer whether or not the desk had said anything about tools.
+      const steps = Array.isArray(data.tool_trajectory) ? data.tool_trajectory : [];
       if ($("askToolTags")) {
-        $("askToolTags").innerHTML = tools
-          .map(
-            (t, idx) =>
-              `<span class="tag ${idx === tools.length - 1 ? "on" : "ok"}">${idx + 1}. ${escapeHtml(
-                t
-              )}</span>`
-          )
-          .join("");
+        $("askToolTags").innerHTML = steps.length
+          ? steps
+              .map(
+                (s, idx) =>
+                  `<span class="tag ${idx === steps.length - 1 ? "on" : "ok"}" title="status ${escapeHtml(
+                    pvText(s.status)
+                  )} · ${escapeHtml(pvSource(s.tool))}">${idx + 1}. ${escapeHtml(
+                    pvText(s.tool)
+                  )} · ${escapeHtml(pvText(s.status))}</span>`
+              )
+              .join("")
+          : `<span class="tag">${NOT_RECORDED}</span>`;
       }
 
-      renderVeracityAudit(data.veracity_audit || data.claim_veracity_audit);
-      setStampText("Run 0412 · 6.3s");
+      renderVeracityAudit(data.veracity_evaluation);
+      subscribeToSynthesisStream(customerId, query);
     } catch (err) {
       if ($("askAnswerBody")) {
         $("askAnswerBody").innerHTML = `<span style="color:var(--bad);">Error communicating with desk: ${escapeHtml(
@@ -810,38 +994,163 @@
   }
 
   function renderVeracityAudit(audit) {
-    if (!audit) return;
-    const status = audit.veracity_status || "VERIFIED_TRUE";
-    const confPct =
-      audit.confidence_score != null
-        ? `${Math.round(
-            Number(audit.confidence_score) * (Number(audit.confidence_score) <= 1 ? 100 : 1)
-          )}%`
-        : "98%";
-
     const tagEl = $("veracityStatusTag") || $("veracityStatusBadge");
-    if (tagEl) {
-      const isContradicted = status.includes("CONTRADICTED") || status.includes("FALSE");
-      tagEl.className = `tag ${isContradicted ? "no" : "ok"}`;
-      tagEl.textContent = `${status} · ${confPct}`;
+    const outEl = $("veracityAuditOutput");
+    if (!audit) {
+      if (tagEl) {
+        tagEl.className = "tag";
+        tagEl.textContent = NOT_RECORDED;
+      }
+      if (outEl) outEl.innerHTML = `<div><code>${NOT_RECORDED}</code> — no audit returned.</div>`;
+      return;
     }
 
-    const avenues = audit.relevant_avenues_checked || audit.avenues_checked || [];
-    const outEl = $("veracityAuditOutput");
-    if (outEl && avenues.length > 0) {
-      outEl.innerHTML = avenues
-        .map((av, i) => {
-          const name = escapeHtml(av.avenue || av.name || `Avenue 0${i + 1}`);
-          const finding = escapeHtml(av.finding || av.evidence || av.result || "");
-          const why = av.why_relevant ? ` <em>(${escapeHtml(av.why_relevant)})</em>` : "";
-          const badgeColor = String(av.status || "").toUpperCase().includes("CONTRADICT")
-            ? "var(--bad)"
-            : "var(--good)";
-          return `<div style="margin-bottom:5px;"><b>${i + 1}. ${name}:</b> <span style="color:${badgeColor};font-weight:700;">${escapeHtml(
-            av.status || "CHECKED"
-          )}</span> — ${finding}${why}</div>`;
-        })
-        .join("");
+    // Status and confidence are the validator's. Neither is defaulted here:
+    // the old code fell back to VERIFIED_TRUE and 98%, which meant a broken
+    // validator rendered as a confident pass.
+    const status = pvText(audit.veracity_status);
+    const rawConf = pvValue(audit.confidence_score);
+    const confText =
+      typeof rawConf === "number"
+        ? `${Math.round(rawConf * (rawConf <= 1 ? 100 : 1))}%`
+        : NOT_RECORDED;
+
+    if (tagEl) {
+      const isContradicted = status.includes("CONTRADICTED") || status.includes("FALSE");
+      const unknown = status === NOT_RECORDED;
+      tagEl.className = `tag ${unknown ? "" : isContradicted ? "no" : "ok"}`;
+      tagEl.textContent = `${status} · ${confText}`;
+      tagEl.title = `${pvTag(audit.veracity_status)} · ${pvSource(audit.veracity_status)}`;
+    }
+
+    // Backend keys are relevant_avenues_checked / avenue_title / finding_summary.
+    // The old reads (av.avenue, av.finding, av.status) matched none of them, so
+    // every avenue rendered as a blank line labelled CHECKED.
+    const avenues = audit.relevant_avenues_checked || [];
+    if (!outEl) return;
+
+    if (!avenues.length) {
+      const why = audit.error && audit.error !== NOT_RECORDED ? ` — ${escapeHtml(audit.error)}` : "";
+      outEl.innerHTML = `<div><code>${NOT_RECORDED}</code> — no avenue was probed${why}.</div>`;
+      return;
+    }
+
+    outEl.innerHTML = avenues
+      .map((av, i) => {
+        const title = escapeHtml(av.avenue_title || av.avenue_id || `Avenue 0${i + 1}`);
+        const finding = escapeHtml(pvText(av.finding_summary));
+        const rows = escapeHtml(pvText(av.row_count));
+        const why = av.why_relevant ? ` <em>(${escapeHtml(av.why_relevant)})</em>` : "";
+        const err = av.error ? ` <span style="color:var(--bad);">${escapeHtml(av.error)}</span>` : "";
+        return (
+          `<div style="margin-bottom:6px;"><b>${i + 1}. ${title}</b> ` +
+          pvChip(av.finding_summary) +
+          `<div>rows <b>${rows}</b> — ${finding}${why}${err}</div></div>`
+        );
+      })
+      .join("");
+  }
+
+  // =========================================================================
+  // 4b. A2UI SYNTHESIS STREAM (/api/chat/stream)
+  // The backend has always served these frames and nothing subscribed, so the
+  // zero-question causal synthesis never reached the page.
+  // Frames: onAgentThought, onMemoryBankAccess, onAgentSynthesis,
+  //         onUiComponentDelivery.
+  // =========================================================================
+  function appendStreamLine(text, kind) {
+    const list = $("eventStreamList");
+    if (!list) return;
+    const li = document.createElement("li");
+    li.className = kind || "";
+    li.innerHTML = text;
+    list.appendChild(li);
+  }
+
+  function subscribeToSynthesisStream(customerId, prompt) {
+    if (typeof EventSource === "undefined") return;
+    if (STATE.stream) {
+      STATE.stream.close();
+      STATE.stream = null;
+    }
+    const list = $("eventStreamList");
+    if (list) list.innerHTML = "";
+
+    const url =
+      "/api/chat/stream?customer_id=" +
+      encodeURIComponent(customerId) +
+      "&prompt=" +
+      encodeURIComponent(prompt);
+    const source = new EventSource(url);
+    STATE.stream = source;
+
+    source.onmessage = (event) => {
+      let frame;
+      try {
+        frame = JSON.parse(event.data);
+      } catch (err) {
+        appendStreamLine(`<b>malformed frame</b> — ${escapeHtml(event.data)}`, "bad");
+        return;
+      }
+      const method = frame.method || NOT_RECORDED;
+      const params = frame.params || {};
+
+      if (method === "onAgentThought") {
+        appendStreamLine(
+          `<b>${escapeHtml(pvText(params.author))}</b> — ${escapeHtml(params.message || NOT_RECORDED)}`
+        );
+      } else if (method === "onMemoryBankAccess") {
+        appendStreamLine(
+          `<b>memory</b> — ${escapeHtml(pvText(params.memory_count))} memory(ies) ${pvChip(
+            params.memories
+          )}`
+        );
+      } else if (method === "onAgentSynthesis") {
+        const narrative = params.narrative;
+        appendStreamLine(`<b>synthesis</b> ${pvChip(narrative)}`);
+        if ($("askAnswerBody")) {
+          $("askAnswerBody").innerHTML =
+            pvValue(narrative) === NOT_RECORDED
+              ? `<code>${NOT_RECORDED}</code> — the model returned no narrative. ${pvChip(narrative)}`
+              : formatAgentReply(pvText(narrative));
+        }
+      } else if (method === "onUiComponentDelivery") {
+        renderSynthesisCard(params.payload);
+        appendStreamLine("<b>a2ui</b> — synthesis card delivered");
+        source.close();
+        STATE.stream = null;
+        setStampText("Run 0412 · stream complete");
+      }
+    };
+
+    source.onerror = () => {
+      appendStreamLine("<b>stream closed</b>", "bad");
+      source.close();
+      STATE.stream = null;
+    };
+  }
+
+  function renderSynthesisCard(card) {
+    if (!card) return;
+    if ($("caseCard1Title")) {
+      $("caseCard1Title").textContent = card.title || NOT_RECORDED;
+    }
+    if ($("caseCard1Sub")) {
+      $("caseCard1Sub").innerHTML =
+        `${escapeHtml(pvText(card.memory_count))} memory(ies) · confidence ` +
+        `${escapeHtml(pvText(card.confidence_score))} ${pvChip(card.confidence_score)}`;
+    }
+    if ($("caseCard1Kv")) {
+      const timeline = Array.isArray(card.timeline) ? card.timeline : [];
+      $("caseCard1Kv").innerHTML = timeline.length
+        ? timeline
+            .map(
+              (t) =>
+                `<div class="kv"><span>${escapeHtml(t.timestamp || NOT_RECORDED)}</span>` +
+                `<b>${escapeHtml(t.title || NOT_RECORDED)}</b></div>`
+            )
+            .join("")
+        : `<div class="kv"><span>${NOT_RECORDED}</span><b>no causal steps</b></div>`;
     }
   }
 
@@ -852,27 +1161,57 @@
     const cid = customerId || DEFAULT_CUSTOMER_ID;
     try {
       const resp = await fetch(`/api/card-oversight?customer_id=${encodeURIComponent(cid)}`);
-      if (!resp.ok) return;
       const data = await resp.json();
+      if (!resp.ok) {
+        const badge = $("oversightCardStatusBadge");
+        if (badge) {
+          badge.className = "tag no";
+          badge.textContent = String(data.status || resp.status);
+        }
+        const summary = $("oversightVerificationSummary");
+        if (summary) summary.textContent = data.error || `HTTP ${resp.status}`;
+        return;
+      }
       updateOversightUI(data);
     } catch (err) {
-      console.warn("Oversight fetch notice:", err);
+      console.error("Oversight fetch failed:", err);
     }
   }
 
   function updateOversightUI(data) {
-    if (!data) return;
     const badge = $("oversightCardStatusBadge");
     const summary = $("oversightVerificationSummary");
-    const stateStr = String(data.card_status || data.status || "RESTRICTED").toUpperCase();
+    if (!data) return;
 
+    // Only card_status is emitted. Falling back to "RESTRICTED" made a missing
+    // field look like a locked card, which is a claim about the account.
+    const stateStr = data.card_status ? String(data.card_status).toUpperCase() : NOT_RECORDED;
     if (badge) {
-      const isUnlocked = stateStr.includes("UNLOCK") || stateStr.includes("ACTIVE");
-      badge.className = `tag ${isUnlocked ? "ok" : "on"}`;
-      badge.textContent = isUnlocked ? "UNLOCKED · ACTIVE" : "RESTRICTED";
+      if (stateStr === NOT_RECORDED) {
+        badge.className = "tag";
+        badge.textContent = NOT_RECORDED;
+      } else {
+        const isUnlocked = stateStr.includes("UNLOCK") || stateStr.includes("ACTIVE");
+        badge.className = `tag ${isUnlocked ? "ok" : "on"}`;
+        badge.textContent = isUnlocked ? "UNLOCKED · ACTIVE" : "RESTRICTED";
+      }
     }
-    if (summary && data.summary) {
-      summary.textContent = data.summary;
+
+    // Backend key is admin_review_case, not summary.
+    const c = data.admin_review_case;
+    if (summary) {
+      if (!c) {
+        summary.textContent = NOT_RECORDED;
+      } else {
+        const score = c.confidence_score === null || c.confidence_score === undefined
+          ? NOT_RECORDED
+          : c.confidence_score;
+        summary.textContent =
+          `${c.flagged_transaction || NOT_RECORDED} (${c.flagged_amount || NOT_RECORDED}) · ` +
+          `confidence ${score} · ` +
+          `${c.verification_passed ? "verification passed" : "verification not passed"} · ` +
+          `recommends ${c.recommended_admin_decision || NOT_RECORDED}`;
+      }
     }
   }
 
@@ -884,8 +1223,8 @@
 
     const notes =
       decision === "APPROVE_UNLOCK"
-        ? "Supervisor verified FaceID + travel notice TRV00001 / MEM00015; approved virtual card & POS unlock."
-        : "Supervisor maintained restriction on stolen Lisbon plastic CARD00004 & CARD00002.";
+        ? "Supervisor approved the unlock from the oversight card."
+        : "Supervisor kept the restriction in place from the oversight card.";
 
     try {
       const resp = await fetch("/api/card-oversight/decide", {
@@ -894,14 +1233,25 @@
         body: JSON.stringify({
           customer_id: DEFAULT_CUSTOMER_ID,
           decision: decision,
-          supervisor_notes: notes,
+          // The route reads admin_notes or reason. "supervisor_notes" was read
+          // by nothing, so the supervisor's reason never reached the case file.
+          admin_notes: notes,
         }),
       });
       const data = await resp.json();
+      if (!resp.ok) {
+        const badge = $("oversightCardStatusBadge");
+        if (badge) {
+          badge.className = "tag no";
+          badge.textContent = String(data.status || resp.status);
+        }
+        console.error("Card oversight decision failed:", data);
+        return;
+      }
       updateOversightUI(data);
       setStampText("Run 0412 · SUPERVISOR LOGGED");
     } catch (err) {
-      console.warn("Card oversight decision error:", err);
+      console.error("Card oversight decision error:", err);
     } finally {
       if (btnUnlock) btnUnlock.disabled = false;
       if (btnRestrict) btnRestrict.disabled = false;
@@ -912,7 +1262,7 @@
     const btn = $("btnRunCompaction");
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Compacting sessions...";
+      btn.textContent = "Triggering consolidation...";
     }
 
     try {
@@ -922,13 +1272,27 @@
         body: JSON.stringify({ customer_id: DEFAULT_CUSTOMER_ID }),
       });
       const data = await resp.json();
-      const pct = data.token_reduction_pct || "68.8%";
+
+      if (!resp.ok) {
+        if (btn) btn.textContent = `✗ ${data.status || resp.status}`;
+        console.error("Compaction failed:", data);
+        return;
+      }
+
+      // Consolidation runs inside Memory Bank. It does not report a token count,
+      // so the button shows "n/r" rather than the 68.8% this used to invent on
+      // every click, success or failure.
+      const report = data.compaction_report || {};
+      const pct = pvText(report.token_reduction_pct);
+      const before = pvText(report.memories_in_scope_before);
       if (btn) {
-        btn.textContent = `✓ Compacted (${pct} saved)`;
+        btn.textContent = `Consolidation requested · ${before} in scope · saved ${pct}`;
+        btn.title = `${pvTag(report.token_reduction_pct)} · ${pvSource(report.token_reduction_pct)}`;
       }
       await loadLiveTestbed(DEFAULT_CUSTOMER_ID);
     } catch (err) {
-      if (btn) btn.textContent = "▶ Run compaction (68.8% saved)";
+      console.error("Compaction error:", err);
+      if (btn) btn.textContent = `✗ ${err.message}`;
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -937,6 +1301,65 @@
   // =========================================================================
   // INITIALIZATION & EVENT LISTENERS
   // =========================================================================
+  // =========================================================================
+  // Deployment identity (/api/session)
+  //
+  // The engine id, dataset and glossary used to be literals in index.html, so
+  // the page displayed one project's ids no matter which project the backend
+  // was talking to -- and displayed them just as confidently when the backend
+  // was unreachable. They are read from the API now, and a failed read says
+  // so instead of leaving the stale value on screen.
+  // =========================================================================
+  async function loadDeploymentIdentity(customerId) {
+    const cid = customerId || DEFAULT_CUSTOMER_ID;
+    const set = (id, text, title) => {
+      const el = $(id);
+      if (!el) return;
+      el.textContent = text;
+      if (title) el.title = title;
+    };
+
+    try {
+      const resp = await fetch(`/api/session?customer_id=${encodeURIComponent(cid)}`);
+      const data = await resp.json();
+      if (!resp.ok) {
+        set("engineIdTag", "engine: unavailable", String(data.error || resp.status));
+        return;
+      }
+
+      const engine = pvText(data.agent_engine_id);
+      const project = pvText(data.project_id);
+      const dataset = pvText(data.dataset);
+      const glossary = pvText(data.glossary);
+      const mbStatus = pvText(data.memory_bank_status);
+      const sessions = pvText(data.open_session_count);
+
+      const online = String(mbStatus).startsWith("ONLINE");
+      const tagEl = $("engineIdTag");
+      if (tagEl) tagEl.className = online ? "tag ok" : "tag no";
+      set(
+        "engineIdTag",
+        online ? engine : `${engine} · ${mbStatus}`,
+        `projects/${project}/locations/*/reasoningEngines/${engine}\n${pvTag(
+          data.memory_bank_status
+        )} · ${pvSource(data.memory_bank_status)}`
+      );
+
+      set("noteEngine", engine);
+      set("noteDataset", dataset);
+      set("noteGlossary", glossary);
+      set(
+        "noteCounts",
+        `${sessions} session(s) on the engine, ${pvText(
+          data.knowledge_catalog_status
+        )} catalog`,
+        pvSource(data.open_session_count)
+      );
+    } catch (err) {
+      set("engineIdTag", "engine: unreachable", err.message);
+    }
+  }
+
   function init() {
     ensureLiveBarDom();
 
@@ -1092,13 +1515,14 @@
       btnRestrict.addEventListener("click", () => submitCardDecision("KEEP_RESTRICTED"));
     }
 
-    // 8. Memory Bank Compaction (#btnRunCompaction)
+        // 8. Memory Bank Compaction (#btnRunCompaction)
     const btnCompaction = $("btnRunCompaction");
     if (btnCompaction) {
       btnCompaction.addEventListener("click", runMemoryCompaction);
     }
 
     // Initial background data hydration for canonical CUST00001
+    loadDeploymentIdentity(DEFAULT_CUSTOMER_ID);
     loadEvalScorecard();
     loadLiveTestbed(DEFAULT_CUSTOMER_ID);
     loadCardOversight(DEFAULT_CUSTOMER_ID);

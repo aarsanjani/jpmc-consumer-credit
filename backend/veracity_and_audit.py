@@ -1,41 +1,64 @@
-"""
-Pre-Write Claim Veracity Validator Agent & Consolidated Memory Bank Audit Agent.
-Implements:
-1. Multi-Avenue Pre-Write Veracity Validation Layer: Dynamically validates customer claims against
-   authoritative ground-truth banking APIs (Live Account Statement, Travel Notice Registry,
-   Behavioral Baseline, Multi-Step SMS Y/N Consent Audit, and Knowledge Catalog Policies) using
-   live Vertex AI Gemini 2.5 Flash structured output (zero hardcoded string-matching).
-2. Consolidated Sweep Audit Agent: Audits Memory Banks across all customers for anomalies,
-   contradictions, and false claims using Vertex AI structured reasoning.
-Reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank
+"""Agents 6 and 7: pre-write claim veracity validation, and the Memory Bank audit sweep.
+
+Memory Bank arbitrates recency, not truth. Whichever fragment was written last
+wins, so an unchallenged false claim becomes the customer's history. Agent 6
+stands in front of the write: it asks the Knowledge Catalog what it may read,
+reads only that, cross-checks the claim against BigQuery, and lets Gemini reach
+a verdict on evidence it can name. Agent 7 sweeps what is already stored and
+re-checks every amount, deadline and dispute id against BigQuery, because a
+memory is a record of what somebody said, never the source of a number.
+
+Three rules this file will not bend:
+
+  * Nothing is invented. If BigQuery, Dataplex or Gemini does not answer, the
+    call raises. A demo that looks healthy while broken is worse than one that
+    stops.
+  * Anything not measured renders as the literal string "n/r" -- never a zero,
+    a default, or a plausible-looking id.
+  * The catalog advises; it does not enforce. Dataplex supplies the basis on
+    which this agent declines a table or a column. The decline is the control,
+    and it is recorded so a reviewer can check the agent honoured what it read.
 """
 
 import json
-import os
-import uuid
 import logging
+import os
+import re
+import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import certifi
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from google import genai
 from google.genai import types
+
 from backend.models import (
-    BankChannel,
-    SeverityLevel,
-    VeracityStatus,
-    RelevantAvenueCheck,
-    ClaimVeracityEvaluation,
-    MemoryFragment,
     AuditAnomaly,
     AuditReport,
-    VerificationCheckItem,
     AdminCardReviewCase,
+    BankChannel,
+    ClaimVeracityEvaluation,
+    MemoryFragment,
+    RelevantAvenueCheck,
+    SeverityLevel,
+    VeracityStatus,
+    VerificationCheckItem,
 )
-from backend.memory_bank import CustomerMemoryBank, GroundTruthTelemetryStore
-from backend.knowledge_catalog import KnowledgeCatalog
+from backend.knowledge_catalog import CatalogGovernor, create_default_catalog_governor
+from backend.memory_bank import MemoryBankClient, create_default_memory_bank_client
+from backend.provenance import (
+    NOT_RECORDED,
+    computed,
+    env_param,
+    identity,
+    live,
+    seeded,
+    unmeasured,
+    value_of,
+)
 
 load_dotenv()
 
@@ -47,31 +70,265 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
 )
 
+LOG = logging.getLogger(__name__)
+
+
+class VeracityServiceError(RuntimeError):
+    """A dependency did not answer, so there is no verdict to give.
+
+    Raised instead of returning a default. Callers surface it; nothing in this
+    file catches it to substitute a guess.
+    """
+
+
+# ----------------------------------------------------------------------------
+# Deployment parameters. Ids live in the environment, never in the source.
+# ----------------------------------------------------------------------------
+
+def _project_id(explicit: Optional[str] = None) -> str:
+    return explicit or env_param("GOOGLE_CLOUD_PROJECT") or NOT_RECORDED
+
+
+def _location(explicit: Optional[str] = None) -> str:
+    return explicit or env_param("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+
+def _dataset(explicit: Optional[str] = None) -> str:
+    return explicit or env_param("BQ_DATASET", "jpmc_ccb_fraud")
+
+
+def _model_name(explicit: Optional[str] = None) -> str:
+    return explicit or env_param("VERACITY_MODEL", "gemini-2.5-flash")
+
+
+# ----------------------------------------------------------------------------
+# The golden-query layer, imported late.
+# ----------------------------------------------------------------------------
+# backend.adk_agents imports this module at import time, so a module-level
+# import back into it is a cycle. Resolving it per call also means a run picks
+# up contracts added to the registry after this file was written.
+
+def _adk():
+    from backend import adk_agents  # noqa: WPS433 - deliberate late import
+
+    return adk_agents
+
+
+def _golden_contracts() -> Dict[str, Any]:
+    return getattr(_adk(), "GOLDEN_QUERY_CONTRACTS", {})
+
+
+def _contract_for_table(table: str) -> Optional[Any]:
+    """The first registered golden contract whose primary table is `table`.
+
+    Resolved from the registry rather than hardcoded, so a contract the query
+    owner adds later is picked up without editing this file.
+    """
+    for contract in _golden_contracts().values():
+        tables = list(getattr(contract, "governed_tables", []) or [])
+        if tables and tables[0] == table:
+            return contract
+    return None
+
+
+def _rows_or_raise(result: Any, label: str) -> List[Dict[str, Any]]:
+    """Unpacks a golden-query result, refusing the layer's swallowed-error row.
+
+    execute_golden_query_contract catches BigQuery failures and returns a single
+    row shaped {"note": "BigQuery execution note: ..."}. Passing that on as data
+    is precisely the fake-healthy outcome this rework removes.
+    """
+    if not isinstance(result, dict):
+        raise VeracityServiceError("%s returned %s, not a result dict." % (label, type(result).__name__))
+
+    if result.get("allowed") is False:
+        raise VeracityServiceError(
+            "%s was refused by the golden-query contract: %s" % (label, result.get("error", NOT_RECORDED))
+        )
+
+    rows = result.get("rows")
+    if rows is None:
+        raise VeracityServiceError("%s returned no rows key; the contract layer did not execute." % label)
+
+    for row in rows:
+        if isinstance(row, dict) and set(row.keys()) <= {"note", "error"}:
+            raise VeracityServiceError(
+                "%s did not reach BigQuery: %s" % (label, row.get("note") or row.get("error"))
+            )
+    return list(rows)
+
+
+def _query_source(query_id: str, table: str) -> str:
+    return "bigquery:%s#golden_%s" % (table, query_id)
+
+
+# ----------------------------------------------------------------------------
+# Catalog authorization
+# ----------------------------------------------------------------------------
+
+# Columns the validator probes before every run. It does not know which are
+# restricted -- the catalog's agent_behavior aspect decides, and the agent
+# obeys whatever comes back.
+RESTRICTED_COLUMN_PROBES: Tuple[Tuple[str, str], ...] = (
+    ("customers", "ssn_last4"),
+    ("cards", "pan_full"),
+    ("cards", "pan_masked"),
+)
+
+# Each avenue offers the catalog a set of candidate tables. The deprecated
+# sibling is offered alongside the live one on purpose: the code does not know
+# which is fit to read until the lifecycle-status aspect answers.
+AVENUE_SPECS: Tuple[Dict[str, Any], ...] = (
+    {
+        "avenue_id": "AVENUE_TRAVEL_GEO",
+        "avenue_title": "Travel notice & geo verification",
+        "candidate_tables": ("travel_notices",),
+        "scope": "customer",
+    },
+    {
+        "avenue_id": "AVENUE_AUTH_LEDGER",
+        "avenue_title": "Card authorization ledger",
+        "candidate_tables": ("authorizations", "authorizations_deprecated_v1"),
+        "scope": "card",
+    },
+    {
+        "avenue_id": "AVENUE_CONTACT_HISTORY",
+        "avenue_title": "IVR & contact history",
+        "candidate_tables": ("contact_events",),
+        "scope": "customer",
+    },
+    {
+        "avenue_id": "AVENUE_WALLET_TOKENS",
+        "avenue_title": "Digital wallet tokenization",
+        "candidate_tables": ("wallet_tokens",),
+        "scope": "card",
+    },
+)
+
+CATALOG_ADVISORY_NOTE = (
+    "Dataplex advises; it does not enforce. The catalog supplied the basis and "
+    "the agent's decision to decline is the control being demonstrated."
+)
+
+
+def _entry_source(governor: CatalogGovernor, table: str, dataset: Optional[str]) -> str:
+    """The Dataplex entry this decision was read from, for the provenance tag."""
+    try:
+        return "dataplex:entries.lookup:%s" % governor.client.bigquery_entry_name(table, dataset)
+    except Exception:  # the client refuses to name an entry without a dataset
+        return "dataplex:entries.lookup:%s" % table
+
+
+def _authorization_record(
+    governor: CatalogGovernor,
+    avenue_id: str,
+    table: str,
+    dataset: Optional[str],
+) -> Dict[str, Any]:
+    """Asks the catalog about one table and records the whole exchange.
+
+    Three things go in the record because three things are worth auditing: what
+    was asked, what came back, and whether the agent did as it was told.
+    """
+    decision = governor.check_table(table, dataset)
+    verdict = decision.to_dict()
+    honoured = (not decision.allowed) or decision.action == "ALLOW"
+
+    return {
+        "avenue_id": avenue_id,
+        "table": table,
+        "asked": "May this validator read %s for %s?" % (table, avenue_id),
+        "catalog_said": live(verdict, _entry_source(governor, table, dataset)),
+        "aspect_cited": live(verdict.get("evidence", NOT_RECORDED), _entry_source(governor, table, dataset)),
+        "authoritative_replacement": (
+            live(verdict.get("replacement"), _entry_source(governor, table, dataset))
+            if verdict.get("replacement")
+            else unmeasured("catalog named no replacement for %s" % table)
+        ),
+        "agent_action": computed("READ" if decision.allowed else "DECLINED", "validator.catalog_gate"),
+        "agent_honoured_catalog": computed(honoured, "validator.catalog_gate"),
+        "enforcement": CATALOG_ADVISORY_NOTE,
+    }
+
+
+def _column_records(
+    governor: CatalogGovernor,
+    dataset: Optional[str],
+    probes: Sequence[Tuple[str, str]] = RESTRICTED_COLUMN_PROBES,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Probes the governed columns and returns (records, columns the agent declined)."""
+    records: List[Dict[str, Any]] = []
+    declined: List[str] = []
+
+    for table, column in probes:
+        decision = governor.check_column(table, column, dataset)
+        verdict = decision.to_dict()
+        subject = "%s.%s" % (table, column)
+        if not decision.allowed:
+            declined.append(subject)
+        records.append({
+            "column": subject,
+            "asked": "May this validator read and print %s?" % subject,
+            "catalog_said": live(verdict, _entry_source(governor, table, dataset)),
+            "aspect_cited": live(verdict.get("evidence", NOT_RECORDED), _entry_source(governor, table, dataset)),
+            "regulation": live(verdict.get("regulation", NOT_RECORDED), _entry_source(governor, table, dataset)),
+            "agent_action": computed("READ" if decision.allowed else "DECLINED", "validator.catalog_gate"),
+            "agent_honoured_catalog": computed(True, "validator.catalog_gate"),
+            "enforcement": CATALOG_ADVISORY_NOTE,
+        })
+    return records, declined
+
+
+def _redact(rows: List[Dict[str, Any]], declined_columns: Sequence[str]) -> List[Dict[str, Any]]:
+    """Blanks any declined column that still turns up in a result row.
+
+    The golden SQL is not supposed to select these, but the decline has to hold
+    even if it does -- otherwise the record claims a refusal the output betrays.
+    """
+    bare = {c.split(".", 1)[-1] for c in declined_columns}
+    if not bare:
+        return rows
+
+    clean: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            clean.append(row)
+            continue
+        clean.append({
+            key: (NOT_RECORDED if key in bare else val)
+            for key, val in row.items()
+        })
+    return clean
+
+
+# ----------------------------------------------------------------------------
+# Structured-output schemas (unchanged surface)
+# ----------------------------------------------------------------------------
 
 class ClaimVeracityGenAIOutput(BaseModel):
     veracity_status: VeracityStatus = Field(
         ...,
-        description="Forensic veracity determination based strictly on the relevant ground-truth telemetry avenues.",
+        description="Verdict reached strictly from the BigQuery evidence supplied. Never from prior knowledge.",
     )
     confidence_score: float = Field(
         ...,
-        description="Confidence score between 0.0 and 1.0.",
+        description="Confidence between 0.0 and 1.0, justified by how many avenues returned corroborating rows.",
     )
     corroborating_telemetry: List[str] = Field(
         ...,
-        description="Specific ground-truth evidence items strictly relevant to the customer's claim.",
+        description="Evidence items, each naming the table and golden query id it came from.",
     )
     relevant_avenues_checked: List[RelevantAvenueCheck] = Field(
         default_factory=list,
-        description="ONLY the ground-truth avenues relevant to evaluating this specific claim. Do NOT include Multi-Step SMS Y/N Consent / Chicago $1000 details if the claim is about London Duty Free, Apple Pay, or IVR Call Drop.",
+        description="Only the avenues that returned rows bearing on this claim. Declined sources are not evidence.",
     )
     discrepancy_details: Optional[str] = Field(
         None,
-        description="Explanation of any contradiction or SIM-swap/eSIM interception nuance between claim and telemetry.",
+        description="Where the claim and the rows disagree, quoting the row values. Null if they agree.",
     )
     recommended_remediation: str = Field(
         ...,
-        description="Actionable remediation citing governing Knowledge Catalog policies strictly relevant to this claim.",
+        description="The next action, grounded in the rows and in any catalog decline recorded.",
     )
 
 
@@ -87,396 +344,307 @@ class AuditSweepGenAIOutput(BaseModel):
     anomalies: List[AuditAnomalyItemSchema]
 
 
+# ----------------------------------------------------------------------------
+# Agent 6: pre-write claim veracity validator
+# ----------------------------------------------------------------------------
+
+_AMOUNT_RE = re.compile(r"(?:[$\u00a3\u20ac]\s?)(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)|(\d+\.\d{2})\b")
+_DISPUTE_RE = re.compile(r"\bDSP\d{5}\b", re.IGNORECASE)
+_CARD_RE = re.compile(r"\bCARD\d{5}\b", re.IGNORECASE)
+
+
+def _amounts_in(text: str) -> List[float]:
+    found: List[float] = []
+    for match in _AMOUNT_RE.finditer(text or ""):
+        raw = match.group(1) or match.group(2) or ""
+        try:
+            found.append(round(float(raw.replace(",", "")), 2))
+        except ValueError:
+            continue
+    return found
+
+
+def _row_amounts(rows: List[Dict[str, Any]]) -> List[float]:
+    """Every numeric amount-like field in a result set, for cross-checking a quoted figure."""
+    values: List[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key, val in row.items():
+            if "amount" not in str(key).lower():
+                continue
+            try:
+                values.append(round(float(val), 2))
+            except (TypeError, ValueError):
+                continue
+    return values
+
+
 class ClaimVeracityValidatorAgent:
-    """
-    Pre-Write Claim Veracity Validation Layer.
-    Intercepts claims submitted by customer/channel agents during a session,
-    selects and executes ONLY the relevant Ground-Truth Verification avenues for that specific claim,
-    and invokes Vertex AI Gemini 2.5 Flash structured output to produce a ClaimVeracityEvaluation
-    before committing the fragment to the Memory Bank.
+    """Validates a claim against BigQuery before it is allowed into Memory Bank.
+
+    Order matters: catalog first, then only the tables it cleared, then the
+    verdict. Reading first and asking afterwards would make the governance
+    record decorative.
     """
 
     def __init__(
         self,
         project_id: Optional[str] = None,
         location: Optional[str] = None,
-        model_name: str = "gemini-2.5-flash",
+        model_name: Optional[str] = None,
+        dataset: Optional[str] = None,
+        catalog_governor: Optional[CatalogGovernor] = None,
+        memory_client: Optional[MemoryBankClient] = None,
     ):
-        self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-        self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.model_name = model_name
+        self.project_id = _project_id(project_id)
+        self.location = _location(location)
+        self.model_name = _model_name(model_name)
+        self.dataset = _dataset(dataset)
         self._client: Optional[genai.Client] = None
+        self._governor = catalog_governor
+        self._memory = memory_client
 
     @property
     def client(self) -> genai.Client:
         if self._client is None:
+            if self.project_id == NOT_RECORDED:
+                raise VeracityServiceError(
+                    "GOOGLE_CLOUD_PROJECT is unset. Refusing to build a Vertex client against a placeholder project."
+                )
             os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-            self._client = genai.Client(
-                vertexai=True,
-                project=self.project_id,
-                location=self.location,
-            )
+            self._client = genai.Client(vertexai=True, project=self.project_id, location=self.location)
         return self._client
 
-    def _build_multi_avenue_audit(
-        self,
-        customer_id: str,
-        claim_text: str,
-    ) -> Dict[str, Any]:
+    @property
+    def governor(self) -> CatalogGovernor:
+        if self._governor is None:
+            self._governor = create_default_catalog_governor(strict=True, verbose=False)
+        return self._governor
+
+    @property
+    def memory(self) -> MemoryBankClient:
+        if self._memory is None:
+            self._memory = create_default_memory_bank_client(verbose=False)
+        return self._memory
+
+    # -- catalog gate --------------------------------------------------------
+
+    def authorize_sources(self, avenue_specs: Sequence[Dict[str, Any]] = AVENUE_SPECS) -> Dict[str, Any]:
+        """Asks Dataplex about every candidate table and column before any read.
+
+        Returns the evidence record plus the set of tables the agent will read.
+        Nothing here matches a table name against a literal: `authorizations`
+        and `authorizations_deprecated_v1` are both offered, and only the
+        lifecycle-status aspect separates them.
         """
-        Executes live Ground-Truth API lookups across banking avenues and filters
-        telemetry summaries to strictly match the subject matter of the customer's claim.
-        """
-        claim_lower = claim_text.lower()
-        statement_data = GroundTruthTelemetryStore.fetch_live_account_statement(customer_id)
-        geo_data = GroundTruthTelemetryStore.fetch_travel_and_geo_verification(customer_id)
-        consent_logs = GroundTruthTelemetryStore.fetch_step_up_consent_audit(customer_id)
-        raw_telemetry = GroundTruthTelemetryStore.get_telemetry_for_customer(customer_id)
-        ivr_logs = raw_telemetry.get("telephony_ivr_logs", [])
-        mobile_logs = raw_telemetry.get("mobile_app_logs", [])
-        risk_profile = KnowledgeCatalog.get_customer_risk_profile(customer_id)
-        policies = KnowledgeCatalog.query_policies(claim_text, top_k=3)
+        governor = self.governor
+        table_records: List[Dict[str, Any]] = []
+        allowed_tables: Dict[str, List[str]] = {}
+        declined_tables: List[Dict[str, str]] = []
 
-        travel_notices = geo_data.get("registered_travel_notices", [])
-        ip_sessions = geo_data.get("recent_ip_sessions", [])
-        verified_destinations = [t.get("destination") for t in travel_notices if t.get("status") == "ACTIVE_VERIFIED"]
-        ip_cities = list({s.get("city") for s in ip_sessions if s.get("city")})
+        for spec in avenue_specs:
+            cleared: List[str] = []
+            for table in spec["candidate_tables"]:
+                record = _authorization_record(governor, spec["avenue_id"], table, self.dataset)
+                table_records.append(record)
+                if value_of(record["agent_action"]) == "READ":
+                    cleared.append(table)
+                else:
+                    declined_tables.append({
+                        "table": table,
+                        "avenue_id": spec["avenue_id"],
+                        "basis": value_of(record["aspect_cited"]),
+                        "replacement": value_of(record["authoritative_replacement"]),
+                    })
+            allowed_tables[spec["avenue_id"]] = cleared
 
-        # Determine if claim relates to Chicago / $1000 / SMS Consent
-        is_chicago_or_consent_claim = any(
-            kw in claim_lower
-            for kw in ["chicago", "1000", "1,000", "luxury electronics", "sms", "consent", "sim", "esim", "unauthorized"]
-        )
-        is_london_or_travel_claim = any(
-            kw in claim_lower
-            for kw in ["london", "heathrow", "duty free", "185", "travel", "uk", "england"]
-        )
-        is_ivr_or_call_claim = any(
-            kw in claim_lower
-            for kw in ["call", "dropped", "ivr", "passcode", "phone", "disconnected", "target", "142.50"]
-        )
-
-        if is_london_or_travel_claim and not is_chicago_or_consent_claim:
-            travel_summary = (
-                f"Active Verified Travel Notice: {', '.join(verified_destinations) if verified_destinations else 'London, UK'}. "
-                "Mobile GPS Breadcrumb: Verified at London Heathrow Airport (Terminal 5)."
-            )
-        else:
-            travel_summary = (
-                f"Verified Travel Notices: {', '.join(verified_destinations) if verified_destinations else 'None'}. "
-                f"Observed IP Session Cities: {', '.join(ip_cities) if ip_cities else 'None'}."
-            )
-
-        baseline = risk_profile.get("historical_spending_baseline", {})
-        avg_tx = float(baseline.get("average_transaction_usd", 100.0))
-        tx_ledger = statement_data.get("recent_transactions", [])
-
-        # Filter ledger transactions relevant to the claim
-        if is_london_or_travel_claim and not is_chicago_or_consent_claim:
-            matched_tx = [t for t in tx_ledger if "london" in str(t.get("merchant", "")).lower() or "duty free" in str(t.get("merchant", "")).lower()]
-            if not matched_tx:
-                matched_tx = [
-                    {
-                        "tx_id": "tx-lhr-dutyfree-185",
-                        "merchant": "London Heathrow Duty Free",
-                        "amount": 235.00,
-                        "currency_original": "£185.00 GBP",
-                        "status": "DECLINED_CARD_STATUS_LOCKED_RESTRICTED",
-                        "location": "London, UK",
-                    }
-                ]
-            behavioral_summary = (
-                f"Customer Credit Tier: {risk_profile.get('credit_tier', 'PRIME_PLUS')}. "
-                "London Heathrow Duty Free purchase (£185.00 / $235.00 USD) is consistent with active international travel profile."
-            )
-        elif is_ivr_or_call_claim and not is_chicago_or_consent_claim:
-            matched_tx = [t for t in tx_ledger if "target" in str(t.get("merchant", "")).lower() or float(t.get("amount", 0)) == 142.50]
-            behavioral_summary = (
-                f"Customer Credit Tier: {risk_profile.get('credit_tier', 'PRIME_PLUS')}. "
-                "Target retail transaction ($142.50) within normal domestic retail baseline ($95.00 avg)."
-            )
-        else:
-            matched_tx = tx_ledger
-            max_ledger_tx = max((float(t.get("amount", 0.0)) for t in tx_ledger), default=0.0)
-            ratio = round(max_ledger_tx / max(1.0, avg_tx), 1)
-            behavioral_summary = (
-                f"Customer Credit Tier: {risk_profile.get('credit_tier', 'PRIME_PLUS')}. "
-                f"Historical Avg Ticket: ${avg_tx:.2f}. Max recent ledger transaction: ${max_ledger_tx:.2f} "
-                f"({ratio}x historical average baseline)."
-            )
-
-        consent_protocol_steps = []
-        if is_chicago_or_consent_claim:
-            for idx, c in enumerate(consent_logs, 1):
-                carrier = c.get("reply_carrier_telemetry", {})
-                consent_protocol_steps.append(
-                    f"Event {idx}: Initial ${c.get('amount_usd', 0):.2f} attempt at {c.get('merchant')} "
-                    f"({c.get('initial_attempt_timestamp')}) -> {c.get('initial_decision')}. "
-                    f"Challenge '{c.get('challenge_type')}' sent to {c.get('challenge_sent_to')}. "
-                    f"Reply '{c.get('user_reply')}' at {c.get('user_reply_timestamp')} from IP {carrier.get('origin_ip')} "
-                    f"({carrier.get('cell_tower_region')}; SIM-Swap Flag: {carrier.get('sim_swap_flag')}; "
-                    f"Simultaneous NY Session: {carrier.get('simultaneous_ny_session_active')}). "
-                    f"Retry tx {c.get('retry_tx_id')} -> {c.get('retry_decision')}."
-                )
-            protocol_verification_str = "\n".join(consent_protocol_steps) if consent_protocol_steps else "No step-up consent events recorded."
-        else:
-            protocol_verification_str = "Not applicable to this claim (No Multi-Step SMS Y/N Consent challenge associated with this transaction)."
+        column_records, declined_columns = _column_records(governor, self.dataset)
 
         return {
-            "avenue_1_account_statement": {
-                "api_called": "GroundTruthTelemetryStore.fetch_live_account_statement",
-                "account_status": statement_data.get("statement_summary", {}).get("account_status", "SECURITY_LOCKED"),
-                "current_posted_balance_usd": statement_data.get("statement_summary", {}).get(
-                    "current_posted_balance_usd", 4280.50
-                ),
-                "available_credit_usd": statement_data.get("statement_summary", {}).get("available_credit_usd", 15719.50),
-                "matched_ledger_transactions": matched_tx,
-            },
-            "avenue_2_geo_presence_and_travel": {
-                "api_called": "GroundTruthTelemetryStore.fetch_travel_and_geo_verification",
-                "registered_travel_notices": travel_notices,
-                "ip_session_locations": ip_sessions,
-                "mobile_gps_breadcrumbs": geo_data.get("mobile_gps_breadcrumbs", []),
-                "travel_notice_assessment": travel_summary,
-            },
-            "avenue_3_behavioral_baseline": {
-                "api_called": "KnowledgeCatalog.get_customer_risk_profile",
-                "customer_tier": risk_profile.get("credit_tier", "PRIME_PLUS"),
-                "avg_transaction_usd": avg_tx,
-                "p95_transaction_usd": baseline.get("p95_transaction_usd", 420.0),
-                "typical_mccs": baseline.get("typical_merchant_categories", []),
-                "behavioral_anomaly_verdict": behavioral_summary,
-            },
-            "avenue_4_multistep_consent_audit": {
-                "api_called": "GroundTruthTelemetryStore.fetch_step_up_consent_audit",
-                "is_relevant_to_claim": is_chicago_or_consent_claim,
-                "step_up_events_found": len(consent_logs) if is_chicago_or_consent_claim else 0,
-                "consent_audit_trail": consent_logs if is_chicago_or_consent_claim else [],
-                "telephony_ivr_logs": ivr_logs if is_ivr_or_call_claim else [],
-                "mobile_app_logs": mobile_logs,
-                "protocol_verification": protocol_verification_str,
-            },
-            "avenue_5_knowledge_catalog_policies": {
-                "api_called": "KnowledgeCatalog.query_policies (Vertex AI text-embedding-005 cosine similarity)",
-                "governing_policies": [
-                    {
-                        "policy_id": p.policy_id,
-                        "title": p.title,
-                        "framework": p.regulatory_framework,
-                        "action": p.automated_action,
-                    }
-                    for p in policies
-                ],
-            },
+            "gate": identity(
+                "catalog-before-read", "validator.catalog_gate", "names the gate this agent implements"
+            ),
+            "dataset": computed(self.dataset, "env:BQ_DATASET"),
+            "table_authorizations": table_records,
+            "column_authorizations": column_records,
+            "tables_declined": computed(declined_tables, "validator.catalog_gate"),
+            "columns_declined": computed(declined_columns, "validator.catalog_gate"),
+            "allowed_tables_by_avenue": computed(allowed_tables, "validator.catalog_gate"),
+            "enforcement": CATALOG_ADVISORY_NOTE,
         }
 
-    def _algorithmic_telemetry_evaluation(
-        self,
-        claim_text: str,
-        multi_avenue: Dict[str, Any],
-    ) -> ClaimVeracityGenAIOutput:
-        """
-        Claim-specific ground-truth evaluation returning ONLY the avenues that matter for the claim.
-        """
-        claim_lower = claim_text.lower()
-        ip_sessions = multi_avenue["avenue_2_geo_presence_and_travel"]["ip_session_locations"]
-        travel_notices = multi_avenue["avenue_2_geo_presence_and_travel"]["registered_travel_notices"]
-        consent_logs = multi_avenue["avenue_4_multistep_consent_audit"]["consent_audit_trail"]
-        ivr_logs = multi_avenue["avenue_4_multistep_consent_audit"].get("telephony_ivr_logs", [])
-        policies = multi_avenue["avenue_5_knowledge_catalog_policies"]["governing_policies"]
+    # -- evidence ------------------------------------------------------------
 
-        ip_cities = {s.get("city", "").lower(): s for s in ip_sessions if s.get("city")}
-        claim_words = set(claim_lower.replace(",", " ").replace(".", " ").split())
-        negation_tokens = {"never", "not", "wasn't", "no", "zero", "didn't"}
-        has_negation = bool(claim_words.intersection(negation_tokens))
+    def _resolve_cards(self, customer_id: str, declined_columns: Sequence[str]) -> Tuple[List[str], Dict[str, Any]]:
+        """Card ids for this customer, from golden 01. Never a literal card id."""
+        result = _adk().golden_01_customer_360_snapshot(customer_id=customer_id)
+        rows = _redact(_rows_or_raise(result, "golden_01_customer_360_snapshot"), declined_columns)
 
-        # Case 1: Claim explicitly denies presence/login in a city where IP session exists (e.g. "Never in Lisbon" or "Never in Chicago")
-        if has_negation and any(c in claim_lower for c in ["lisbon", "chicago"]) and "1000" not in claim_lower and "1,000" not in claim_lower:
-            city_matched = "Lisbon, Portugal" if "lisbon" in claim_lower else "Chicago, IL"
-            session_record = next(iter(ip_cities.values()), {"ip": "85.244.119.42", "city": city_matched, "timestamp": "2025-09-12T22:18:00Z", "device": "Unrecognized Session"})
-            return ClaimVeracityGenAIOutput(
-                veracity_status=VeracityStatus.CONTRADICTED_BY_TELEMETRY,
-                confidence_score=0.96,
-                corroborating_telemetry=[
-                    f"Network Authentication Log: IP {session_record.get('ip')} authenticated in {city_matched} at {session_record.get('timestamp')} ({session_record.get('device')})",
-                    "Geo & Travel Notice Registry: Travel Notice TRV00001 active through 10 Sep (updated from 18 Sep per MEM00015).",
-                ],
-                relevant_avenues_checked=[
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_2_NETWORK_IP_TELEMETRY",
-                        avenue_title="Network Authentication & IP Access Log",
-                        why_relevant=f"Customer explicitly denied logging in from or visiting {city_matched}.",
-                        finding_summary=f"Contradicted: Authenticated session (auth_result: SUCCESS) recorded from IP {session_record.get('ip')} in {city_matched} on {session_record.get('device')}.",
-                        corroborates_claim=False,
-                    ),
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_2_TRAVEL_REGISTRY",
-                        avenue_title="Geo & Travel Notice Registry",
-                        why_relevant="Verify travel notice dates and post-departure activity.",
-                        finding_summary="Travel Notice TRV00001 returned early on 2025-09-10 (MEM00015); post-departure activity contradicted.",
-                        corroborates_claim=False,
-                    ),
-                ],
-                discrepancy_details=(
-                    f"Customer claim denies presence or login in {city_matched}, but authoritative network telemetry "
-                    f"recorded an authenticated session from IP {session_record.get('ip')} ({city_matched})."
-                ),
-                recommended_remediation=(
-                    "Enforce Policy POL-STEP-UP-2FA-002: Flag account for Dashboard Admin security review; "
-                    "keep card restricted until primary device biometric FaceID re-authentication is completed."
-                ),
-            )
+        card_ids: List[str] = []
+        for row in rows:
+            for key, val in (row or {}).items():
+                if str(key).lower() in ("card_id", "cards", "card_ids") and isinstance(val, str):
+                    card_ids.extend(_CARD_RE.findall(val) or ([val] if val.startswith("CARD") else []))
 
-        # Case 2: Claim about London Heathrow Duty Free Decline / Travel Notice
-        if any(w in claim_lower for w in ["london", "heathrow", "duty free", "185", "£185"]) and "1000" not in claim_lower and "1,000" not in claim_lower:
-            return ClaimVeracityGenAIOutput(
-                veracity_status=VeracityStatus.VERIFIED_TRUE,
-                confidence_score=0.99,
-                corroborating_telemetry=[
-                    "Geo & Travel Notice Registry: Active verified travel notice on file for London, United Kingdom (Status: ACTIVE_VERIFIED).",
-                    "POS Authorization Log: Attempt at London Heathrow Duty Free (£185.00 GBP / $235.00 USD) declined with code CARD_STATUS_LOCKED_RESTRICTED.",
-                    "Mobile Device GPS Telemetry: Verified customer presence at London Heathrow Airport Terminal 5.",
-                ],
-                relevant_avenues_checked=[
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_2_GEO_TRAVEL",
-                        avenue_title="Geo & Travel Notice Registry",
-                        why_relevant="Customer claims card declined despite an active London travel notice.",
-                        finding_summary="Verified TRUE: Customer has an ACTIVE_VERIFIED travel notice for London, UK and GPS breadcrumbs at Heathrow Terminal 5.",
-                        corroborates_claim=True,
-                    ),
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_1_POS_AUTHORIZATION",
-                        avenue_title="Account Statement & POS Decline Log",
-                        why_relevant="Verify the exact decline reason for the £185.00 London Heathrow Duty Free transaction.",
-                        finding_summary="Verified TRUE: POS attempt for £185.00 ($235.00 USD) at London Heathrow Duty Free was declined solely due to prior card security lock (CARD_STATUS_LOCKED_RESTRICTED).",
-                        corroborates_claim=True,
-                    ),
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_5_TRAVEL_POLICY",
-                        avenue_title="Governing Knowledge Catalog Policy",
-                        why_relevant="Determine remediation protocol for false-positive declines during verified travel.",
-                        finding_summary="Under Policy POL-GEO-VEL-003 (Travel Notice Override) & POL-VCN-ISSUANCE-004: Eligible for immediate Admin card unlock and instant Virtual Card Number (VCN) provisioning.",
-                        corroborates_claim=True,
-                    ),
-                ],
-                discrepancy_details=None,
-                recommended_remediation=(
-                    "Under Policy POL-GEO-VEL-003 (Travel Notice False-Positive Protection) & POL-VCN-ISSUANCE-004: "
-                    "Forward verified London travel & device attestation to Dashboard Admin to ENABLE card access immediately and restore Apple Pay."
-                ),
-            )
-
-        # Case 3: Claim about IVR Call Dropped / 2FA OTP Passcode
-        if any(w in claim_words for w in {"call", "dropped", "disconnected", "ivr", "passcode", "code"}):
-            raw_ivr = GroundTruthTelemetryStore.get_telemetry_for_customer("CUST00001").get("telephony_ivr_logs", [])
-            call = raw_ivr[0] if raw_ivr else {}
-            return ClaimVeracityGenAIOutput(
-                veracity_status=VeracityStatus.VERIFIED_TRUE,
-                confidence_score=0.98,
-                corroborating_telemetry=[
-                    f"Telephony IVR Session Log ({call.get('call_id', 'SES00004-IVR')}): Inbound call duration {call.get('duration_seconds', 184)}s regarding {call.get('merchant_inquired', 'Stolen wallet in Lisbon')}.",
-                    f"SMS OTP Dispatch Log: Passcode dispatched at {call.get('sms_otp_sent_timestamp', '21:15:30Z')} to *0146 ({call.get('disconnection_reason', 'COMPLETED_REPORTED_THEFT')}).",
-                ],
-                relevant_avenues_checked=[
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_4_TELEPHONY_IVR_LOG",
-                        avenue_title="Telephony IVR Session Log",
-                        why_relevant="Customer references IVR theft report session.",
-                        finding_summary=f"Verified TRUE: Call {call.get('call_id', 'SES00004-IVR')} recorded stolen wallet report in Lisbon.",
-                        corroborates_claim=True,
-                    ),
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_4_SMS_OTP_GATEWAY",
-                        avenue_title="SMS OTP Dispatch Telemetry",
-                        why_relevant="Verify whether 2FA SMS code was transmitted to updated mobile *0146.",
-                        finding_summary="Verified TRUE: SMS OTP dispatched to *0146 (updated from *0143 per MEM00017).",
-                        corroborates_claim=True,
-                    ),
-                ],
-                discrepancy_details=None,
-                recommended_remediation=(
-                    "Under Policy POL-STEP-UP-2FA-002: Confirm IVR identity check and proceed with dual-path Reg E (DSP00033) and Reg Z (DSP00034) resolution."
-                ),
-            )
-
-        # Case 4: Claim about Lisbon Unauthorized Electronics / Boutique Charge
-        if any(w in claim_lower for w in ["1000", "1,000", "casa verde", "electronics", "unauthorized", "sim", "esim", "620", "1480"]):
-            raw_consent = GroundTruthTelemetryStore.fetch_step_up_consent_audit("CUST00001")
-            ev = raw_consent[0] if raw_consent else {}
-            carrier = ev.get("reply_carrier_telemetry", {})
-            return ClaimVeracityGenAIOutput(
-                veracity_status=VeracityStatus.VERIFIED_TRUE,
-                confidence_score=0.99,
-                corroborating_telemetry=[
-                    f"Account Statement Ledger: Disputes DSP00033 (€620.00 Debit Reg E) and DSP00034 (€1,480.00 Credit Reg Z) at {ev.get('merchant', 'Casa Verde Electronics, Lisbon')}.",
-                    f"Standing Instruction & Carrier Audit: Alert sent to *0146 ({carrier.get('cell_tower_region', 'Lisbon Metro')}) with flag {carrier.get('sim_swap_flag', 'NONE_REPORTED_WALLET_THEFT')}.",
-                    "Behavioral Baseline: Post-theft EMV taps in Alfama corroborated against IVR theft timestamp 08 Sep 21:15 UTC.",
-                ],
-                relevant_avenues_checked=[
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_4_SMS_YN_CONSENT_AUDIT",
-                        avenue_title="Multi-Step SMS Y/N Consent & eSIM Carrier Audit",
-                        why_relevant="Customer claims the $1,000 Chicago Luxury Electronics charge was unauthorized despite SMS step-up.",
-                        finding_summary=f"Verified TRUE: Carrier telemetry proves concurrent session conflict ({carrier.get('sim_swap_flag', 'SUSPECTED_CONCURRENT_ESIM_CLONE')}). SMS 'Y' consent was intercepted via unauthorized eSIM clone.",
-                        corroborates_claim=True,
-                    ),
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_3_BEHAVIORAL_BASELINE",
-                        avenue_title="Behavioral Spending Baseline",
-                        why_relevant="Assess whether $1,000 electronics transaction matches customer spending history.",
-                        finding_summary="Anomalous: $1,000.00 charge represents a 10.5x spike over historical average ticket ($95.00).",
-                        corroborates_claim=True,
-                    ),
-                    RelevantAvenueCheck(
-                        avenue_id="AVENUE_5_REG_E_POLICY",
-                        avenue_title="Governing Knowledge Catalog Policy",
-                        why_relevant="Determine zero-liability protection for eSIM/SIM-swap interception.",
-                        finding_summary="Under Policy POL-REG-E-001 (Zero Liability) & POL-STEP-UP-2FA-002: Customer is protected under Regulation E; issue provisional credit.",
-                        corroborates_claim=True,
-                    ),
-                ],
-                discrepancy_details=(
-                    f"Although SMS 'Y' consent was logged prior to retry approval, carrier telemetry proves "
-                    f"concurrent NY session conflict ({carrier.get('sim_swap_flag', 'SUSPECTED_CONCURRENT_ESIM_CLONE')}). Consent was intercepted via unauthorized eSIM/SIM-swap."
-                ),
-                recommended_remediation=(
-                    "Under Policy POL-REG-E-001 (Zero Liability) & POL-STEP-UP-2FA-002: "
-                    "1) Issue provisional credit for $1,000.00 (tx-chi-1000-retry); "
-                    "2) Revoke compromised eSIM/token bindings; "
-                    "3) Require Dashboard Admin verification before re-enabling primary card."
-                ),
-            )
-
-        # Default / General Claim Evaluation (e.g. Apple Pay restriction inquiry)
-        return ClaimVeracityGenAIOutput(
-            veracity_status=VeracityStatus.VERIFIED_TRUE,
-            confidence_score=0.95,
-            corroborating_telemetry=[
-                f"Account Statement Status: {multi_avenue['avenue_1_account_statement']['account_status']} (Balance: ${multi_avenue['avenue_1_account_statement']['current_posted_balance_usd']:.2f})",
-                "Mobile Wallet Log: Apple Pay tokenization blocked with status CARD_STATUS_LOCKED_RESTRICTED.",
-            ],
-            relevant_avenues_checked=[
-                RelevantAvenueCheck(
-                    avenue_id="AVENUE_1_STATEMENT_STATUS",
-                    avenue_title="Account Statement & Card Status API",
-                    why_relevant="Verify current card restriction state affecting customer transactions.",
-                    finding_summary="Verified TRUE: Card *4821 is currently in SECURITY_LOCKED state pending verification.",
-                    corroborates_claim=True,
-                ),
-                RelevantAvenueCheck(
-                    avenue_id="AVENUE_4_MOBILE_WALLET_LOG",
-                    avenue_title="Mobile App & Digital Wallet Telemetry",
-                    why_relevant="Check mobile provisioning logs for Apple Pay / digital wallet.",
-                    finding_summary="Verified TRUE: Provisioning rejected due to active security lock on underlying card instrument.",
-                    corroborates_claim=True,
-                ),
-            ],
-            discrepancy_details=None,
-            recommended_remediation=(
-                "Complete customer verification in Support Chat so Dashboard Risk Admin can review and ENABLE card access."
+        record = {
+            "query": computed("golden_01_customer_360_snapshot", "validator.evidence"),
+            "parameters": computed({"customer_id": customer_id}, "validator.evidence"),
+            "row_count": seeded(len(rows), _query_source("01", "v_customer_360")),
+            "rows": seeded(rows, _query_source("01", "v_customer_360")),
+            "card_ids": (
+                seeded(sorted(set(card_ids)), _query_source("01", "cards"))
+                if card_ids
+                else unmeasured("golden_01 returned no card id column for %s" % customer_id)
             ),
-        )
+        }
+        return sorted(set(card_ids)), record
+
+    def _avenue_evidence(
+        self,
+        avenue: Dict[str, Any],
+        customer_id: str,
+        card_id: Optional[str],
+        allowed_tables: Sequence[str],
+        declined_columns: Sequence[str],
+    ) -> Dict[str, Any]:
+        """Runs the golden query behind one avenue, or records honestly why it did not."""
+        avenue_id = avenue["avenue_id"]
+        primary = avenue["candidate_tables"][0]
+
+        if primary not in allowed_tables:
+            return {
+                "avenue_id": avenue_id,
+                "avenue_title": avenue["avenue_title"],
+                "table": primary,
+                "rows": unmeasured("catalog declined %s; the agent did not read it" % primary),
+                "row_count": unmeasured("catalog declined %s" % primary),
+            }
+
+        if avenue["scope"] == "card" and not card_id:
+            return {
+                "avenue_id": avenue_id,
+                "avenue_title": avenue["avenue_title"],
+                "table": primary,
+                "rows": unmeasured("no card id resolved for %s, so %s cannot be scoped" % (customer_id, primary)),
+                "row_count": unmeasured("no card id resolved for %s" % customer_id),
+            }
+
+        contract = _contract_for_table(primary)
+        if contract is None:
+            return {
+                "avenue_id": avenue_id,
+                "avenue_title": avenue["avenue_title"],
+                "table": primary,
+                "rows": unmeasured("no golden query contract governs %s; avenue not measured" % primary),
+                "row_count": unmeasured("no golden query contract governs %s" % primary),
+                "gap": computed(
+                    "queries/golden/INDEX.md registers no contract whose primary table is %s" % primary,
+                    "validator.evidence",
+                ),
+            }
+
+        tool_name = getattr(contract, "tool_name", None)
+        query_id = getattr(contract, "query_id", NOT_RECORDED)
+        wrapper = getattr(_adk(), tool_name or "", None)
+        if wrapper is None:
+            raise VeracityServiceError(
+                "Contract %s names tool %s, which backend.adk_agents does not define." % (query_id, tool_name)
+            )
+
+        params = {"card_id": card_id} if avenue["scope"] == "card" else {"customer_id": customer_id}
+        rows = _redact(_rows_or_raise(wrapper(**params), tool_name), declined_columns)
+        source = _query_source(query_id, primary)
+
+        return {
+            "avenue_id": avenue_id,
+            "avenue_title": avenue["avenue_title"],
+            "table": primary,
+            "query": computed(tool_name, "validator.evidence"),
+            "parameters": computed(params, "validator.evidence"),
+            "row_count": seeded(len(rows), source),
+            "rows": seeded(rows, source),
+        }
+
+    def _dispute_evidence(self, customer_id: str, declined_columns: Sequence[str]) -> Dict[str, Any]:
+        """Open disputes, because amounts and deadlines are settled here and nowhere else."""
+        result = _adk().golden_07_open_disputes_for_customer(customer_id=customer_id)
+        rows = _redact(_rows_or_raise(result, "golden_07_open_disputes_for_customer"), declined_columns)
+        source = _query_source("07", "disputes")
+        return {
+            "query": computed("golden_07_open_disputes_for_customer", "validator.evidence"),
+            "parameters": computed({"customer_id": customer_id}, "validator.evidence"),
+            "row_count": seeded(len(rows), source),
+            "rows": seeded(rows, source),
+        }
+
+    def _amount_cross_check(self, claim_text: str, evidence: Dict[str, Any]) -> Dict[str, Any]:
+        """Every figure the claim quotes, checked against the rows BigQuery returned.
+
+        A quoted amount with no matching row is not proof of a lie, but it is the
+        one fact the verdict must not skip.
+        """
+        quoted = _amounts_in(claim_text)
+        if not quoted:
+            return {"amounts_quoted": unmeasured("claim quotes no amount")}
+
+        ledger: List[float] = []
+        for block in evidence.values():
+            if isinstance(block, dict) and isinstance(block.get("rows"), dict):
+                rows = value_of(block["rows"])
+                if isinstance(rows, list):
+                    ledger.extend(_row_amounts(rows))
+
+        matches = {str(amount): (amount in ledger) for amount in quoted}
+        return {
+            "amounts_quoted": computed(quoted, "validator.amount_cross_check"),
+            "amounts_found_in_bigquery": (
+                computed(sorted(set(ledger)), "validator.amount_cross_check")
+                if ledger
+                else unmeasured("no amount column in any authorised result set")
+            ),
+            "match_by_amount": computed(matches, "validator.amount_cross_check"),
+            "rule": "BigQuery is authoritative for amounts; the claim's figure is never accepted on its own.",
+        }
+
+    def build_evidence(self, customer_id: str, claim_text: str) -> Dict[str, Any]:
+        """Catalog gate, then the authorised golden queries, then the cross-check."""
+        authorization = self.authorize_sources()
+        declined_columns = value_of(authorization["columns_declined"]) or []
+        allowed_by_avenue = value_of(authorization["allowed_tables_by_avenue"]) or {}
+
+        card_ids, card_record = self._resolve_cards(customer_id, declined_columns)
+        claimed_cards = [c.upper() for c in _CARD_RE.findall(claim_text or "")]
+        card_id = next((c for c in claimed_cards if c in card_ids), card_ids[0] if card_ids else None)
+
+        avenues: Dict[str, Any] = {}
+        for spec in AVENUE_SPECS:
+            avenues[spec["avenue_id"]] = self._avenue_evidence(
+                spec,
+                customer_id=customer_id,
+                card_id=card_id,
+                allowed_tables=allowed_by_avenue.get(spec["avenue_id"], []),
+                declined_columns=declined_columns,
+            )
+
+        disputes = self._dispute_evidence(customer_id, declined_columns)
+
+        evidence: Dict[str, Any] = {
+            "customer_id": computed(customer_id, "validator.request"),
+            "card_id_used": (
+                seeded(card_id, _query_source("01", "cards"))
+                if card_id
+                else unmeasured("golden_01 returned no card for %s" % customer_id)
+            ),
+            "customer_360": card_record,
+            "catalog_authorization": authorization,
+            "disputes": disputes,
+        }
+        evidence.update(avenues)
+        evidence["amount_cross_check"] = self._amount_cross_check(claim_text, evidence)
+        return evidence
+
+    # -- verdict -------------------------------------------------------------
 
     def validate_claim_against_telemetry(
         self,
@@ -485,72 +653,69 @@ class ClaimVeracityValidatorAgent:
         claim_text: str,
         claim_metadata: Optional[Dict[str, Any]] = None,
     ) -> ClaimVeracityEvaluation:
-        """
-        Validate claim veracity using live Vertex AI Gemini 2.5 Flash structured reasoning
-        against ONLY the relevant ground-truth banking avenues for the specific claim.
-        """
-        claim_id = f"clm-{uuid.uuid4().hex[:8]}"
-        multi_avenue = self._build_multi_avenue_audit(customer_id, claim_text)
-        alg_check = self._algorithmic_telemetry_evaluation(claim_text, multi_avenue)
+        """Reaches a verdict on real rows, or raises. There is no third outcome."""
+        evidence = self.build_evidence(customer_id, claim_text)
 
-        prompt = f"""You are the Pre-Write Claim Veracity Validator Agent for JPMC Consumer Credit.
-Evaluate the following customer/channel claim strictly against the Authoritative Ground-Truth Telemetry provided below.
+        prompt = """You are the pre-write claim veracity validator on a JPMorgan Chase consumer-credit fraud desk.
 
 CUSTOMER ID: {customer_id}
-INGESTION CHANNEL: {channel.value}
-CUSTOMER CLAIM TO VALIDATE: "{claim_text}"
-ADDITIONAL CLAIM METADATA: {json.dumps(claim_metadata or {})}
+INGESTION CHANNEL: {channel}
+CLAIM: "{claim_text}"
+CLAIM METADATA: {metadata}
 
-AUTHORITATIVE GROUND-TRUTH TELEMETRY:
-{json.dumps(multi_avenue, indent=2)}
+EVIDENCE (every value carries a _provenance tag naming the table and golden query that produced it):
+{evidence}
 
-STRICT RELEVANCE & EVALUATION PROTOCOL:
-1. CHECK ONLY WHAT MATTERS FOR THIS SPECIFIC CLAIM:
-   - Populate `relevant_avenues_checked` with ONLY the 2 to 3 ground-truth avenues that directly pertain to the customer's claim.
-   - CRITICAL RULE: If the customer's claim is about London Heathrow Duty Free (£185 decline), Travel Notice, Apple Pay, or an IVR Call Drop, DO NOT check or mention the Chicago $1,000 Luxury Electronics transaction or Multi-Step SMS Y/N Consent Audit! Only check Multi-Step SMS Y/N Consent if the claim is specifically about the $1,000 Chicago charge or SMS consent.
-2. LITERAL NETWORK TELEMETRY CONTRADICTION:
-   - If the claim explicitly denies logging in from or being in Chicago (e.g. "never logged in from Chicago", "never in Chicago"), classify `veracity_status` as `CONTRADICTED_BY_TELEMETRY`, set `confidence_score` >= 0.95, and cite the Chicago IP (`203.0.113.19`).
-3. LONDON DUTY FREE / ACTIVE TRAVEL NOTICE DECLINE:
-   - If the claim reports a card decline at London Heathrow Duty Free despite an active travel notice, verify against `Geo & Travel Notice Registry` (`ACTIVE_VERIFIED` for London, UK) and `Account Statement & POS Decline Log` (`CARD_STATUS_LOCKED_RESTRICTED`). Classify as `VERIFIED_TRUE` (Confidence >= 0.98) and recommend forwarding verification to Dashboard Admin to enable card access under `POL-GEO-VEL-003`.
-4. CORROBORATED IVR CALL DROP / OTP INTERRUPTION:
-   - If the claim mentions a dropped phone call before entering an SMS OTP code, verify against `Telephony IVR Session Log` (`CALLER_DISCONNECTED_PRE_AUTH`). Classify as `VERIFIED_TRUE` (Confidence >= 0.98).
-5. CORROBORATED $1,000 CHICAGO UNAUTHORIZED CHARGE / SIM-SWAP FRAUD:
-   - Only if the claim is about the $1,000 Chicago charge, check `Multi-Step SMS Y/N Consent & eSIM Carrier Audit` (`SUSPECTED_CONCURRENT_ESIM_CLONE`), classify as `VERIFIED_TRUE`, and cite `POL-REG-E-001`.
-"""
+RULES:
+1. Judge the claim only against rows present in the evidence. If a value is "n/r" it was not measured; say so and never substitute a figure.
+2. An avenue whose rows are "n/r" is not evidence for or against the claim. Do not treat an unread source as a clean bill of health.
+3. Amounts, deadlines and dispute ids come from BigQuery rows only. If the claim quotes a figure, check amount_cross_check.match_by_amount and state the result.
+4. Where catalog_authorization shows a declined table or column, say the agent declined it and cite the aspect in aspect_cited. Never imply Dataplex blocked the read.
+5. Choose the veracity status the rows support. If the rows are thin, UNVERIFIED_PENDING_INVESTIGATION is the correct answer, not a confident one.
+6. Each corroborating_telemetry entry must name its table and golden query id.
+""".format(
+            customer_id=customer_id,
+            channel=channel.value,
+            claim_text=claim_text,
+            metadata=json.dumps(claim_metadata or {}),
+            evidence=json.dumps(evidence, indent=2, default=str),
+        )
+
         try:
-            if alg_check.confidence_score >= 0.95:
-                parsed = alg_check
-            else:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ClaimVeracityGenAIOutput,
-                        temperature=0.0,
-                    ),
-                )
-                parsed: ClaimVeracityGenAIOutput = response.parsed
-                if not parsed:
-                    raise ValueError("Empty structured response from Gemini")
-        except Exception as e:
-            logging.warning("Vertex AI Gemini live evaluation fallback triggered: %s", e)
-            parsed = alg_check
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema=ClaimVeracityGenAIOutput,
+                ),
+            )
+            parsed = response.parsed
+        except Exception as error:
+            # No fallback verdict. An invented judgement on a customer's honesty
+            # is the single most damaging thing this file could produce.
+            raise VeracityServiceError(
+                "Vertex AI evaluation failed for %s and no verdict was invented: %s" % (customer_id, error)
+            )
+
+        if parsed is None:
+            raise VeracityServiceError(
+                "Vertex AI returned no parsable ClaimVeracityGenAIOutput for %s." % customer_id
+            )
 
         return ClaimVeracityEvaluation(
-            claim_id=claim_id,
+            claim_id="CLM-%s" % uuid.uuid4().hex[:10].upper(),
             claim_text=claim_text,
             veracity_status=parsed.veracity_status,
             confidence_score=parsed.confidence_score,
             corroborating_telemetry=parsed.corroborating_telemetry,
-            discrepancy_details=parsed.discrepancy_details,
             relevant_avenues_checked=parsed.relevant_avenues_checked,
-            multi_avenue_audit=multi_avenue,
+            discrepancy_details=parsed.discrepancy_details,
+            multi_avenue_audit=evidence,
             recommended_remediation=parsed.recommended_remediation,
-            validation_timestamp=datetime.now(timezone.utc),
-            validator_agent=f"ClaimVeracityValidatorAgent ({self.model_name})",
+            validator_agent="ClaimVeracityValidatorAgent (%s)" % self.model_name,
         )
-
 
     def validate_and_write_to_memory_bank(
         self,
@@ -563,10 +728,7 @@ STRICT RELEVANCE & EVALUATION PROTOCOL:
         severity: SeverityLevel = SeverityLevel.MEDIUM,
         session_id: Optional[str] = None,
     ) -> MemoryFragment:
-        """
-        Execute multi-avenue pre-write veracity validation via Vertex AI Gemini and commit
-        the evaluated fragment to both local and Google Cloud Vertex AI Memory Bank.
-        """
+        """Validates first, then writes. The evaluation travels with the fragment."""
         evaluation = self.validate_claim_against_telemetry(
             customer_id=customer_id,
             channel=channel,
@@ -574,252 +736,356 @@ STRICT RELEVANCE & EVALUATION PROTOCOL:
             claim_metadata=metadata,
         )
 
-        enriched_meta = dict(metadata or {})
-        enriched_meta["veracity_status"] = evaluation.veracity_status.value
-        enriched_meta["avenues_audited"] = list(evaluation.multi_avenue_audit.keys())
-
-        mb = CustomerMemoryBank(customer_id=customer_id)
-        fragment = mb.ingest_event(
+        fragment = MemoryFragment(
+            fragment_id="MEM-%s" % uuid.uuid4().hex[:10].upper(),
+            customer_id=customer_id,
             channel=channel,
+            timestamp=datetime.now(timezone.utc),
             day_label=day_label,
             summary=summary,
-            metadata=enriched_meta,
+            metadata=dict(metadata or {}, claim_text=claim_text),
             severity=severity,
             session_id=session_id,
             veracity_evaluation=evaluation,
-            sync_to_cloud=True,
         )
+
+        if evaluation.veracity_status == VeracityStatus.CONTRADICTED_BY_TELEMETRY:
+            LOG.warning(
+                "Claim %s for %s is contradicted by BigQuery; fragment carries the contradiction rather than hiding it.",
+                evaluation.claim_id,
+                customer_id,
+            )
         return fragment
 
 
+# ----------------------------------------------------------------------------
+# Agent 7: Memory Bank audit sweep
+# ----------------------------------------------------------------------------
+
 class MemoryBankAuditAgent:
-    """
-    Consolidated Sweep & Audit Agent.
-    Audits Memory Banks across all customers using Vertex AI Gemini structured reasoning to discover:
-    - Multi-channel contradictory claims (e.g. Phone says X, Mobile says Y).
-    - Step-Up Y/N consent anomalies (e.g., SIM-swap 'Y' reply in Chicago vs NY/UK customer presence).
-    - Velocity anomalies and risk escalation patterns.
+    """Re-checks what is already stored against BigQuery, customer by customer.
+
+    Two passes. The first is deterministic: any amount or dispute id a memory
+    quotes is compared to the disputes table, and a mismatch is a CRITICAL
+    anomaly regardless of what a model thinks. The second asks Gemini to read
+    the memories for contradictions a comparison cannot see.
     """
 
     def __init__(
         self,
         project_id: Optional[str] = None,
         location: Optional[str] = None,
-        model_name: str = "gemini-2.5-flash",
+        model_name: Optional[str] = None,
+        memory_client: Optional[MemoryBankClient] = None,
+        validator: Optional[ClaimVeracityValidatorAgent] = None,
     ):
-        self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-        self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.model_name = model_name
+        self.project_id = _project_id(project_id)
+        self.location = _location(location)
+        self.model_name = _model_name(model_name)
         self._client: Optional[genai.Client] = None
+        self._memory = memory_client
+        self._validator = validator
 
     @property
     def client(self) -> genai.Client:
         if self._client is None:
+            if self.project_id == NOT_RECORDED:
+                raise VeracityServiceError(
+                    "GOOGLE_CLOUD_PROJECT is unset. Refusing to build a Vertex client against a placeholder project."
+                )
             os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-            self._client = genai.Client(
-                vertexai=True,
-                project=self.project_id,
-                location=self.location,
-            )
+            self._client = genai.Client(vertexai=True, project=self.project_id, location=self.location)
         return self._client
 
-    def audit_customer_memory_bank(self, customer_id: str) -> List[AuditAnomaly]:
-        """
-        Audit a single customer's Memory Bank and detect cross-channel anomalies.
-        """
-        mb = CustomerMemoryBank(customer_id=customer_id)
-        fragments = mb.get_fragments()
-        anomalies: List[AuditAnomaly] = []
+    @property
+    def memory(self) -> MemoryBankClient:
+        if self._memory is None:
+            self._memory = create_default_memory_bank_client(verbose=False)
+        return self._memory
 
-        if not fragments:
-            return anomalies
-
-        for frag in fragments:
-            if frag.veracity_evaluation:
-                eval_obj = frag.veracity_evaluation
-                if eval_obj.veracity_status == VeracityStatus.CONTRADICTED_BY_TELEMETRY:
-                    anomalies.append(
-                        AuditAnomaly(
-                            anomaly_id=f"ano-{uuid.uuid4().hex[:6]}",
-                            customer_id=customer_id,
-                            severity=SeverityLevel.HIGH,
-                            anomaly_type="CONTRADICTED_CUSTOMER_CLAIM",
-                            description=(
-                                f"Claim in {frag.channel.value} ('{eval_obj.claim_text}') is contradicted by "
-                                f"ground-truth telemetry: {eval_obj.discrepancy_details}"
-                            ),
-                            affected_channels=[frag.channel],
-                            evidence_fragments=[frag.fragment_id],
-                            recommended_action="Flag account for manual fraud analyst review before unlocking restriction.",
-                        )
-                    )
-                elif eval_obj.veracity_status == VeracityStatus.SUSPICIOUS_FALSE_CLAIM:
-                    anomalies.append(
-                        AuditAnomaly(
-                            anomaly_id=f"ano-{uuid.uuid4().hex[:6]}",
-                            customer_id=customer_id,
-                            severity=SeverityLevel.CRITICAL,
-                            anomaly_type="FALSE_CLAIM_PATTERN",
-                            description=f"Customer claim ('{eval_obj.claim_text}') identified as potentially fraudulent.",
-                            affected_channels=[frag.channel],
-                            evidence_fragments=[frag.fragment_id],
-                            recommended_action="Escalate to Risk Operations and suspend automated biometric unlocks.",
-                        )
-                    )
-
-        consent_logs = GroundTruthTelemetryStore.fetch_step_up_consent_audit(customer_id)
-        for c in consent_logs:
-            carrier = c.get("reply_carrier_telemetry", {})
-            if carrier.get("simultaneous_ny_session_active") or any(k in str(carrier.get("sim_swap_flag", "")) for k in ("SIM", "INTERCEPT", "WALLET_THEFT")):
-                anomalies.append(
-                    AuditAnomaly(
-                        anomaly_id=f"ano-{uuid.uuid4().hex[:6]}",
-                        customer_id=customer_id,
-                        severity=SeverityLevel.CRITICAL,
-                        anomaly_type="STEP_UP_CONSENT_SIM_SWAP_INTERCEPTION",
-                        description=(
-                            f"Initial attempt for ${c.get('amount_usd', 0):.2f} at {c.get('merchant')} was declined for Step-Up 2FA; "
-                            f"subsequent SMS '{c.get('user_reply')}' approval originated from IP {carrier.get('origin_ip')} "
-                            f"({carrier.get('cell_tower_region')}) while customer was active on primary residence device."
-                        ),
-                        affected_channels=[BankChannel.FRAUD_DETECTION, BankChannel.MOBILE_APP],
-                        evidence_fragments=[f.fragment_id for f in fragments[:2]],
-                        recommended_action=(
-                            f"Issue ${c.get('amount_usd', 0):.2f} Reg E provisional credit under POL-REG-E-001, "
-                            "revoke compromised eSIM token, and unlock card via Mobile App FaceID."
-                        ),
-                    )
-                )
-
-        channels_seen = {f.channel for f in fragments}
-        if BankChannel.FRAUD_DETECTION in channels_seen and BankChannel.MOBILE_APP in channels_seen:
-            anomalies.append(
-                AuditAnomaly(
-                    anomaly_id=f"ano-{uuid.uuid4().hex[:6]}",
-                    customer_id=customer_id,
-                    severity=SeverityLevel.MEDIUM,
-                    anomaly_type="CROSS_CHANNEL_CASCADE_FRICTION",
-                    description=(
-                        "Root security containment lock cascaded across channels into Inbound IVR session drop "
-                        "and mobile wallet tokenization rejection."
-                    ),
-                    affected_channels=list(channels_seen),
-                    evidence_fragments=[f.fragment_id for f in fragments[:3]],
-                    recommended_action="Offer 1-Click Biometric Remediation in mobile channel to resolve root lock.",
-                )
+    @property
+    def validator(self) -> ClaimVeracityValidatorAgent:
+        if self._validator is None:
+            self._validator = ClaimVeracityValidatorAgent(
+                project_id=self.project_id, location=self.location, model_name=self.model_name
             )
+        return self._validator
 
+    # -- helpers -------------------------------------------------------------
+
+    def _memories(self, customer_id: str, top_k: int = 25) -> List[Dict[str, Any]]:
+        try:
+            return self.memory.retrieve(scope={"customer_id": customer_id}, top_k=top_k)
+        except Exception as error:
+            raise VeracityServiceError("Memory Bank retrieve failed for %s: %s" % (customer_id, error))
+
+    @staticmethod
+    def _memory_text(memory: Dict[str, Any]) -> str:
+        """Pulls the fact text out of whatever shape the retrieve response used."""
+        node = memory.get("memory", memory) if isinstance(memory, dict) else {}
+        for key in ("fact", "content", "text", "displayName"):
+            value = node.get(key) if isinstance(node, dict) else None
+            if isinstance(value, str) and value.strip():
+                return value
+        return json.dumps(node, default=str)
+
+    @staticmethod
+    def _memory_id(memory: Dict[str, Any]) -> str:
+        node = memory.get("memory", memory) if isinstance(memory, dict) else {}
+        name = node.get("name") if isinstance(node, dict) else None
+        if isinstance(name, str) and name:
+            return name.rsplit("/", 1)[-1]
+        return NOT_RECORDED
+
+    # -- pass 1: BigQuery arbitration ---------------------------------------
+
+    def _contradictions_against_bigquery(
+        self,
+        customer_id: str,
+        memories: List[Dict[str, Any]],
+    ) -> List[AuditAnomaly]:
+        """Amounts and dispute ids in memory, judged against the disputes table."""
+        declined = value_of(self.validator.authorize_sources()["columns_declined"]) or []
+        dispute_rows = value_of(self.validator._dispute_evidence(customer_id, declined)["rows"]) or []
+
+        known_amounts = set(_row_amounts(dispute_rows))
+        known_disputes = set()
+        for row in dispute_rows:
+            for key, val in (row or {}).items():
+                if "dispute_id" in str(key).lower() and isinstance(val, str):
+                    known_disputes.add(val.upper())
+
+        anomalies: List[AuditAnomaly] = []
+        for memory in memories:
+            text = self._memory_text(memory)
+            memory_id = self._memory_id(memory)
+
+            unmatched_amounts = [a for a in _amounts_in(text) if a not in known_amounts]
+            unmatched_disputes = [d.upper() for d in _DISPUTE_RE.findall(text) if d.upper() not in known_disputes]
+
+            if not unmatched_amounts and not unmatched_disputes:
+                continue
+
+            anomalies.append(AuditAnomaly(
+                anomaly_id="ANM-%s" % uuid.uuid4().hex[:8].upper(),
+                customer_id=customer_id,
+                severity=SeverityLevel.CRITICAL,
+                anomaly_type="MEMORY_FIGURE_NOT_IN_BIGQUERY",
+                description=(
+                    "Memory %s quotes %s that the disputes table does not confirm. "
+                    "Memory is not the source of an amount, a deadline or a dispute id; "
+                    "golden_07 (bigquery:disputes#golden_07) is." % (
+                        memory_id,
+                        "amount(s) %s" % unmatched_amounts if unmatched_amounts else "dispute id(s) %s" % unmatched_disputes,
+                    )
+                ),
+                affected_channels=[BankChannel.CORE_BANKING],
+                evidence_fragments=[memory_id],
+                recommended_action=(
+                    "Re-verify the figure against golden_07 before any customer-facing use, "
+                    "and quarantine the memory if BigQuery still disagrees."
+                ),
+            ))
         return anomalies
 
-    def run_consolidated_sweep(self, customer_ids: Optional[List[str]] = None) -> AuditReport:
-        """
-        Execute a consolidated sweep across all customer Memory Banks in the enterprise.
-        """
-        if customer_ids is None:
-            customer_ids = CustomerMemoryBank.get_all_customer_ids()
+    # -- pass 2: model sweep -------------------------------------------------
 
-        all_anomalies: List[AuditAnomaly] = []
-        total_fragments = 0
-        risk_dist = {"LOW": 0, "MEDIUM": 0, "HIGH": 0, "CRITICAL": 0}
+    def _contradictions_from_model(
+        self,
+        customer_id: str,
+        memories: List[Dict[str, Any]],
+    ) -> List[AuditAnomaly]:
+        summaries = [{"memory_id": self._memory_id(m), "text": self._memory_text(m)} for m in memories]
 
-        for cid in customer_ids:
-            mb = CustomerMemoryBank(customer_id=cid)
-            frags = mb.get_fragments()
-            total_fragments += len(frags)
-            cust_anomalies = self.audit_customer_memory_bank(cid)
-            all_anomalies.extend(cust_anomalies)
+        prompt = """Audit one customer's Memory Bank for internal contradictions.
 
-            if any(a.severity == SeverityLevel.CRITICAL for a in cust_anomalies):
-                risk_dist["CRITICAL"] += 1
-            elif any(a.severity == SeverityLevel.HIGH for a in cust_anomalies):
-                risk_dist["HIGH"] += 1
-            elif any(a.severity == SeverityLevel.MEDIUM for a in cust_anomalies):
-                risk_dist["MEDIUM"] += 1
-            else:
-                risk_dist["LOW"] += 1
+CUSTOMER ID: {customer_id}
+MEMORIES RETRIEVED FROM VERTEX AI MEMORY BANK:
+{memories}
 
-        summary = (
-            f"Consolidated Memory Bank audit sweep completed for {len(customer_ids)} customer(s). "
-            f"Scanned {total_fragments} total memory fragments. Detected {len(all_anomalies)} anomaly pattern(s)."
+RULES:
+1. Report only contradictions visible between these memories -- two facts that cannot both be true.
+2. Do not judge whether a figure is correct. BigQuery settles figures and a separate pass already did that.
+3. Quote the memory ids involved in every description.
+4. Return an empty list when the memories are consistent. An empty list is a valid, useful answer.
+""".format(customer_id=customer_id, memories=json.dumps(summaries, indent=2, default=str))
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema=AuditSweepGenAIOutput,
+                ),
+            )
+            parsed = response.parsed
+        except Exception as error:
+            raise VeracityServiceError("Vertex AI audit sweep failed for %s: %s" % (customer_id, error))
+
+        if parsed is None:
+            raise VeracityServiceError("Vertex AI returned no parsable AuditSweepGenAIOutput for %s." % customer_id)
+
+        evidence_ids = [self._memory_id(m) for m in memories] or [NOT_RECORDED]
+        return [
+            AuditAnomaly(
+                anomaly_id="ANM-%s" % uuid.uuid4().hex[:8].upper(),
+                customer_id=customer_id,
+                severity=item.severity,
+                anomaly_type=item.anomaly_type,
+                description=item.description,
+                affected_channels=item.affected_channels,
+                evidence_fragments=evidence_ids,
+                recommended_action=item.recommended_action,
+            )
+            for item in parsed.anomalies
+        ]
+
+    def audit_customer_memory_bank(self, customer_id: str) -> List[AuditAnomaly]:
+        memories = self._memories(customer_id)
+        if not memories:
+            LOG.info("No memories in scope for %s; nothing to audit.", customer_id)
+            return []
+        return self._contradictions_against_bigquery(customer_id, memories) + self._contradictions_from_model(
+            customer_id, memories
         )
+
+    def run_consolidated_sweep(self, customer_ids: Optional[List[str]] = None) -> AuditReport:
+        """Sweeps the customers given, or the ones AUDIT_CUSTOMER_IDS names.
+
+        There is no default roster. Inventing one would put made-up customer ids
+        in an audit report, which is the opposite of what an audit is for.
+        """
+        if not customer_ids:
+            configured = env_param("AUDIT_CUSTOMER_IDS", "")
+            customer_ids = [c.strip() for c in (configured or "").split(",") if c.strip()]
+        if not customer_ids:
+            raise VeracityServiceError(
+                "No customer ids to sweep. Pass customer_ids, or set AUDIT_CUSTOMER_IDS."
+            )
+
+        anomalies: List[AuditAnomaly] = []
+        risk_distribution = {"LOW": 0, "MEDIUM": 0, "HIGH": 0, "CRITICAL": 0}
+        fragments_scanned = 0
+
+        for customer_id in customer_ids:
+            memories = self._memories(customer_id)
+            fragments_scanned += len(memories)
+
+            if memories:
+                found = self._contradictions_against_bigquery(customer_id, memories)
+                found.extend(self._contradictions_from_model(customer_id, memories))
+            else:
+                found = []
+            anomalies.extend(found)
+
+            worst = SeverityLevel.LOW
+            order = [SeverityLevel.LOW, SeverityLevel.MEDIUM, SeverityLevel.HIGH, SeverityLevel.CRITICAL]
+            for anomaly in found:
+                if order.index(anomaly.severity) > order.index(worst):
+                    worst = anomaly.severity
+            risk_distribution[worst.value] += 1
 
         return AuditReport(
-            sweep_id=f"sweep-{uuid.uuid4().hex[:8]}",
-            timestamp=datetime.now(timezone.utc),
+            sweep_id="SWEEP-%s" % uuid.uuid4().hex[:10].upper(),
             customers_audited=len(customer_ids),
-            total_fragments_scanned=total_fragments,
-            anomalies_detected=all_anomalies,
-            summary=summary,
-            risk_score_distribution=risk_dist,
+            total_fragments_scanned=fragments_scanned,
+            anomalies_detected=anomalies,
+            summary=(
+                "Swept %d customer memory bank(s) and %d memory record(s). %d anomaly(ies) recorded: "
+                "amounts and dispute ids were arbitrated against bigquery:disputes#golden_07, "
+                "contradictions between memories by %s." % (
+                    len(customer_ids), fragments_scanned, len(anomalies), self.model_name,
+                )
+            ),
+            risk_score_distribution=risk_distribution,
         )
 
 
+# ----------------------------------------------------------------------------
+# Admin card oversight
+# ----------------------------------------------------------------------------
+
 class AdminCardOversightManager:
-    """
-    Manages the end-to-end Card Restriction -> Customer Support Chat Verification ->
-    Dashboard Admin Oversight (YES = Enable Card / NO = Keep Restricted & Notify Customer) workflow.
+    """Card restriction -> support-chat verification -> admin decision.
+
+    Every field on the case comes from a golden query or from a validator
+    verdict. Nothing about a customer's card is written here as a literal.
     """
 
     _cases: Dict[str, AdminCardReviewCase] = {}
+    _evidence: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def _validator(cls) -> ClaimVeracityValidatorAgent:
+        return ClaimVeracityValidatorAgent()
+
+    @classmethod
+    def _flagged_dispute(cls, customer_id: str) -> Dict[str, Any]:
+        """The customer's most material open dispute, straight from golden_07."""
+        validator = cls._validator()
+        declined = value_of(validator.authorize_sources()["columns_declined"]) or []
+        block = validator._dispute_evidence(customer_id, declined)
+        rows = value_of(block["rows"]) or []
+
+        if not rows:
+            return {"row": {}, "evidence": block}
+
+        def amount_of(row: Dict[str, Any]) -> float:
+            values = _row_amounts([row])
+            return max(values) if values else 0.0
+
+        return {"row": max(rows, key=amount_of), "evidence": block}
+
+    @classmethod
+    def _describe(cls, row: Dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = row.get(key)
+            if value not in (None, "", []):
+                return str(value)
+        return NOT_RECORDED
 
     @classmethod
     def get_or_init_case(cls, customer_id: str = "CUST00001") -> AdminCardReviewCase:
-        if customer_id not in cls._cases:
-            cls._cases[customer_id] = AdminCardReviewCase(
-                case_id="CASE-JPMC-CUST00001-VERIFY",
-                customer_id=customer_id,
-                customer_name="Lauren Morrison (CUST00001)",
-                card_last4="9012",
-                card_status="RESTRICTED",
-                flagged_transaction_summary=(
-                    "Stolen wallet in Lisbon containing Checking Debit CARD00004 (DSP00033 · €620.00 Reg E) "
-                    "and Sapphire Credit CARD00002 (DSP00034 · €1,480.00 Reg Z)"
-                ),
-                system_flag_reason=(
-                    "Both cards frozen after 08 Sep 21:15 IVR theft report; 3 wallet tokens revoked; "
-                    "virtual card issued and courier SHP00001 rerouted to NYC home address after 10 Sep early return (MEM00015)."
-                ),
-                confidence_score=0.98,
-                customer_chat_verification_transcript=(
-                    'Customer (Lauren Morrison · CUST00001): "My wallet was stolen in Lisbon on 08 Sep with Debit CARD00004 and Credit CARD00002. '
-                    'I flew back early to JFK on 10 Sep (MEM00015) and updated my phone to *0146 (MEM00017). '
-                    'Please confirm my Reg E vs Reg Z provisional credit dates and unlock my virtual replacement card."'
-                ),
-                verification_status="VERIFIED_PASSED",
-                verification_checks=[
-                    VerificationCheckItem(
-                        check_name="Travel Notice & Early Return Lineage",
-                        status="PASSED",
-                        detail="Confirmed TRV00001 (Lisbon) superseded by MEM00015 (10 Sep early return to JFK).",
-                    ),
-                    VerificationCheckItem(
-                        check_name="Primary Mobile & Biometric Attestation",
-                        status="PASSED",
-                        detail="Matched updated mobile *0146 (MEM00017 superseding *0143) and iPhone 16 Pro FaceID.",
-                    ),
-                    VerificationCheckItem(
-                        check_name="Dual-Regulation Path Verification",
-                        status="PASSED",
-                        detail="DSP00033 (Debit Reg E · prov. credit due 23 Sep) & DSP00034 (Credit Reg Z · withhold payment).",
-                    ),
-                    VerificationCheckItem(
-                        check_name="Claim Veracity Confidence Score",
-                        status="PASSED",
-                        detail="98% Confidence Score (Exceeds 80% security threshold for Supervisor Card Action).",
-                    ),
-                ],
-                recommended_admin_action="APPROVE_ENABLE_CARD",
-                admin_decision=None,
-                admin_decision_reason=None,
-                admin_decision_timestamp=None,
-                customer_notification_message=None,
-            )
-        return cls._cases[customer_id]
+        """Builds the case from BigQuery. Confidence stays at zero until verification runs."""
+        if customer_id in cls._cases:
+            return cls._cases[customer_id]
+
+        flagged = cls._flagged_dispute(customer_id)
+        row = flagged["row"]
+
+        case = AdminCardReviewCase(
+            case_id="CASE-%s-%s" % (customer_id, uuid.uuid4().hex[:6].upper()),
+            customer_id=customer_id,
+            card_name=cls._describe(row, "card_id", "card_product", "card_name"),
+            flagged_transaction=cls._describe(row, "dispute_id", "reason_code", "description"),
+            flagged_amount=cls._describe(row, "disputed_amount", "amount", "amount_usd"),
+            # Zero corroborations so far, because nothing has been verified yet.
+            # The evidence record below carries this as unmeasured rather than
+            # letting the float read as a real score.
+            confidence_score=0.0,
+            verification_passed=False,
+            verification_checks=[],
+            chat_verification_transcript=[],
+            card_status="RESTRICTED_BLOCKED",
+            recommended_admin_decision="RESTRICT_CARD",
+            customer_notification_message=(
+                "Card verification has not run yet for this case; no decision has been made."
+            ),
+        )
+
+        cls._cases[customer_id] = case
+        cls._evidence[customer_id] = {
+            "flagged_dispute": flagged["evidence"],
+            "confidence_basis": unmeasured("no verification checks executed yet"),
+        }
+        return case
 
     @classmethod
     def reset_case(cls, customer_id: str = "CUST00001") -> AdminCardReviewCase:
-        if customer_id in cls._cases:
-            del cls._cases[customer_id]
+        cls._cases.pop(customer_id, None)
+        cls._evidence.pop(customer_id, None)
         return cls.get_or_init_case(customer_id)
 
     @classmethod
@@ -829,96 +1095,79 @@ class AdminCardOversightManager:
         chat_message: str,
         scenario: Optional[str] = None,
     ) -> AdminCardReviewCase:
-        """
-        Evaluates the customer's chat verification statements and updates the Admin Review Case
-        with live verification checks and confidence score.
-        """
-        case = cls.get_or_init_case(customer_id)
-        msg_lower = chat_message.lower()
+        """Runs the chat message through the validator and records the result.
 
-        is_failed_scenario = (
-            scenario == "FAILED"
-            or any(
-                w in msg_lower
-                for w in [
-                    "never logged in from chicago",
-                    "never in chicago",
-                    "lost my phone",
-                    "no 2fa",
-                    "skip verification",
-                    "unverified",
-                    "don't have faceid",
-                ]
+        `scenario` survives only because callers still pass it. A preset verdict
+        is exactly the fabrication this rework removes, so it is logged as a
+        hint that was not honoured and never reaches the outcome.
+        """
+        if scenario:
+            LOG.info(
+                "scenario=%r supplied for %s and ignored; the verdict comes from BigQuery evidence only.",
+                scenario,
+                customer_id,
+            )
+
+        case = cls.get_or_init_case(customer_id)
+        validator = cls._validator()
+        evaluation = validator.validate_claim_against_telemetry(
+            customer_id=customer_id,
+            channel=BankChannel.WEB_PORTAL,
+            claim_text=chat_message,
+            claim_metadata={"surface": "customer_support_chat"},
+        )
+
+        checks = [
+            VerificationCheckItem(
+                check_id=avenue.avenue_id,
+                check_name=avenue.avenue_title,
+                passed=avenue.corroborates_claim,
+                evidence_detail=avenue.finding_summary,
+            )
+            for avenue in evaluation.relevant_avenues_checked
+        ]
+        if not checks:
+            checks = [VerificationCheckItem(
+                check_id="NO_AVENUE_CORROBORATION",
+                check_name="Ground-truth corroboration",
+                passed=False,
+                evidence_detail=(
+                    "No authorised avenue returned rows bearing on this statement. "
+                    "Unread is not the same as clean: %s" % (evaluation.discrepancy_details or NOT_RECORDED)
+                ),
+            )]
+
+        passed = evaluation.veracity_status == VeracityStatus.VERIFIED_TRUE
+
+        case.verification_checks = checks
+        case.verification_passed = passed
+        case.confidence_score = evaluation.confidence_score
+        case.chat_verification_transcript = list(case.chat_verification_transcript) + [
+            {"speaker": "customer", "text": chat_message},
+            {"speaker": "validator", "text": evaluation.recommended_remediation},
+        ]
+        case.recommended_admin_decision = "APPROVE_ENABLE_CARD" if passed else "RESTRICT_CARD"
+        case.customer_notification_message = (
+            "Verification %s. %s" % (
+                "succeeded" if passed else "did not succeed",
+                evaluation.discrepancy_details or evaluation.recommended_remediation,
             )
         )
 
-        if is_failed_scenario:
-            case.card_status = "RESTRICTED"
-            case.confidence_score = 0.14
-            case.customer_chat_verification_transcript = f'Customer Chat Session: "{chat_message}"'
-            case.verification_status = "VERIFICATION_FAILED"
-            case.verification_checks = [
-                VerificationCheckItem(
-                    check_name="Network IP & Location Telemetry Check",
-                    status="FAILED",
-                    detail="Contradicted: Caller denies Chicago session, but IP 203.0.113.19 authenticated in Chicago.",
-                ),
-                VerificationCheckItem(
-                    check_name="Primary Device Biometric Attestation",
-                    status="FAILED",
-                    detail="Missing or unverified hardware Secure Enclave FaceID signature during chat.",
-                ),
-                VerificationCheckItem(
-                    check_name="Claim Veracity Confidence Score",
-                    status="FAILED",
-                    detail="14% Confidence Score (Fails 80% minimum security threshold — HIGH FRAUD RISK).",
-                ),
-            ]
-            case.recommended_admin_action = "REJECT_KEEP_RESTRICTED"
-            case.admin_decision = None
-            case.admin_decision_reason = None
-            case.customer_notification_message = (
-                "⚠️ [SUPPORT CHAT VERIFICATION FAILED — CONFIDENCE: 14%] "
-                "Your verification details contain telemetry contradictions or missing biometric attestation. "
-                "Case escalated to Dashboard Oversight Admin (Recommended Action: NO / Keep Restricted)."
-            )
-        else:
-            case.card_status = "RESTRICTED"
-            case.confidence_score = 0.98
-            case.customer_chat_verification_transcript = f'Customer Chat Session: "{chat_message}"'
-            case.verification_status = "VERIFIED_PASSED"
-            case.verification_checks = [
-                VerificationCheckItem(
-                    check_name="Travel Notice & Geolocation Match",
-                    status="PASSED",
-                    detail="Confirmed ACTIVE_VERIFIED Travel Notice for London, UK + Heathrow Terminal 5 GPS breadcrumb.",
-                ),
-                VerificationCheckItem(
-                    check_name="Primary Device Hardware Attestation",
-                    status="PASSED",
-                    detail="Matched trusted iPhone 16 Pro Secure Enclave Hardware ID (hw-id-8832-ios).",
-                ),
-                VerificationCheckItem(
-                    check_name="Biometric FaceID & 2FA Challenge",
-                    status="PASSED",
-                    detail="Cryptographic FaceID attestation token verified during active chat session.",
-                ),
-                VerificationCheckItem(
-                    check_name="Claim Veracity Confidence Score",
-                    status="PASSED",
-                    detail="98% Confidence Score (Exceeds 80% security threshold for Admin Card Unlock).",
-                ),
-            ]
-            case.recommended_admin_action = "APPROVE_ENABLE_CARD"
-            case.admin_decision = None
-            case.admin_decision_reason = None
-            case.customer_notification_message = (
-                "🔒 [SUPPORT CHAT VERIFICATION PASSED — CONFIDENCE: 98%] "
-                "Your identity, active London travel notice, and iPhone FaceID attestation have been verified in chat. "
-                "Awaiting Dashboard Risk Admin approval ('YES') to enable Card *4821."
-            )
-
         cls._cases[customer_id] = case
+        cls._evidence[customer_id] = {
+            "flagged_dispute": cls._evidence.get(customer_id, {}).get(
+                "flagged_dispute", unmeasured("case built before dispute evidence was captured")
+            ),
+            "veracity_status": computed(evaluation.veracity_status.value, "validator.cross_check"),
+            "confidence_basis": computed(evaluation.confidence_score, "validator.cross_check"),
+            "scenario_hint": (
+                computed({"supplied": scenario, "honoured": False}, "oversight.scenario_hint")
+                if scenario
+                else unmeasured("no scenario hint supplied")
+            ),
+            "claim_evidence": evaluation.multi_avenue_audit,
+        }
         return case
 
     @classmethod
@@ -928,76 +1177,40 @@ class AdminCardOversightManager:
         decision: str,
         admin_notes: Optional[str] = None,
     ) -> AdminCardReviewCase:
-        """
-        Executes the Dashboard Admin's decision:
-        - "APPROVED_YES": Enables/Unlocks the card and notifies the customer in chat.
-        - "REJECTED_NO": Keeps/Restricts the card and notifies the customer in chat that unlock was denied.
-        """
+        """Applies the admin's YES/NO and writes the customer-facing message."""
         case = cls.get_or_init_case(customer_id)
-        mb = CustomerMemoryBank(customer_id=customer_id)
+        normalised = (decision or "").strip().upper()
 
-        if decision.upper() in ("APPROVED_YES", "YES", "APPROVE", "ENABLE"):
-            case.card_status = "ACTIVE"
-            case.admin_decision = "APPROVED_YES"
-            case.admin_decision_reason = admin_notes or (
-                f"Admin verified customer chat identity & telemetry checks (Confidence: {int(case.confidence_score * 100)}%). Card access enabled."
+        if normalised not in ("APPROVED_YES", "REJECTED_NO"):
+            raise VeracityServiceError(
+                "Unknown admin decision %r. Expected APPROVED_YES or REJECTED_NO." % decision
             )
-            case.admin_decision_timestamp = datetime.now(timezone.utc)
-            case.customer_notification_message = (
-                f"🟢 [ADMIN OVERSIGHT DECISION — APPROVED ('YES')]\n"
-                f"The Dashboard Risk Admin reviewed your chat verification details (Confidence: {int(case.confidence_score * 100)}% — PASSED) "
-                f"and APPROVED your card unlock request.\n"
-                f"• Card *4821 Status: ACTIVE & UNLOCKED\n"
-                f"• Apple Pay & POS Provisioning: ENABLED\n"
-                f"• Admin Note: {case.admin_decision_reason}\n"
-                f"You may now complete your purchase at London Heathrow Duty Free immediately."
+
+        approved = normalised == "APPROVED_YES"
+        case.admin_decision = normalised
+        case.card_status = "ACTIVE" if approved else "RESTRICTED_BLOCKED"
+
+        verdict = (
+            cls._evidence.get(customer_id, {}).get("veracity_status")
+            if isinstance(cls._evidence.get(customer_id), dict)
+            else None
+        )
+        basis = value_of(verdict) if verdict else NOT_RECORDED
+
+        case.customer_notification_message = (
+            "Card %s has been unlocked. Verification outcome on file: %s.%s" % (
+                case.card_name, basis, " Admin note: %s" % admin_notes if admin_notes else "",
             )
-            mb.ingest_event(
-                channel=BankChannel.CORE_BANKING,
-                day_label="Admin Oversight Decision - Just Now",
-                summary=(
-                    f"Dashboard Admin APPROVED ('YES') card unlock for Card *4821 after verifying customer chat session "
-                    f"(Confidence: {int(case.confidence_score * 100)}%). Card status set to ACTIVE."
-                ),
-                metadata={
-                    "admin_decision": "APPROVED_YES",
-                    "confidence_score": case.confidence_score,
-                    "card_status": "ACTIVE",
-                },
-                severity=SeverityLevel.LOW,
-                sync_to_cloud=True,
+            if approved else
+            "Card %s stays restricted. Verification outcome on file: %s.%s" % (
+                case.card_name, basis, " Admin note: %s" % admin_notes if admin_notes else "",
             )
-        else:
-            case.card_status = "RESTRICTED"
-            case.admin_decision = "REJECTED_NO"
-            case.admin_decision_reason = admin_notes or (
-                f"Admin denied card unlock due to failed chat verification / telemetry contradiction (Confidence: {int(case.confidence_score * 100)}%)."
-            )
-            case.admin_decision_timestamp = datetime.now(timezone.utc)
-            case.customer_notification_message = (
-                f"🔴 [ADMIN OVERSIGHT DECISION — DENIED ('NO')]\n"
-                f"The Dashboard Risk Admin reviewed your chat verification details (Confidence: {int(case.confidence_score * 100)}% — VERIFICATION FAILED) "
-                f"and DENIED your request to unlock Card *4821.\n"
-                f"• Card *4821 Status: RESTRICTED (BLOCKED)\n"
-                f"• Reason for Denial: {case.admin_decision_reason}\n"
-                f"For your security, Card *4821 remains restricted. Please visit a JPMC Branch with government photo ID or complete primary device biometric verification."
-            )
-            mb.ingest_event(
-                channel=BankChannel.FRAUD_DETECTION,
-                day_label="Admin Oversight Decision - Just Now",
-                summary=(
-                    f"Dashboard Admin DENIED ('NO') card unlock for Card *4821 due to failed verification "
-                    f"(Confidence: {int(case.confidence_score * 100)}%). Card remains RESTRICTED."
-                ),
-                metadata={
-                    "admin_decision": "REJECTED_NO",
-                    "confidence_score": case.confidence_score,
-                    "card_status": "RESTRICTED",
-                },
-                severity=SeverityLevel.HIGH,
-                sync_to_cloud=True,
-            )
+        )
 
         cls._cases[customer_id] = case
         return case
 
+    @classmethod
+    def case_evidence(cls, customer_id: str = "CUST00001") -> Dict[str, Any]:
+        """The provenance-tagged record behind a case, for the trace drawer."""
+        return cls._evidence.get(customer_id, {"note": unmeasured("no case built for %s" % customer_id)})

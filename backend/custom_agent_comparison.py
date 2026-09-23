@@ -1,404 +1,670 @@
 """
-Fair Architectural & Live Execution Comparison:
-Google Native ADK Agent (google.adk.agents.LlmAgent) vs. Custom Non-ADK Framework Agent (LangGraph / State Machine).
-Demonstrates how both native Google ADK agents and external/custom agent frameworks integrate with
-Vertex AI Memory Bank (reasoningEngines) and Knowledge Catalog (text-embedding-005 vector search),
-measuring real latency, token consumption, memory retrieval overhead, and architectural trade-offs.
+custom_agent_comparison.py - the same Memory Bank, reached two different ways.
+
+WHAT THIS PROVES
+    Vertex AI Agent Engine Memory Bank and Dataplex Universal Catalog are
+    *services*, not a framework. The claim this module exists to demonstrate is
+    that an agent written with Google's ADK and an agent written with nothing at
+    all -- a state machine in LangGraph, a Java service on EKS, a Lambda --
+    read the same facts out of the same engine, under the same catalog
+    governance, and arrive at the same ground truth.
+
+    So both lanes below are pointed at ONE `MemoryBankClient`, ONE scope, and
+    ONE `CatalogGovernor`. The engine id is not read from the environment here
+    and is never written in this file: it arrives on the injected client, which
+    is the only way a kit runs in someone else's project without a source edit.
+
+TWO LANES
+
+    ADK lane      google.adk LlmAgent + Runner + VertexAiMemoryBankService.
+                  The Runner owns the memory lifecycle: it preloads memories
+                  before the turn and syncs the session afterwards.
+
+    Custom lane   StandaloneMemoryBankClient. Six lines of urllib over HTTPS.
+                  No ADK, no Vertex SDK, no google-cloud-aiplatform. The lane
+                  reports the literal HTTP requests it made so a reviewer can
+                  confirm there is nothing else going on.
+
+WHAT THIS DELIBERATELY DOES NOT DO
+    The version this replaces invented its own evidence. It carried token
+    counts as source literals (`p_tok = 195`), an integration size nobody
+    counted (`"integration_code_lines_loc": 38`), and a headline improvement
+    derived from those two literals (`"reduces boilerplate by ~73%"`). All
+    three survived a failed run untouched, so a broken demo scored the same as
+    a working one.
+
+    Every number below is either measured in this process or rendered `n/r`:
+
+      - latencies come from `time.perf_counter()` around the real call
+      - token counts come from `models.count_tokens`; if that call fails the
+        field is `unmeasured()`, never a plausible integer
+      - integration size is counted with `inspect.getsource` on the lane
+        method that is actually running, so editing this file changes the
+        number
+      - a lane that could not run reports `status: "did_not_run"` with the
+        real exception text, and contributes no metrics at all
+
+    There is no fallback branch that answers the user when the model call
+    fails. A fabricated answer is the failure mode this rework exists to
+    remove.
+
+Reference:
+    https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/memory-bank/overview
 """
 
+from __future__ import annotations
+
 import asyncio
+import inspect
+import logging
 import os
 import time
-import logging
-from typing import Dict, Any, List, Optional
-import certifi
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from google.adk.agents import LlmAgent
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.adk.memory import VertexAiMemoryBankService
+import uuid
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from backend.memory_bank import CustomerMemoryBank, StandaloneMemoryBankClient, GroundTruthTelemetryStore
-from backend.knowledge_catalog import KnowledgeCatalog
+from backend.memory_bank import (
+    NOT_RECORDED,
+    MemoryBankClient,
+    MemoryBankError,
+    StandaloneMemoryBankClient,
+    field as mb_field,
+)
+from backend.knowledge_catalog import CatalogError, CatalogGovernor
+from backend.provenance import computed, live, unmeasured
 
-load_dotenv()
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+LOG = logging.getLogger(__name__)
 
+# Model id is a capability choice, not a deployment secret, so it carries a
+# default. Project, location and engine id never do.
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-def query_memory_bank_tool(customer_id: str, search_query: str) -> Dict[str, Any]:
-    """ Retrieves relevant customer memories and cross-channel breadcrumbs from Vertex AI Memory Bank."""
-    mb = CustomerMemoryBank(customer_id=customer_id)
-    return mb.retrieve_relevant_memories(query=search_query, top_k=4)
-
-
-def query_knowledge_catalog_tool(policy_query: str) -> List[Dict[str, Any]]:
-    """ Retrieves governing JPMC credit/fraud policies using Vertex AI text-embedding-005 cosine similarity."""
-    policies = KnowledgeCatalog.query_policies(query=policy_query, top_k=3)
-    return [p.model_dump() for p in policies]
+# The tables the comparison asks the catalog about before either lane answers.
+# Named here because they are the demo's question, not a measurement; the
+# ALLOW/REFUSE verdict against them comes from Dataplex at runtime.
+GOVERNED_READS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("authorizations", ("auth_id", "card_id", "amount", "auth_timestamp")),
+    ("disputes", ("dispute_id", "customer_id", "status")),
+)
 
 
-def check_ground_truth_statement_tool(customer_id: str) -> Dict[str, Any]:
-    """ Fetches live account statement ledger and step-up SMS Y/N consent audit trail."""
-    statement = GroundTruthTelemetryStore.fetch_live_account_statement(customer_id)
-    consent = GroundTruthTelemetryStore.fetch_step_up_consent_audit(customer_id)
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000.0, 1)
+
+
+def _source_lines(func: Callable[..., Any]) -> Any:
+    """Counts the real lines of the integration that ran.
+
+    The predecessor asserted 38 versus 142 lines as source literals and then
+    derived a 73% headline from them. This reads the file on disk, so the
+    number moves when the code moves and cannot drift into marketing.
+    """
+    try:
+        body, _ = inspect.getsourcelines(func)
+    except (OSError, TypeError):
+        return NOT_RECORDED
+    return len([ln for ln in body if ln.strip() and not ln.strip().startswith("#")])
+
+
+def _facts_from_memories(memories: List[Dict[str, Any]]) -> List[str]:
+    """Pulls the `fact` string out of a memories:retrieve response."""
+    out = []
+    for item in memories:
+        fact = mb_field(item.get("memory", item), "fact")
+        if fact != NOT_RECORDED:
+            out.append(fact)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Catalog gate - runs once, and both lanes inherit the verdict
+# ---------------------------------------------------------------------------
+
+
+def _catalog_gate(governor: Optional[CatalogGovernor]) -> Dict[str, Any]:
+    """Asks Dataplex what may be read, before either agent reasons.
+
+    This is the Knowledge Catalog capability the demo is about: the catalog is
+    not documentation the agent reads for colour, it is an authorization the
+    agent obeys. A REFUSE here is meant to stop a lane, not decorate it.
+    """
+    if governor is None:
+        return {
+            "status": "not_configured",
+            "detail": "no CatalogGovernor was injected; no table was authorized",
+            "decisions": [],
+        }
+
+    decisions: List[Dict[str, Any]] = []
+    refusals: List[str] = []
+    started = time.perf_counter()
+    try:
+        for table, columns in GOVERNED_READS:
+            verdict = governor.authorize(table=table, columns=list(columns))
+            as_dict = verdict.to_dict() if hasattr(verdict, "to_dict") else dict(verdict)
+            decisions.append(as_dict)
+            if not as_dict.get("allowed", False):
+                refusals.append("%s: %s" % (table, as_dict.get("reason", NOT_RECORDED)))
+    except CatalogError as exc:
+        return {
+            "status": "unavailable",
+            "detail": "Dataplex returned HTTP %s: %s" % (exc.status, exc.body[:400]),
+            "decisions": decisions,
+        }
+
     return {
-        "statement_summary": statement.get("statement_summary", {}),
-        "recent_transactions": statement.get("recent_transactions", []),
-        "step_up_consent_audit": consent,
+        "status": "refused" if refusals else "authorized",
+        "lookup_ms": _elapsed_ms(started),
+        "tables_checked": [t for t, _ in GOVERNED_READS],
+        "decisions": decisions,
+        "refusals": refusals,
+        "note": (
+            "Both lanes are bound by this verdict. The catalog decides what is "
+            "readable; neither agent is trusted to decide for itself."
+        ),
     }
 
 
+# ---------------------------------------------------------------------------
+# Lane 1 - Google ADK
+# ---------------------------------------------------------------------------
+
+
 class GoogleADKNativeAgentRunner:
-    """
-    Google Cloud Native ADK Agent using `google.adk.agents.LlmAgent`, `Runner`,
-    `InMemorySessionService`, and `VertexAiMemoryBankService` (reasoningEngines/915213137995628544).
+    """Memory Bank reached through ADK's managed memory lifecycle.
+
+    The ADK argument is not that it is faster. It is that `Runner` owns the
+    round trip: `VertexAiMemoryBankService` is preloaded into the prompt before
+    the turn and the session is handed back for extraction after it, without
+    the developer writing either call. This lane exists to show that, so it
+    does not hand-roll a retrieve and then claim ADK did it.
     """
 
-    def __init__(self, project_id: Optional[str] = None, location: Optional[str] = None):
-        self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-        self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.agent_engine_id = os.environ.get("VERTEX_AGENT_ENGINE_ID", "915213137995628544")
-        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-        self.session_service = InMemorySessionService()
-        self.memory_service = VertexAiMemoryBankService(
-            project=self.project_id,
-            location=self.location,
-            agent_engine_id=self.agent_engine_id,
+    lane = "GOOGLE_ADK"
+
+    def __init__(
+        self,
+        memory_client: MemoryBankClient,
+        adk_module: Any,
+        model: str = DEFAULT_MODEL,
+    ):
+        self.memory_client = memory_client
+        self.adk_module = adk_module
+        self.model = model
+        # Project / location / engine come off the injected client. Nothing in
+        # this file knows which project it is running in.
+        self.project = memory_client.project
+        self.location = memory_client.location
+        self.engine_id = memory_client.engine_id
+
+    def _tools(self) -> List[Callable[..., Any]]:
+        """The roster's own tools, so the lane tests shipped code, not a stub."""
+        names = (
+            "retrieve_customer_memories_tool",
+            "query_knowledge_catalog_tool",
+            "catalog_governance_authorize_tool",
+            "catalog_lookup_glossary_term_tool",
         )
-        self.adk_agent = LlmAgent(
-            name="jpmc_adk_native_concierge",
-            model="gemini-2.5-flash",
-            instruction=(
-                "You are the JPMC Consumer Credit Native ADK Agent powered by Google Cloud Vertex AI. "
-                "Always ground your responses in the customer's Memory Bank notes, live account statement telemetry, "
-                "and Knowledge Catalog policies (POL-REG-E-001, POL-STEP-UP-2FA-002, POL-VCN-ISSUANCE-004). "
-                "Provide a concise, executive-grade banking resolution explaining root cause and immediate remediation."
-            ),
-            tools=[
-                query_memory_bank_tool,
-                query_knowledge_catalog_tool,
-                check_ground_truth_statement_tool,
-            ],
-        )
+        return [getattr(self.adk_module, n) for n in names if hasattr(self.adk_module, n)]
 
     def execute_turn(self, customer_id: str, user_prompt: str) -> Dict[str, Any]:
-        t_start = time.perf_counter()
+        from google.adk.agents import LlmAgent
+        from google.adk.memory import VertexAiMemoryBankService
+        from google.adk.runners import Runner
+        from google.adk.sessions import InMemorySessionService
+        from google.genai import types
 
-        t_mem_start = time.perf_counter()
-        mb = CustomerMemoryBank(customer_id=customer_id)
-        mem_data = mb.retrieve_relevant_memories(query=user_prompt, top_k=4)
-        t_mem_ms = round((time.perf_counter() - t_mem_start) * 1000.0, 1)
+        started = time.perf_counter()
 
-        t_cat_start = time.perf_counter()
-        policies = KnowledgeCatalog.query_policies(query=user_prompt, top_k=3)
-        t_cat_ms = round((time.perf_counter() - t_cat_start) * 1000.0, 1)
+        memory_service = VertexAiMemoryBankService(
+            project=self.project,
+            location=self.location,
+            agent_engine_id=self.engine_id,
+        )
+        session_service = InMemorySessionService()
 
-        runner = Runner(
-            agent=self.adk_agent,
-            app_name="jpmc_consumer_credit_adk",
-            session_service=self.session_service,
-            memory_service=self.memory_service,
+        tools = self._tools()
+        agent = LlmAgent(
+            name="ccb_adk_lane",
+            model=self.model,
+            instruction=(
+                "You are a JPMC consumer credit fraud desk agent.\n"
+                "Answer only from what the Memory Bank and the golden BigQuery "
+                "queries give you. Amounts, dates, deadlines and dispute ids "
+                "come from BigQuery at the moment you answer, never from a "
+                "memory. If a value was not returned to you, say it was not "
+                "returned; do not supply a plausible one."
+            ),
+            tools=tools,
         )
 
+        app_name = "ccb_fraud_desk_adk_lane"
+        session_id = "adk-%s" % uuid.uuid4().hex[:12]
         response_text = ""
-        tool_calls_made = []
-        session_id = f"adk-sess-{int(time.time())}"
+        tool_calls: List[str] = []
 
-        async def _run_adk():
-            nonlocal response_text, tool_calls_made
-            await self.session_service.create_session(
-                app_name="jpmc_consumer_credit_adk",
-                user_id=customer_id,
-                session_id=session_id,
+        async def _drive() -> None:
+            nonlocal response_text
+            await session_service.create_session(
+                app_name=app_name, user_id=customer_id, session_id=session_id
             )
-            content = types.Content(
+            runner = Runner(
+                app_name=app_name,
+                agent=agent,
+                session_service=session_service,
+                memory_service=memory_service,
+            )
+            message = types.Content(
                 role="user",
-                parts=[
-                    types.Part(
-                        text=(
-                            f"Customer ID: {customer_id}\n"
-                            f"Customer Inquiry: {user_prompt}\n"
-                            f"Preloaded Memory Bank Context: {mem_data['retrieved_fragments']}\n"
-                            f"Governing Knowledge Catalog Policies: {[p.policy_id + ': ' + p.title for p in policies]}"
-                        )
-                    )
-                ],
+                parts=[types.Part(text="Customer %s: %s" % (customer_id, user_prompt))],
             )
-            async for event in runner.run_async(
-                user_id=customer_id,
-                session_id=session_id,
-                new_message=content,
-            ):
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if part.function_call:
-                            tool_calls_made.append(part.function_call.name)
-                        if part.text:
-                            response_text += part.text
-
-        try:
-            loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(_run_adk())
+                async for event in runner.run_async(
+                    user_id=customer_id, session_id=session_id, new_message=message
+                ):
+                    if not (event.content and event.content.parts):
+                        continue
+                    for part in event.content.parts:
+                        if getattr(part, "function_call", None):
+                            tool_calls.append(part.function_call.name)
+                        if getattr(part, "text", None):
+                            response_text += part.text
             finally:
-                loop.close()
-        except Exception as e:
-            logging.warning("ADK Runner execution fallback triggered: %s", e)
+                await runner.close()
 
-        if not response_text.strip():
-            client = genai.Client(vertexai=True, project=self.project_id, location=self.location)
-            fallback_prompt = (
-                f"You are the Google ADK Native Concierge Agent for customer {customer_id}.\n"
-                f"Memory Bank Context: {mem_data['retrieved_fragments']}\n"
-                f"Policies: {[p.title for p in policies]}\n"
-                f"User Query: {user_prompt}\n"
-                "Provide a concise resolution grounded in Memory Bank and Knowledge Catalog policies."
-            )
-            res = client.models.generate_content(model="gemini-2.5-flash", contents=fallback_prompt)
-            response_text = res.text or "ADK Agent synthesized resolution."
-
-        total_ms = round((time.perf_counter() - t_start) * 1000.0, 1)
-
+        loop = asyncio.new_event_loop()
         try:
-            client = genai.Client(vertexai=True, project=self.project_id, location=self.location)
-            p_tok = client.models.count_tokens(model="gemini-2.5-flash", contents=user_prompt).total_tokens or 180
-            c_tok = client.models.count_tokens(model="gemini-2.5-flash", contents=response_text).total_tokens or 220
-        except Exception:
-            p_tok = 195
-            c_tok = 240
+            loop.run_until_complete(_drive())
+        finally:
+            loop.close()
+
+        total_ms = _elapsed_ms(started)
+
+        # Ask the service what it now holds for this customer. This is the ADK
+        # lane's answer to "did the turn reach Memory Bank", and it is read
+        # back from the API rather than asserted.
+        scope = {"customer_id": customer_id}
+        memories = self.memory_client.retrieve(scope, query=user_prompt, top_k=5)
 
         return {
-            "agent_type": "GOOGLE_ADK_NATIVE_AGENT",
-            "framework": "Google Agent Development Kit (google.adk.agents.LlmAgent + VertexAiMemoryBankService)",
-            "vertex_agent_engine_id": self.agent_engine_id,
-            "response_text": response_text.strip(),
+            "lane": self.lane,
+            "status": "ran",
+            "framework": "google-adk: LlmAgent + Runner + VertexAiMemoryBankService",
+            "memory_bank_resource": self.memory_client.parent,
+            "response_text": response_text.strip() or NOT_RECORDED,
+            "tools_bound": [t.__name__ for t in tools],
+            "tool_calls_observed": tool_calls or [],
+            "memory_facts_visible": _facts_from_memories(memories),
             "metrics": {
                 "total_latency_ms": total_ms,
-                "memory_bank_retrieval_ms": t_mem_ms,
-                "knowledge_catalog_lookup_ms": t_cat_ms,
-                "prompt_tokens": p_tok + 340,
-                "completion_tokens": c_tok,
-                "memory_vectors_injected": mem_data["retrieved_count"],
-                "policies_matched": len(policies),
-                "tool_calls_invoked": tool_calls_made or ["preload_memory_tool", "query_knowledge_catalog_tool"],
-                "integration_code_lines_loc": 38,
+                "memory_retrieval": "managed by Runner (PreloadMemoryTool)",
+                "integration_lines_of_code": _source_lines(
+                    GoogleADKNativeAgentRunner.execute_turn
+                ),
             },
-            "architecture_highlights": [
-                "Zero-Boilerplate Memory Lifecycle: Runner automatically invokes PreloadMemoryTool and syncs session events to VertexAiMemoryBankService (reasoningEngines/915213137995628544).",
-                "Native Tool Schema Binding: Python functions with docstrings are automatically compiled into Gemini function-calling declarations.",
-                "Built-in Enterprise Safety & Tracing: Automatic OpenTelemetry Cloud Trace span generation and Model Armor policy hooks.",
+            "what_the_framework_did_for_us": [
+                "Runner preloaded Memory Bank into the prompt; this lane wrote "
+                "no retrieve call for that step.",
+                "Session events were handed to VertexAiMemoryBankService for "
+                "asynchronous extraction; this lane wrote no generate call.",
+                "Python callables became Gemini function declarations from "
+                "their signatures and docstrings.",
             ],
         }
+
+
+# ---------------------------------------------------------------------------
+# Lane 2 - no framework at all
+# ---------------------------------------------------------------------------
 
 
 class CustomFrameworkStateAgentRunner:
-    """
-    Custom Non-ADK Framework Agent (Modeling a LangGraph / Custom State-Machine Agent running on AWS EKS / On-Prem)
-    that integrates with Google's Memory Bank and Knowledge Catalog via Standalone REST/SDK Client (`StandaloneMemoryBankClient`).
-    Demonstrates zero Agent Builder lock-in while highlighting explicit state management responsibilities.
+    """Memory Bank reached with urllib and a bearer token.
+
+    Stands in for a LangGraph graph, a CrewAI crew, or a Java service on EKS:
+    anything that is not ADK and is not necessarily on Google Cloud. The point
+    is the symmetry with the lane above, not the prose - it reads the same
+    scope out of the same engine and gets the same facts.
+
+    The cost is visible rather than argued: this lane performs retrieval and
+    persistence itself, in explicit steps, and reports the HTTP calls it made.
     """
 
-    def __init__(self, project_id: Optional[str] = None, location: Optional[str] = None):
-        self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-        self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.agent_engine_id = os.environ.get("VERTEX_AGENT_ENGINE_ID", "915213137995628544")
-        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-        self.client = genai.Client(vertexai=True, project=self.project_id, location=self.location)
+    lane = "CUSTOM_NO_FRAMEWORK"
+
+    def __init__(
+        self,
+        memory_client: MemoryBankClient,
+        model: str = DEFAULT_MODEL,
+        framework_name: str = "LangGraph / custom state machine",
+    ):
+        self.memory_client = memory_client
+        self.model = model
+        self.framework_name = framework_name
 
     def execute_turn(self, customer_id: str, user_prompt: str) -> Dict[str, Any]:
-        t_start = time.perf_counter()
-        state_graph_log = []
+        from google import genai
+        from google.genai import types
 
-        # State Node 1: Standalone Memory Bank REST/SDK Preload
-        t_mem_start = time.perf_counter()
-        standalone_client = StandaloneMemoryBankClient(customer_id=customer_id)
-        mem_payload = standalone_client.preload_context_for_external_agent(
-            user_query=user_prompt,
-            framework_name="LangGraph / Custom State Machine (AWS EKS)",
-        )
-        t_mem_ms = round((time.perf_counter() - t_mem_start) * 1000.0, 1)
-        state_graph_log.append(
-            f"[Node 1: fetch_memory_vectors] Retrieved {len(mem_payload['retrieved_memories'])} vectors via StandaloneMemoryBankClient ({t_mem_ms}ms)"
-        )
+        started = time.perf_counter()
+        trace: List[str] = []
 
-        # State Node 2: Standalone Knowledge Catalog Embedding Lookup
-        t_cat_start = time.perf_counter()
-        policies = KnowledgeCatalog.query_policies(query=user_prompt, top_k=3)
-        statement = GroundTruthTelemetryStore.fetch_live_account_statement(customer_id)
-        consent = GroundTruthTelemetryStore.fetch_step_up_consent_audit(customer_id)
-        t_cat_ms = round((time.perf_counter() - t_cat_start) * 1000.0, 1)
-        state_graph_log.append(
-            f"[Node 2: query_knowledge_catalog] Matched {len(policies)} policies via text-embedding-005 cosine similarity ({t_cat_ms}ms)"
+        # Node 1 - retrieve. Explicit, because nothing does it for us.
+        t_mem = time.perf_counter()
+        standalone = StandaloneMemoryBankClient(
+            client=self.memory_client,
+            customer_id=customer_id,
+            framework_name=self.framework_name,
+        )
+        bundle = standalone.preload_context_for_external_agent(
+            user_query=user_prompt, top_k=5
+        )
+        mem_ms = _elapsed_ms(t_mem)
+        trace.append(
+            "node 1 retrieve: memories:retrieve returned %s fact(s) in %sms"
+            % (bundle["memory_count"], mem_ms)
         )
 
-        # State Node 3: Manual Prompt Template Assembly & LLM Generation
-        state_prompt = f"""[CUSTOM LANGGRAPH STATE MACHINE AGENT • EXTERNAL ORCHESTRATOR]
-You are an external custom banking agent running outside Google Agent Builder (e.g., on AWS EKS or On-Premise)
-consuming Google Cloud Vertex AI Memory Bank & Knowledge Catalog via standalone REST/SDK APIs.
+        # Node 2 - prompt assembly. Also explicit.
+        prompt = (
+            "You are a JPMC consumer credit fraud desk agent running outside "
+            "Google Cloud, on your own runtime.\n\n"
+            "%s\n\n"
+            "Customer %s asks: %s\n\n"
+            "Answer only from the facts above. Amounts, dates, deadlines and "
+            "dispute ids are owned by BigQuery and are not in this prompt; if "
+            "one is needed, say it must be fetched. Do not supply a plausible "
+            "value."
+        ) % (bundle["prompt_block"], customer_id, user_prompt)
+        trace.append("node 2 assemble: prompt built by hand from the retrieved facts")
 
-STATE DICTIONARY INJECTION:
-- Customer ID: {customer_id}
-- Standalone Memory Bank Vectors (768-dim text-embedding-005): {mem_payload['retrieved_memories']}
-- Knowledge Catalog Policies: {[p.policy_id + ' (' + p.title + '): ' + p.automated_action for p in policies]}
-- Ground-Truth Account Statement Status: {statement.get('statement_summary')}
-- Step-Up Consent Logs: {consent}
+        # Node 3 - generate. No fallback: a failed call is a failed lane.
+        client = genai.Client(
+            vertexai=True, project=self.memory_client.project, location=self.memory_client.location
+        )
+        t_llm = time.perf_counter()
+        result = client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.1),
+        )
+        llm_ms = _elapsed_ms(t_llm)
+        response_text = (result.text or "").strip()
+        trace.append("node 3 generate: %s answered in %sms" % (self.model, llm_ms))
 
-CUSTOMER QUERY: "{user_prompt}"
-
-Provide a clear, structured banking response explaining how your custom state machine resolved the customer's issue using the retrieved Memory Bank and Knowledge Catalog facts."""
-
+        # Node 4 - persist. The framework would have done this for us.
+        persistence: Dict[str, Any]
         try:
-            res = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=state_prompt,
-                config=types.GenerateContentConfig(temperature=0.1),
+            persistence = standalone.persist_turns_after_run(
+                [
+                    {"role": "user", "text": user_prompt},
+                    {"role": "agent", "text": response_text},
+                ]
             )
-            response_text = res.text or "Custom State Machine Agent synthesized resolution."
-        except Exception as e:
-            logging.warning("Custom agent LLM call fallback: %s", e)
-            response_text = "Custom State Machine Agent verified London Travel Notice and SIM-swap step-up interception."
+            trace.append(
+                "node 4 persist: memories:generate accepted 2 turns, operation %s"
+                % persistence.get("operation", NOT_RECORDED)
+            )
+        except MemoryBankError as exc:
+            persistence = {"error": "HTTP %s: %s" % (exc.status, exc.body[:300])}
+            trace.append("node 4 persist: FAILED - %s" % persistence["error"])
 
-        state_graph_log.append("[Node 3: invoke_llm_node] Executed Gemini 2.5 Flash completion over manually assembled state dictionary.")
-
-        # State Node 4: Explicit Post-Turn Memory Serialization & Ingestion
-        state_graph_log.append("[Node 4: sync_post_turn_memory] Explicitly serialized turn state to Vertex AI Memory Bank API.")
-
-        total_ms = round((time.perf_counter() - t_start) * 1000.0, 1)
-
-        try:
-            p_tok = self.client.models.count_tokens(model="gemini-2.5-flash", contents=state_prompt).total_tokens or 480
-            c_tok = self.client.models.count_tokens(model="gemini-2.5-flash", contents=response_text).total_tokens or 230
-        except Exception:
-            p_tok = 510
-            c_tok = 245
+        usage = getattr(result, "usage_metadata", None)
+        tokens: Dict[str, Any] = {
+            "prompt_tokens": (
+                getattr(usage, "prompt_token_count", None)
+                if usage is not None
+                else None
+            ),
+            "response_tokens": (
+                getattr(usage, "candidates_token_count", None)
+                if usage is not None
+                else None
+            ),
+        }
+        for key, value in list(tokens.items()):
+            if value is None:
+                tokens[key] = unmeasured("genai usage_metadata absent on this response")
 
         return {
-            "agent_type": "CUSTOM_NON_ADK_AGENT",
-            "framework": "Custom State-Machine / LangGraph Agent (Standalone REST/SDK Consumer)",
-            "vertex_agent_engine_id": self.agent_engine_id,
-            "response_text": response_text.strip(),
-            "state_graph_execution_trace": state_graph_log,
+            "lane": self.lane,
+            "status": "ran",
+            "framework": "%s - urllib over HTTPS, no ADK, no Vertex SDK"
+            % self.framework_name,
+            "memory_bank_resource": self.memory_client.parent,
+            "response_text": response_text or NOT_RECORDED,
+            "memory_facts_visible": [
+                f for f in bundle["facts"] if f != NOT_RECORDED
+            ],
+            "state_graph_trace": trace,
+            "http_calls_made": bundle["http_calls"],
+            "persistence": persistence,
             "metrics": {
-                "total_latency_ms": total_ms,
-                "memory_bank_retrieval_ms": t_mem_ms,
-                "knowledge_catalog_lookup_ms": t_cat_ms,
-                "prompt_tokens": p_tok,
-                "completion_tokens": c_tok,
-                "memory_vectors_injected": len(mem_payload["retrieved_memories"]),
-                "policies_matched": len(policies),
-                "tool_calls_invoked": ["StandaloneMemoryBankClient.preload_context", "KnowledgeCatalog.query_policies"],
-                "integration_code_lines_loc": 142,
+                "total_latency_ms": _elapsed_ms(started),
+                "memory_retrieval_ms": mem_ms,
+                "model_latency_ms": llm_ms,
+                "tokens": tokens,
+                "integration_lines_of_code": _source_lines(
+                    CustomFrameworkStateAgentRunner.execute_turn
+                ),
             },
-            "architecture_highlights": [
-                "100% Orchestration Independence: Runs on any external runtime (AWS EKS, Azure AKS, On-Premise Java/Python) without Google Agent Builder lock-in.",
-                "Explicit Deterministic State Graph: Full control over DAG transitions, custom retry middleware, and manual prompt templating.",
-                "Higher Boilerplate Responsibility: Developer must manually code REST/gRPC memory retrieval, token budgeting, session serialization, and PII scrubbing.",
+            "what_we_had_to_write_ourselves": [
+                "The retrieve call, and the decision of when to make it.",
+                "The prompt block: turning facts into text the model reads.",
+                "The write-back after the turn, including its failure handling.",
             ],
         }
 
 
+# ---------------------------------------------------------------------------
+# The comparison
+# ---------------------------------------------------------------------------
+
+
 class AgentComparisonEngine:
+    """Runs both lanes against one Memory Bank and reports what differed.
+
+    `adk_module` and `adk_import_error` come from `backend/app.py`, which
+    records import failures instead of swallowing them. If the roster did not
+    import, the ADK lane reports why and the custom lane still runs: a partial
+    result that says which half is missing beats a whole result that is half
+    invented.
     """
-    Executes side-by-side live runs of Google ADK Native Agent vs. Custom Non-ADK Agent
-    and returns comparative performance telemetry and an unbiased 6-Dimension Architectural Trade-Off Matrix.
-    """
+
+    def __init__(
+        self,
+        memory_client: MemoryBankClient,
+        adk_module: Any = None,
+        adk_import_error: Optional[str] = None,
+        catalog_governor: Optional[CatalogGovernor] = None,
+        model: str = DEFAULT_MODEL,
+    ):
+        if memory_client is None:
+            raise ValueError(
+                "memory_client is required. Both lanes must be pointed at the "
+                "same engine or the comparison proves nothing."
+            )
+        self.memory_client = memory_client
+        self.adk_module = adk_module
+        self.adk_import_error = adk_import_error
+        self.catalog_governor = catalog_governor
+        self.model = model
+
+    # -- lanes -------------------------------------------------------------
+
+    def _adk_lane(self, customer_id: str, user_prompt: str) -> Dict[str, Any]:
+        if self.adk_module is None:
+            return {
+                "lane": GoogleADKNativeAgentRunner.lane,
+                "status": "did_not_run",
+                "reason": self.adk_import_error
+                or "backend.adk_agents was not supplied to AgentComparisonEngine",
+            }
+        try:
+            return GoogleADKNativeAgentRunner(
+                memory_client=self.memory_client,
+                adk_module=self.adk_module,
+                model=self.model,
+            ).execute_turn(customer_id, user_prompt)
+        except Exception as exc:  # noqa: BLE001 - the real reason is the payload
+            LOG.exception("ADK lane failed")
+            return {
+                "lane": GoogleADKNativeAgentRunner.lane,
+                "status": "did_not_run",
+                "reason": "%s: %s" % (type(exc).__name__, exc),
+            }
+
+    def _custom_lane(self, customer_id: str, user_prompt: str) -> Dict[str, Any]:
+        try:
+            return CustomFrameworkStateAgentRunner(
+                memory_client=self.memory_client, model=self.model
+            ).execute_turn(customer_id, user_prompt)
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("custom lane failed")
+            return {
+                "lane": CustomFrameworkStateAgentRunner.lane,
+                "status": "did_not_run",
+                "reason": "%s: %s" % (type(exc).__name__, exc),
+            }
+
+    # -- the finding -------------------------------------------------------
 
     @staticmethod
-    def run_side_by_side_comparison(customer_id: str, user_prompt: str) -> Dict[str, Any]:
-        from concurrent.futures import ThreadPoolExecutor
+    def _parity(adk: Dict[str, Any], custom: Dict[str, Any]) -> Dict[str, Any]:
+        """Did both lanes see the same facts?
 
-        adk_runner = GoogleADKNativeAgentRunner()
-        custom_runner = CustomFrameworkStateAgentRunner()
+        This is the only claim the module makes that is worth anything, so it
+        is computed from the two payloads rather than asserted in prose. If a
+        lane did not run there is no parity to report, and it says so.
+        """
+        if adk.get("status") != "ran" or custom.get("status") != "ran":
+            return {
+                "verdict": "not_established",
+                "detail": (
+                    "only one lane ran, so nothing was compared. This is not a "
+                    "pass and not a failure."
+                ),
+                "adk_status": adk.get("status"),
+                "custom_status": custom.get("status"),
+            }
+        left = set(adk.get("memory_facts_visible") or [])
+        right = set(custom.get("memory_facts_visible") or [])
+        if not left and not right:
+            return {
+                "verdict": "no_memories",
+                "detail": (
+                    "both lanes reached the engine and both found the scope "
+                    "empty. Seed it with scripts/seed_atomic_memories.py."
+                ),
+            }
+        return {
+            "verdict": "identical" if left == right else "diverged",
+            "facts_seen_by_both": sorted(left & right),
+            "adk_only": sorted(left - right),
+            "custom_only": sorted(right - left),
+            "detail": (
+                "Same engine, same scope, same facts - the framework changed "
+                "nothing about what the agent knew."
+                if left == right
+                else "The lanes disagree. Memory Bank extraction is "
+                "asynchronous, so a recent write may be visible to one call "
+                "and not the next; re-run before concluding anything."
+            ),
+        }
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            fut_adk = executor.submit(adk_runner.execute_turn, customer_id, user_prompt)
-            fut_custom = executor.submit(custom_runner.execute_turn, customer_id, user_prompt)
-            adk_result = fut_adk.result()
-            custom_result = fut_custom.result()
+    @staticmethod
+    def _trade_offs(adk: Dict[str, Any], custom: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Qualitative only, plus the two line counts that were measured.
 
-        trade_off_matrix = [
+        No percentages. The version this replaces claimed a 73% reduction
+        computed from two invented integers.
+        """
+
+        def loc(payload: Dict[str, Any]) -> Any:
+            return (payload.get("metrics") or {}).get(
+                "integration_lines_of_code", NOT_RECORDED
+            )
+
+        return [
             {
-                "dimension": "1. Memory Bank Integration & Lifecycle",
-                "google_adk_agent": (
-                    "Native `VertexAiMemoryBankService` + `PreloadMemoryTool`. Automatic pre-turn vector injection "
-                    "and post-session `add_session_to_memory()` background sync to `reasoningEngines`."
-                ),
-                "custom_non_adk_agent": (
-                    "Consumes Memory Bank via `StandaloneMemoryBankClient` / REST API (`memories.retrieve` & `memories.create`). "
-                    "Requires manual state dictionary serialization and explicit async write calls."
-                ),
-                "trade_off_verdict": "ADK wins on developer velocity (3x less code); Custom Agent wins when embedding into existing non-Google state machines.",
+                "dimension": "Memory Bank lifecycle",
+                "adk": "Runner preloads and writes back. The developer writes neither call.",
+                "custom": "Both calls are the developer's: retrieve before, generate after.",
+                "note": "Same REST surface underneath; the difference is who calls it.",
             },
             {
-                "dimension": "2. Knowledge Catalog & Vector Grounding",
-                "google_adk_agent": (
-                    "Declarative Python function tools automatically bound to Gemini's function-calling schema; "
-                    "seamless multi-turn tool execution."
-                ),
-                "custom_non_adk_agent": (
-                    "Direct invocation of `text-embedding-005` cosine similarity search (`KnowledgeCatalog.query_policies`) "
-                    "inside deterministic graph nodes before LLM prompt assembly."
-                ),
-                "trade_off_verdict": "ADK provides dynamic LLM-driven tool selection; Custom Agent guarantees deterministic pre-LLM retrieval on every turn.",
+                "dimension": "Knowledge Catalog governance",
+                "adk": "Catalog authorization is a bound tool the model may invoke.",
+                "custom": "Catalog authorization is a graph node that always runs.",
+                "note": "In this build the gate runs once, before both lanes, so neither "
+                        "can answer from a table Dataplex refused.",
             },
             {
-                "dimension": "3. Multi-Cloud & Hybrid Portability (AWS / On-Prem)",
-                "google_adk_agent": (
-                    "Optimized for GCP Cloud Run and Vertex AI Agent Engine managed runtime; can run elsewhere "
-                    "but couples orchestration to ADK runtime libraries."
-                ),
-                "custom_non_adk_agent": (
-                    "100% runtime agnostic. Runs natively inside AWS ECS/EKS, Azure, or JPMC On-Premise Kubernetes "
-                    "connecting to GCP Memory Bank via Workload Identity Federation (Keyless STS)."
-                ),
-                "trade_off_verdict": "Custom Agent wins for strict multi-cloud/AWS-hosted agent mandates requiring zero orchestration lock-in.",
+                "dimension": "Where it can run",
+                "adk": "Anywhere the ADK runtime installs; at home on Agent Engine and Cloud Run.",
+                "custom": "Anywhere with an HTTPS client and a bearer token, including AWS and on-prem.",
+                "note": "Memory Bank itself imposes no constraint - that is the point of the custom lane.",
             },
             {
-                "dimension": "4. Orchestration Control & Determinism",
-                "google_adk_agent": (
-                    "Autonomous `LlmAgent` / Hierarchical Sub-Agent delegation (`transfer_to_agent`). "
-                    "High flexibility for complex conversational routing."
-                ),
-                "custom_non_adk_agent": (
-                    "Explicit Directed Acyclic Graph (DAG) / State Machine transitions (e.g., LangGraph nodes). "
-                    "Strict deterministic ordering of compliance checks."
-                ),
-                "trade_off_verdict": "Tie — ADK excels at dynamic conversational concierges; Custom State Graphs excel at rigid, regulatory-locked workflows.",
-            },
-            {
-                "dimension": "5. Enterprise Governance, Safety & Observability",
-                "google_adk_agent": (
-                    "Out-of-the-box integration with Google Cloud Model Armor (prompt injection & PII shields) "
-                    "and automatic OpenTelemetry Cloud Trace spans."
-                ),
-                "custom_non_adk_agent": (
-                    "Requires custom API Gateway wrappers, manual OpenTelemetry instrumentation, and standalone "
-                    "DLP / Model Armor REST API calls."
-                ),
-                "trade_off_verdict": "ADK significantly reduces compliance and observability engineering overhead on GCP.",
-            },
-            {
-                "dimension": "6. Code Complexity & Maintenance Overhead",
-                "google_adk_agent": f"~{adk_result['metrics']['integration_code_lines_loc']} Lines of Code (Declarative Agent + Tool bindings).",
-                "custom_non_adk_agent": f"~{custom_result['metrics']['integration_code_lines_loc']} Lines of Code (Manual State Graph, REST client, prompt templating).",
-                "trade_off_verdict": "ADK reduces integration boilerplate by ~73%.",
+                "dimension": "Integration size, measured this run",
+                "adk": loc(adk),
+                "custom": loc(custom),
+                "note": "Counted with inspect.getsourcelines on the method that ran, "
+                        "excluding blanks and comments. Not a benchmark: the lanes do "
+                        "not do identical work.",
             },
         ]
 
+    def run_side_by_side_comparison(
+        self, customer_id: str, user_prompt: str
+    ) -> Dict[str, Any]:
+        started = time.perf_counter()
+
+        # One catalog verdict, binding on both lanes.
+        gate = _catalog_gate(self.catalog_governor)
+        if gate["status"] == "refused":
+            return {
+                "comparison_id": "cmp-%s" % uuid.uuid4().hex[:12],
+                "customer_id": customer_id,
+                "user_prompt": user_prompt,
+                "status": "BLOCKED_BY_CATALOG",
+                "catalog_gate": live(gate, "Dataplex CatalogGovernor.authorize"),
+                "detail": (
+                    "Dataplex refused a table both lanes need, so neither ran. "
+                    "A governance refusal that still returns an answer is not "
+                    "governance."
+                ),
+            }
+
+        # Sequential, not threaded. Two lanes racing for the same bearer token
+        # and the same engine produced latencies that measured contention
+        # rather than the framework.
+        adk = self._adk_lane(customer_id, user_prompt)
+        custom = self._custom_lane(customer_id, user_prompt)
+
         return {
-            "comparison_id": f"cmp-run-{int(time.time())}",
+            "comparison_id": "cmp-%s" % uuid.uuid4().hex[:12],
             "customer_id": customer_id,
             "user_prompt": user_prompt,
-            "google_adk_agent_result": adk_result,
-            "custom_non_adk_agent_result": custom_result,
-            "architectural_trade_off_matrix": trade_off_matrix,
-            "executive_summary": (
-                "Both Google ADK Agents and Custom Non-ADK Agents achieve 100% epistemic parity by sharing the exact same "
-                "Vertex AI Memory Bank (`reasoningEngines/915213137995628544`) and Knowledge Catalog (`text-embedding-005`). "
-                "JPMC can deploy Google ADK for rapid, fully managed GCP concierge workflows while seamlessly connecting "
-                "existing AWS/On-Prem LangGraph or custom microservices to the same Memory Bank without lock-in."
+            "status": "SUCCESS",
+            "memory_bank_resource": self.memory_client.parent,
+            "model": self.model,
+            "catalog_gate": live(gate, "Dataplex CatalogGovernor.authorize"),
+            "google_adk_agent_result": adk,
+            "custom_non_adk_agent_result": custom,
+            "memory_parity": computed(
+                self._parity(adk, custom),
+                "set comparison of memory_facts_visible from both lanes",
+            ),
+            "architectural_trade_off_matrix": self._trade_offs(adk, custom),
+            "wall_clock_ms": _elapsed_ms(started),
+            "reading_this": (
+                "Both lanes address %s. Any lane marked did_not_run contributes "
+                "no metrics and no answer - read its `reason` rather than the "
+                "other lane's numbers." % self.memory_client.parent
             ),
         }

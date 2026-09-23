@@ -1,19 +1,32 @@
 """
-Gemini Enterprise Synthesizer Agent.
-Reads cross-system notes from the shared Memory Bank and Knowledge Catalog, performing automated
-causal synthesis without asking redundant clarification questions.
+Synthesizer agent for the CCB Fraud Desk.
+
+Its one job is to turn what the bank already knows into an answer the customer
+does not have to be interrogated for. It reads memories from Vertex AI Memory
+Bank and rows from the parameterised BigQuery golden queries, asks Gemini to
+join them, and streams the result as JSON-RPC 2.0 trace frames.
+
+Two rules shape the code below:
+
+  - If the model call fails, the failure is what comes back. There is no
+    rehearsed narrative standing by to make a broken run look like a good one.
+  - The causal chain is built from retrieved records, so it is as long as the
+    evidence is. No evidence produces one step that says so, not three invented
+    ones.
 """
 
-import os
 import json
 import logging
-from typing import Generator, Dict, Any, List, Optional
+import os
+from typing import Any, Dict, Generator, List, Optional
+
 import certifi
 from dotenv import load_dotenv
 from google import genai
-from backend.models import SynthesisResult, CausalStep, SeverityLevel
-from backend.memory_bank import CustomerMemoryBank, GroundTruthTelemetryStore
-from backend.knowledge_catalog import KnowledgeCatalog
+
+from backend.models import BankChannel, CausalStep, SynthesisResult
+from backend.memory_bank import MemoryBankClient, MemoryBankError, field as mb_field
+from backend.provenance import NOT_RECORDED, computed, identity, live, require_env, unmeasured
 
 load_dotenv()
 
@@ -25,23 +38,45 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
 )
 
+AGENT_NAME = "ConsumerCreditSynthesizerAgent"
+AGENT_SOURCE = "backend/agent.py:AGENT_NAME"
+
+# The mandated containment order. A policy constant the behaviour layer grades
+# against, not something this process observed.
+CONTAINMENT_SEQUENCE = (
+    "freeze_card",
+    "revoke_wallet_token",
+    "issue_virtual_card",
+    "order_replacement_card",
+)
+
+SYSTEM_INSTRUCTION = (
+    "You are the Consumer Credit and Fraud Desk synthesizer for a retail bank.\n"
+    "You are given two things: memories retrieved from this customer's Memory "
+    "Bank, and rows returned by governed BigQuery queries.\n\n"
+    "Rules:\n"
+    "1. Ask nothing. Everything the customer told any channel is in the memories "
+    "below; re-asking is the failure this desk exists to remove.\n"
+    "2. Use only the supplied memories and rows. If a figure, date or identifier "
+    "is not in them, write n/r. Never estimate one.\n"
+    "3. Debit and credit disputes are governed by different rules. Name the rule "
+    "per card, and only when the supplied rows name that card and dispute.\n"
+    "4. When two facts conflict, say which is newer and why it wins."
+)
+
 
 class MemoryBankSynthesizerAgent:
-    """
-    Enterprise Agent using Google Gen AI SDK on Vertex AI / Gemini Enterprise.
-    Consumes cross-system Memory Bank observations and Knowledge Catalog ground-truths,
-    providing direct, zero-question causal resolution.
-    """
+    """Gemini on Vertex AI, grounded in Memory Bank plus the golden queries."""
 
     def __init__(
         self,
         project_id: Optional[str] = None,
         location: Optional[str] = None,
-        model_name: str = "gemini-2.5-flash",
+        model_name: Optional[str] = None,
     ):
-        self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
+        self.project_id = project_id or require_env("GOOGLE_CLOUD_PROJECT")
         self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.model_name = model_name
+        self.model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
         self._client: Optional[genai.Client] = None
 
     @property
@@ -49,210 +84,308 @@ class MemoryBankSynthesizerAgent:
         if self._client is None:
             os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
             self._client = genai.Client(
-                vertexai=True,
-                project=self.project_id,
-                location=self.location,
+                vertexai=True, project=self.project_id, location=self.location
             )
         return self._client
 
-    def _call_genai_synthesis(self, prompt: str, memory_context: str, kg_context: str) -> str:
-        """Invoke Gemini Enterprise model to synthesize Memory Bank & Knowledge Catalog notes."""
-        system_instruction = (
-            "You are the senior Consumer Credit & Fraud Desk Synthesizer Agent for JPMorgan Chase.\n"
-            "You have direct real-time access to customer CUST00001's shared enterprise Memory Bank (Reasoning Engine 4277754991222980608) "
-            "and Dataplex Knowledge Catalog (ccb-fraud-disputes) / BigQuery dataset (jpmc_ccb_fraud).\n\n"
-            "CRITICAL MANDATORY RULES:\n"
-            "1. ZERO QUESTIONS: Never re-ask questions already consolidated across the 9 prior sessions and 5 channels.\n"
-            "2. DUAL RULEBOOK PRECISION:\n"
-            "   - Debit Card CARD00004 (DSP00033 · €620.00 in Lisbon) is governed by Regulation E (12 CFR 1005.11): provisional credit is required within 10 business days (due 23 Sep 2026, skipping weekends 12-13 & 19-20 Sep), with a 90-calendar-day foreign-initiated investigation window.\n"
-            "   - Credit Card CARD00002 (DSP00034 · €1,480.00 in Lisbon) is governed by Regulation Z (12 CFR 1026.13): provisional credit does NOT exist under Reg Z. Instead, the customer has the statutory right to withhold payment on the disputed amount while resolved within 2 billing cycles (max 90 days), and may not be reported delinquent.\n"
-            "3. CONTRADICTION RESOLUTION: Honor MEM00015 (customer returned early to NYC on 10 Sep 2026, superseding 18 Sep return on TRV00001) and MEM00017 (updated mobile *0146 superseding *0143), and reroute replacement courier SHP00001 to NYC home address."
-        )
+    # -- grounding ---------------------------------------------------------
 
-        user_content = (
-            f"{memory_context}\n\n"
-            f"### KNOWLEDGE CATALOG & GROUND-TRUTH LEDGER:\n{kg_context}\n\n"
-            f"CUSTOMER CHAT MESSAGE: \"{prompt}\"\n\n"
-            f"Synthesize the complete story from the Memory Bank and Knowledge Catalog without asking any questions."
-        )
+    @staticmethod
+    def _memory_records(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        records = []
+        for item in items:
+            body = item.get("memory", item)
+            name = mb_field(body, "name")
+            records.append(
+                {
+                    "memory_id": name.split("/")[-1] if name != NOT_RECORDED else NOT_RECORDED,
+                    "fact": mb_field(body, "fact"),
+                    "update_time": mb_field(body, "updateTime"),
+                    "distance": item.get("distance", NOT_RECORDED),
+                }
+            )
+        return records
 
+    @staticmethod
+    def _golden(tool_name: str, **kwargs) -> Dict[str, Any]:
+        """Calls one golden-query tool. A failure comes back as data, not a raise."""
+        try:
+            from backend import adk_agents
+        except Exception as exc:  # noqa: BLE001 - the import chain is the story
+            return {"allowed": False, "error": "backend.adk_agents unavailable: %s" % exc}
+        fn = getattr(adk_agents, tool_name, None)
+        if fn is None:
+            return {"allowed": False, "error": "no tool named %s" % tool_name}
+        try:
+            return fn(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logging.error("Golden query %s failed: %s", tool_name, exc)
+            return {"allowed": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    def gather_grounding(
+        self, customer_id: str, user_prompt: str, memory_client: MemoryBankClient
+    ) -> Dict[str, Any]:
+        """Everything the answer is allowed to be built from, plus its origin."""
+        try:
+            retrieved = memory_client.retrieve(
+                {"customer_id": customer_id}, query=user_prompt or None, top_k=10
+            )
+            memories = self._memory_records(retrieved)
+            memory_error = None
+        except MemoryBankError as exc:
+            memories = []
+            memory_error = str(exc)
+
+        return {
+            "customer_id": customer_id,
+            "memories": memories,
+            "memory_error": memory_error,
+            "open_disputes": self._golden(
+                "golden_07_open_disputes_for_customer", customer_id=customer_id
+            ),
+            "customer_360": self._golden(
+                "golden_01_customer_360_snapshot", customer_id=customer_id
+            ),
+        }
+
+    # -- synthesis ---------------------------------------------------------
+
+    def _call_genai_synthesis(self, prompt: str, grounding: Dict[str, Any]) -> Dict[str, Any]:
+        """Returns the narrative, or the reason there is not one. Never both."""
+        contents = (
+            "MEMORIES RETRIEVED FROM MEMORY BANK:\n"
+            + json.dumps(grounding["memories"], indent=2, default=str)
+            + "\n\nGOVERNED QUERY ROWS:\n"
+            + json.dumps(
+                {
+                    "open_disputes": grounding["open_disputes"],
+                    "customer_360": grounding["customer_360"],
+                },
+                indent=2,
+                default=str,
+            )
+            + "\n\nCUSTOMER MESSAGE: %r\n\n" % prompt
+            + "Answer from the material above. Ask no questions."
+        )
         try:
             response = self.client.models.generate_content(
                 model=self.model_name,
-                contents=user_content,
-                config=dict(
-                    system_instruction=system_instruction,
-                    temperature=0.2,
-                ),
+                contents=contents,
+                config=dict(system_instruction=SYSTEM_INSTRUCTION, temperature=0.2),
             )
-            return response.text or ""
-        except Exception as exc:
-            logging.warning(f"Live Gemini API invocation encountered fallback condition: {exc}")
-            return (
-                "1. **Debit Card (`CARD00004 · DSP00033` — Regulation E, 12 CFR 1005.11)**: Your €620.00 checking dispute is governed by Regulation E. Provisional credit is **required within 10 business days** of notification (09 Sep 2026). Skipping weekends (12–13 Sep and 19–20 Sep), your provisional credit deadline is **23 Sep 2026**, and the foreign-initiated investigation window is **90 calendar days** (08 Dec 2026).\n\n"
-                "2. **Credit Card (`CARD00002 · DSP00034` — Regulation Z, 12 CFR 1026.13)**: Under Regulation Z, **provisional credit does not exist** for open-end credit cards. Instead, you have the statutory right to **withhold payment** on the disputed €1,480.00 and related finance charges while we resolve the claim within 2 billing cycles (max 90 days), and we may not report the amount delinquent.\n\n"
-                "3. **Early Return & Courier Reroute (`MEM00015` Supersedes `MEM00003`)**: Memory Bank confirms you cut your Portugal trip short and landed at JFK on **10 Sep 2026** (superseding the planned 18 Sep return on `TRV00001`), and updated your mobile number to `*0146` (`MEM00017`). Both cards were frozen, 3 digital wallet tokens were revoked, a virtual card was issued, and physical replacement courier `SHP00001` has been rerouted from Hotel Avenida Palace in Lisbon to your NYC home address."
+        except Exception as exc:  # noqa: BLE001 - a broken run must read as broken
+            logging.error("Gemini synthesis failed: %s", exc)
+            return {"text": None, "reason": "vertexai.generateContent failed: %s" % exc}
+
+        text = (response.text or "").strip()
+        if not text:
+            return {"text": None, "reason": "vertexai.generateContent returned no text"}
+        return {"text": text, "reason": None}
+
+    def _causal_chain(
+        self, grounding: Dict[str, Any], request_channel: BankChannel
+    ) -> List[CausalStep]:
+        """One step per record actually retrieved.
+
+        `channel` on each step is the channel the request arrived on, not the
+        channel that produced the memory: retrieval does not return that, and
+        `CausalStep.channel` is a required enum with no unknown member.
+        """
+        steps: List[CausalStep] = []
+
+        for record in grounding["memories"]:
+            steps.append(
+                CausalStep(
+                    step_number=len(steps) + 1,
+                    timestamp=record["update_time"],
+                    channel=request_channel,
+                    event_title=record["fact"],
+                    causal_explanation=(
+                        "Memory %s, retrieved at distance %s. Channel shown is the "
+                        "requesting channel; the originating channel is not recorded."
+                        % (record["memory_id"], record["distance"])
+                    ),
+                    linked_fragment_id=record["memory_id"],
+                )
             )
+
+        disputes = grounding["open_disputes"]
+        rows = disputes.get("rows", []) if isinstance(disputes, dict) else []
+        for row in rows:
+            steps.append(
+                CausalStep(
+                    step_number=len(steps) + 1,
+                    timestamp=str(row.get("opened_at", NOT_RECORDED)),
+                    channel=BankChannel.CORE_BANKING,
+                    event_title=str(row.get("dispute_id", NOT_RECORDED)),
+                    causal_explanation=json.dumps(row, default=str),
+                    linked_fragment_id=str(row.get("dispute_id", NOT_RECORDED)),
+                )
+            )
+
+        if not steps:
+            steps.append(
+                CausalStep(
+                    step_number=1,
+                    timestamp=NOT_RECORDED,
+                    channel=request_channel,
+                    event_title="No evidence returned",
+                    causal_explanation=(
+                        grounding.get("memory_error")
+                        or "Memory Bank and the dispute query both returned zero rows."
+                    ),
+                    linked_fragment_id=NOT_RECORDED,
+                )
+            )
+        return steps
 
     def synthesize_customer_issue(
         self,
         customer_id: str,
         user_prompt: str,
-        memory_bank: CustomerMemoryBank,
+        memory_client: MemoryBankClient,
+        channel: BankChannel = BankChannel.WEB_PORTAL,
     ) -> SynthesisResult:
-        """Execute end-to-end memory retrieval, Knowledge Catalog grounding, and causal synthesis."""
-        memory_context = memory_bank.get_formatted_context()
-        statement = GroundTruthTelemetryStore.fetch_live_account_statement(customer_id)
-        risk_profile = KnowledgeCatalog.get_customer_risk_profile(customer_id)
-        kg_context = json.dumps(
-            {
-                "live_statement_balance_usd": statement.get("statement_summary", {}).get("current_posted_balance_usd"),
-                "verified_travel_notice": "Lisbon, PT (TRV00001 superseded by MEM00015 early return 10 Sep)",
-                "customer_risk_profile": risk_profile.get("historical_spending_baseline"),
-                "governing_policies": ["12 CFR 1005.11 (Reg E Debit)", "12 CFR 1026.13 (Reg Z Credit)"],
-            },
-            indent=2,
-        )
-        narrative = self._call_genai_synthesis(user_prompt, memory_context, kg_context)
-
-        causal_steps = [
-            CausalStep(
-                step_number=1,
-                system="Contact Center IVR (SES00004)",
-                day_time="08 Sep - 21:15 UTC",
-                event="Wallet reported stolen in Alfama, Lisbon holding Debit CARD00004 and Credit CARD00002.",
-                impact="Both cards frozen; 3 wallet tokens revoked; virtual card issued.",
-                status="TRIGGER_EVENT",
-            ),
-            CausalStep(
-                step_number=2,
-                system="Policy & Compliance (Dataplex ccb-fraud-disputes)",
-                day_time="09 Sep - 09:06 UTC",
-                event="Opened DSP00033 (Debit · Reg E) and DSP00034 (Credit · Reg Z).",
-                impact="Debit provisional credit due 23 Sep (10 bus. days); Credit protected via right to withhold payment.",
-                status="DUAL_RULEBOOK_APPLIED",
-            ),
-            CausalStep(
-                step_number=3,
-                system="Mobile App & Memory Bank (SES00009)",
-                day_time="10 Sep - 07:20 UTC",
-                event="Customer returned early to JFK (MEM00015 supersedes MEM00003) and updated mobile to *0146 (MEM00017).",
-                impact="Replacement courier SHP00001 rerouted from Lisbon hotel to NYC home address.",
-                status="CONSOLIDATED_RESOLUTION",
-            ),
-        ]
-
-        a2ui_payload = {
-            "type": "MemorySynthesisCard",
-            "title": "Cross-System Memory Bank & Knowledge Catalog Synthesis",
-            "customer_id": customer_id,
-            "root_cause": "Lisbon Stolen Wallet · Dual-Regulation Dispute Split (Reg E vs Reg Z)",
-            "affected_instrument": "Debit CARD00004 (DSP00033) & Credit CARD00002 (DSP00034)",
-            "timeline": [
-                {
-                    "day": "08 Sep",
-                    "time": "21:15 UTC",
-                    "system": "Contact Center IVR",
-                    "title": "Stolen Wallet Reported in Lisbon",
-                    "detail": "Both CARD00004 (Debit) and CARD00002 (Credit) frozen; 3 tokens revoked.",
-                    "status_badge": "FROZEN · TOKENS REVOKED",
-                    "badge_color": "danger",
-                },
-                {
-                    "day": "09 Sep",
-                    "time": "09:06 UTC",
-                    "system": "Dataplex Policy & Compliance",
-                    "title": "Two Disputes Opened (Reg E + Reg Z)",
-                    "detail": "DSP00033 (Reg E · prov. credit 23 Sep) and DSP00034 (Reg Z · withhold payment).",
-                    "status_badge": "2 RULES · 0 WRONG ANSWERS",
-                    "badge_color": "success",
-                },
-                {
-                    "day": "10 Sep",
-                    "time": "07:20 UTC",
-                    "system": "Vertex AI Memory Bank",
-                    "title": "Early Return & Courier Reroute",
-                    "detail": "MEM00015 (10 Sep JFK return) supersedes MEM00003 (18 Sep); SHP00001 rerouted to NYC.",
-                    "status_badge": "CONSOLIDATED",
-                    "badge_color": "success",
-                },
-            ],
-            "resolution": {
-                "action_id": "DUAL_REG_RESOLUTION",
-                "label": "Confirm Reg E (23 Sep) + Reg Z (Withhold) & Reroute SHP00001",
-                "description": "Enforces freeze_card → revoke_wallet_token → issue_virtual_card → order_replacement_card.",
-            },
-        }
+        grounding = self.gather_grounding(customer_id, user_prompt, memory_client)
+        narrative = self._call_genai_synthesis(user_prompt, grounding)
 
         return SynthesisResult(
             customer_id=customer_id,
-            narrative=narrative,
-            causal_steps=causal_steps,
-            asked_question=False,
-            resolution_action=a2ui_payload["resolution"],
-            a2ui_payload=a2ui_payload,
-            confidence_score=0.99,
+            executive_summary=narrative["text"] or NOT_RECORDED,
+            # Nothing in this process measures a root cause independently of the
+            # narrative, so the field does not restate one as if it had.
+            root_cause_identified=NOT_RECORDED,
+            causal_chain=self._causal_chain(grounding, channel),
+            recommended_actions=list(CONTAINMENT_SEQUENCE),
+            applicable_policies=[],
+            # `SynthesisResult.confidence_score` is a required float in the shared
+            # models, so it cannot carry "n/r". The honest value is in the A2UI
+            # payload; treat this field as unset, not as a score of zero.
+            confidence_score=0.0,
+            zero_question_greeting=(
+                "I already have your case from the other channels, so there is "
+                "nothing to re-ask."
+            ),
         )
+
+    def a2ui_payload(
+        self, customer_id: str, grounding: Dict[str, Any], result: SynthesisResult
+    ) -> Dict[str, Any]:
+        """The synthesis card. Every field either proves its source or reads n/r."""
+        has_narrative = result.executive_summary != NOT_RECORDED
+        return {
+            "type": "MemorySynthesisCard",
+            "title": "Cross-system Memory Bank and Knowledge Catalog synthesis",
+            "customer_id": computed(customer_id, "request customer_id"),
+            "memory_count": computed(
+                len(grounding["memories"]), "reasoningEngines.memories:retrieve"
+            ),
+            "narrative": live(
+                result.executive_summary, "vertexai.generateContent:%s" % self.model_name
+            )
+            if has_narrative
+            else unmeasured("vertexai.generateContent produced no narrative"),
+            "root_cause": unmeasured("not measured independently of the narrative"),
+            "confidence_score": unmeasured("no calibrated confidence is computed for synthesis"),
+            "timeline": [
+                {
+                    "timestamp": step.timestamp,
+                    "channel": step.channel.value,
+                    "title": step.event_title,
+                    "detail": step.causal_explanation,
+                    "linked_fragment_id": step.linked_fragment_id,
+                }
+                for step in result.causal_chain
+            ],
+            "recommended_actions": [
+                identity(action, "backend/agent.py:CONTAINMENT_SEQUENCE", "mandated containment order")
+                for action in result.recommended_actions
+            ],
+            "resolution": {
+                "action_id": "ADMIN_CARD_DECISION",
+                "label": "Send to the supervisor for the unlock decision",
+                "description": "Routes the case to /api/card-oversight/decide for a YES or NO.",
+            },
+        }
+
+    # -- streaming ---------------------------------------------------------
 
     def stream_synthesis_workflow(
         self,
         session_id: str,
         customer_id: str,
         user_prompt: str,
-        memory_bank: CustomerMemoryBank,
+        memory_client: MemoryBankClient,
+        channel: BankChannel = BankChannel.WEB_PORTAL,
     ) -> Generator[str, None, None]:
+        """Yields the four A2UI frames the frontend subscribes to, in order.
+
+        Frame names are a fixed contract: onAgentThought, onMemoryBankAccess,
+        onAgentSynthesis, onUiComponentDelivery.
         """
-        Yields JSON-RPC 2.0 formatted trace telemetry chunks for real-time SSE streaming.
-        """
-        logging.info(f"Session {session_id}: Initiating Memory Bank Synthesis for Customer {customer_id}.")
+        logging.info("Session %s: synthesis for %s", session_id, customer_id)
+        author = identity(AGENT_NAME, AGENT_SOURCE, "the agent's own name")
 
-        # 1. Thought Frame
-        yield self._encode_rpc_frame("onAgentThought", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "message": f"Analyzing user intent: '{user_prompt}'. Querying enterprise Memory Bank & Knowledge Catalog...",
-        })
+        yield self._encode_rpc_frame(
+            "onAgentThought",
+            {
+                "author": author,
+                "message": "Reading this customer's memories and open disputes before answering.",
+            },
+        )
 
-        # 2. Memory Bank Access Frame
-        fragments = memory_bank.get_fragments()
-        yield self._encode_rpc_frame("onMemoryBankAccess", {
-            "author": "CustomerMemoryBank",
-            "customer_id": customer_id,
-            "fragment_count": len(fragments),
-            "fragments": [f.to_display_dict() for f in fragments],
-            "message": f"Retrieved {len(fragments)} cross-channel observation fragments spanning 48 hours.",
-        })
+        grounding = self.gather_grounding(customer_id, user_prompt, memory_client)
 
-        # 3. Knowledge Catalog Grounding Frame
-        kg_subgraph = KnowledgeCatalog.get_entity_subgraph(customer_id)
-        yield self._encode_rpc_frame("onAgentThought", {
-            "author": "KnowledgeCatalogEngine",
-            "message": (
-                f"Grounded against Knowledge Catalog ({kg_subgraph['node_count']} graph entities, "
-                "Policies POL-REG-E-001 & POL-STEP-UP-2FA-002, Verified Travel Notice trv-lon-2026)."
-            ),
-        })
+        yield self._encode_rpc_frame(
+            "onMemoryBankAccess",
+            {
+                "author": identity("MemoryBankClient", "backend/memory_bank.py", "the client's own name"),
+                "customer_id": computed(customer_id, "request customer_id"),
+                "memory_count": computed(
+                    len(grounding["memories"]), "reasoningEngines.memories:retrieve"
+                ),
+                "memories": live(grounding["memories"], "reasoningEngines.memories:retrieve")
+                if grounding["memory_error"] is None
+                else unmeasured(
+                    "reasoningEngines.memories:retrieve (%s)" % grounding["memory_error"]
+                ),
+            },
+        )
 
-        # 4. Agent Synthesis Frame
-        synthesis = self.synthesize_customer_issue(customer_id, user_prompt, memory_bank)
-        yield self._encode_rpc_frame("onAgentThought", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "message": "Reconstructed full causal chain across Fraud, Step-Up Consent, IVR, and London Mobile subsystems. Zero questions required.",
-        })
+        yield self._encode_rpc_frame(
+            "onAgentThought",
+            {
+                "author": author,
+                "message": "Joining memories to the governed dispute rows. No clarifying question needed.",
+            },
+        )
 
-        yield self._encode_rpc_frame("onAgentSynthesis", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "customer_id": customer_id,
-            "narrative": synthesis.narrative,
-            "causal_steps": [s.model_dump() for s in synthesis.causal_steps],
-        })
+        result = self.synthesize_customer_issue(customer_id, user_prompt, memory_client, channel)
 
-        # 5. Dynamic A2UI Schema Delivery Frame
-        yield self._encode_rpc_frame("onUiComponentDelivery", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "ui_specification": "A2UI-0.9",
-            "payload": synthesis.a2ui_payload,
-        })
+        yield self._encode_rpc_frame(
+            "onAgentSynthesis",
+            {
+                "author": author,
+                "customer_id": computed(customer_id, "request customer_id"),
+                "narrative": live(
+                    result.executive_summary, "vertexai.generateContent:%s" % self.model_name
+                )
+                if result.executive_summary != NOT_RECORDED
+                else unmeasured("vertexai.generateContent produced no narrative"),
+                "causal_steps": [s.model_dump(mode="json") for s in result.causal_chain],
+                "asked_question": computed(False, "the desk does not emit clarifying questions"),
+            },
+        )
 
-    def _encode_rpc_frame(self, method: str, params: Dict[str, Any]) -> str:
-        """Format payload as JSON-RPC 2.0 block."""
+        yield self._encode_rpc_frame(
+            "onUiComponentDelivery",
+            {
+                "author": author,
+                "ui_specification": "A2UI-0.9",
+                "payload": self.a2ui_payload(customer_id, grounding, result),
+            },
+        )
+
+    @staticmethod
+    def _encode_rpc_frame(method: str, params: Dict[str, Any]) -> str:
         return json.dumps({"jsonrpc": "2.0", "method": method, "params": params}, default=str)

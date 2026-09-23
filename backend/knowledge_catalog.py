@@ -79,6 +79,24 @@ DEFAULT_ENTRY_GROUP = "@bigquery"
 DEFAULT_TIMEOUT = 30
 
 
+def require_env(name: str) -> str:
+    """A deployment parameter with no safe default.
+
+    Duplicated from `memory_bank.py` rather than shared, for the same reason:
+    this file is meant to be readable and liftable on its own. Same rule as
+    NOT_RECORDED above -- refuse rather than invent.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        raise ValueError(
+            "%s is not set. Set it to your own value; this module ships no "
+            "default project, dataset or glossary id, because a default is how "
+            "a misconfigured run ends up governing another project's catalog."
+            % name
+        )
+    return raw
+
+
 class CatalogError(RuntimeError):
     """An API call failed. Status and body, unedited."""
 
@@ -562,16 +580,33 @@ WHAT TO SAY WHILE THIS RUNS
 
 
 # ---------------------------------------------------------------------------
-# Factory Helper + Backward Compatibility Bridge
+# Factory Helper
 # ---------------------------------------------------------------------------
 
 
 def create_default_catalog_governor(strict: bool = True, verbose: bool = False) -> CatalogGovernor:
-    """Creates a live DataplexCatalogClient + CatalogGovernor from environment variables."""
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "abhinayboda-genai-bb")
+    """Creates a live DataplexCatalogClient + CatalogGovernor from environment variables.
+
+    The dataset and glossary are read under two names each. `backend/app.py`
+    exports `BIGQUERY_DATASET` and `DATAPLEX_GLOSSARY`; the demo kit's
+    `scripts/config.sh` exports `BQ_DATASET` and `DATAPLEX_GLOSSARY_ID`. Before
+    this, setting the app's pair had no effect here, so the catalog quietly
+    governed a different dataset than the one the app reported it was reading.
+    """
+    # No hardcoded project: a default is how a misconfigured run ends up
+    # authorizing reads against another project's catalog.
+    project = require_env("GOOGLE_CLOUD_PROJECT")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", DEFAULT_LOCATION)
-    dataset = os.environ.get("BQ_DATASET", "jpmc_ccb_fraud")
-    glossary_id = os.environ.get("DATAPLEX_GLOSSARY_ID", "ccb-fraud-disputes")
+    dataset = (
+        os.environ.get("BIGQUERY_DATASET")
+        or os.environ.get("BQ_DATASET")
+        or require_env("BIGQUERY_DATASET")
+    )
+    glossary_id = (
+        os.environ.get("DATAPLEX_GLOSSARY")
+        or os.environ.get("DATAPLEX_GLOSSARY_ID")
+        or require_env("DATAPLEX_GLOSSARY")
+    )
     client = DataplexCatalogClient(
         project=project,
         location=location,
@@ -580,15 +615,6 @@ def create_default_catalog_governor(strict: bool = True, verbose: bool = False) 
         verbose=verbose,
     )
     return CatalogGovernor(client=client, strict=strict)
-
-
-try:
-    from backend.knowledge_catalog_old import (  # noqa: E402, F401
-        KnowledgeCatalog,
-        AWSOnPremHybridConnector,
-    )
-except Exception:  # pragma: no cover
-    pass
 
 
 # ---------------------------------------------------------------------------

@@ -101,6 +101,24 @@ def rfc3339(value: Optional[datetime]) -> Optional[str]:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def require_env(name: str) -> str:
+    """A deployment parameter with no safe default.
+
+    Defined here rather than imported from `backend.provenance` so this file
+    stays what it claims to be: one module, stdlib only, that you can copy into
+    any codebase. Duplicating six lines is the smaller cost.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        raise ValueError(
+            "%s is not set. Set it to your own value; this module ships no "
+            "default project, engine or location id, because a default is how "
+            "a misconfigured run ends up reading another project's data."
+            % name
+        )
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # The client
 # ---------------------------------------------------------------------------
@@ -358,6 +376,42 @@ class MemoryBankClient:
     def list_memories(self) -> List[Dict[str, Any]]:
         return self._request("GET", self.base_url + "/memories").get("memories", [])
 
+    def create_memory(self, fact: str, scope: Dict[str, str]) -> Dict[str, Any]:
+        """Writes one already-extracted fact directly, bypassing generation.
+
+        memories:generate is the right door when you have a conversation and
+        want the service to decide what is worth remembering. Seeding is the
+        other case: the fact is already atomic and the operator, not a model,
+        decides it belongs. Going through generate for a known fact would let
+        the extractor re-word or merge it, which is exactly what produced the
+        narrative blob this seeding path replaces.
+
+        scope arrives per call so one engine-level client can serve every
+        customer; binding it to the constructor is how memories leak between
+        customers.
+        """
+        if not fact or not fact.strip():
+            raise ValueError("fact is required - an empty memory is not a memory.")
+        if not scope:
+            raise ValueError("scope is required - an unscoped memory is visible to every customer.")
+
+        return self._request("POST", self.base_url + "/memories",
+                             {"fact": fact, "scope": scope})
+
+    def delete_memory(self, memory_name: str) -> Dict[str, Any]:
+        """Deletes one memory by full resource name.
+
+        Takes the name the service returned rather than an id fragment, so a
+        caller cannot delete in the wrong engine by pasting a bare id.
+        """
+        if not memory_name or "/memories/" not in memory_name:
+            raise ValueError(
+                "memory_name must be the full resource name the service returned, "
+                "e.g. projects/../locations/../reasoningEngines/../memories/.., "
+                "not a bare id."
+            )
+        return self._request("DELETE", "https://%s/%s/%s" % (self.host, self.api_version, memory_name))
+
 
 # ---------------------------------------------------------------------------
 # Rendering - the only place values become strings
@@ -600,7 +654,7 @@ WHAT TO SAY WHILE THIS RUNS
 
 
 # ---------------------------------------------------------------------------
-# Engine-level Factory Helper + Backward Compatibility Bridge
+# Engine-level Factory Helper
 # ---------------------------------------------------------------------------
 
 
@@ -611,13 +665,17 @@ def create_default_memory_bank_client(verbose: bool = False) -> MemoryBankClient
     location) — never bound to a single `customer_id`. Customer scope is passed
     per API request (`scope={"customer_id": customer_id}`).
     """
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "abhinayboda-genai-bb")
+    # No literal fallback here either. A default project id is the same defect
+    # as a default engine id: the run looks healthy and reads somebody else's
+    # data.
+    project = require_env("GOOGLE_CLOUD_PROJECT")
     engine_id = (
         os.environ.get("VERTEX_AGENT_ENGINE_ID")
         or os.environ.get("AGENT_ENGINE_ID")
         or os.environ.get("VERTEX_MEMORY_BANK_ENGINE_ID")
-        or "4277754991222980608"
     )
+    # No literal fallback: MemoryBankClient raises when engine_id is missing,
+    # which is better than silently running against a hardcoded engine.
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", DEFAULT_LOCATION)
     return MemoryBankClient(
         project=project,
@@ -625,17 +683,6 @@ def create_default_memory_bank_client(verbose: bool = False) -> MemoryBankClient
         location=location,
         verbose=verbose,
     )
-
-
-try:
-    from backend.memory_bank_old import (  # noqa: E402, F401
-        CustomerMemoryBank,
-        GroundTruthTelemetryStore,
-        KNOWN_CUSTOMERS,
-        get_or_create_reasoning_engine_id,
-    )
-except Exception:  # pragma: no cover
-    pass
 
 
 # ---------------------------------------------------------------------------

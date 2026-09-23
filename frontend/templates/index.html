@@ -303,13 +303,18 @@
         <div class="item-top">
           <span class="dot"></span>
           <span class="nm">Vertex AI Memory Bank</span>
-          <span class="tag ok">4277754991222980608</span>
+          <!-- Filled from /api/session. It was a hardcoded engine id, which
+               rendered the same whether the engine was reachable or not. -->
+          <span class="tag" id="engineIdTag">engine: loading…</span>
         </div>
         <div class="rd" id="liveMemoriesList" style="margin-top:4px;">
-          <code>MEM00015</code> (10 Sep return) supersedes <code>MEM00003</code> (18 Sep). <code>MEM00017</code> (*0146) supersedes <code>MEM00002</code> (*0143).
+          <span class="n">Memories load from the engine on open.</span>
         </div>
         <div style="margin-top:8px;">
-          <button type="button" class="chip" id="btnRunCompaction">▶ Run compaction (68.8% saved)</button>
+          <!-- Consolidation happens inside Memory Bank and reports no token
+               count, so the saving is filled in from the response or left n/r.
+               The label used to assert 68.8% before the click. -->
+          <button type="button" class="chip" id="btnRunCompaction">▶ Run consolidation</button>
         </div>
       </div>
 
@@ -341,7 +346,7 @@
   <details class="notes">
     <summary>What this desk does — and does not — show</summary>
     <div class="notes-grid">
-      <p><b>What is live.</b> Six specialist agents reading from BigQuery (<code>jpmc_ccb_fraud</code>), Dataplex Universal Catalog (<code>ccb-fraud-disputes</code>), and Vertex AI Memory Bank (<code>4277754991222980608</code>) across 9 prior sessions and 5 channels for customer <code>CUST00001</code>.</p>
+      <p><b>What is live.</b> The agent roster reads from BigQuery (<code id="noteDataset">…</code>), Dataplex Universal Catalog (<code id="noteGlossary">…</code>), and Vertex AI Memory Bank (<code id="noteEngine">…</code>). Session and agent counts are read from the engine at load: <span id="noteCounts">loading…</span>. These were fixed literals describing one project; they now describe whichever project this instance is pointed at.</p>
       <p><b>What is governed.</b> Restricted columns (<code>customers.ssn_last4</code>, <code>cards.pan_full</code>) are withheld at catalog read time, and the deprecated table (<code>authorizations_deprecated_v1</code>) is refused in favour of <code>authorizations</code>.</p>
       <p><b>What is not measured here.</b> Where a retrieval metric has no recorded output on a cold pass, the scorecard renders <code>n/r</code> rather than inventing a zero.</p>
       <p><b>Synthetic provenance.</b> Every customer record, card number, authorization, and dispute is synthetic and reproducible from seed <code>20260921</code>.</p>

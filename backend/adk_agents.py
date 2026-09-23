@@ -1,5 +1,13 @@
 """
-adk_agents.py - JPMC CCB Fraud & Disputes 6-Agent ADK Topology + Golden Query Tool Wiring.
+adk_agents.py - JPMC CCB Fraud & Disputes 8-Agent ADK Topology + Golden Query Tool Wiring.
+
+Topology is hub-and-spoke: `consumer_credit_synthesizer_agent` is the hub, the
+other seven are spokes that cannot talk to each other or back up the tree
+(`disallow_transfer_to_parent=True`, `disallow_transfer_to_peers=True`). Five of
+the spokes are channel producers: each one reads the seeded Vertex AI Memory
+Bank sessions for its own channel and for one customer scope, and returns what
+is there - an empty result set when the channel has no seeded data, never a
+stand-in row.
 
 Connects the three live pillars of the JPMC Consumer & Community Banking Fraud Desk:
 1. Vertex AI Agent Engine Memory Bank (`backend/memory_bank.py` -> `MemoryBankClient`)
@@ -13,7 +21,12 @@ Connects the three live pillars of the JPMC Consumer & Community Banking Fraud D
 3. Parameterized Golden Query Contract Executor (`backend/queries/golden/01..12.sql` + `INDEX.md`)
    - Wires all 12 `.sql` contracts defined in `queries/golden/INDEX.md` as callable ADK
      `FunctionTool` functions (`@parameterized` BigQuery execution, `ad_hoc_sql = 0`),
-     mapped to the exact 6 agents (`01_orchestrator` .. `06_memory_writer`).
+     mapped to the agents authorized for them in `INDEX.md`.
+
+Every value that leaves this file carries a provenance tag from
+`backend/provenance.py`. The only constant allowed through is an agent's own
+channel name, declared with `identity()` so the waiver is visible to the
+verifier rather than taken on trust.
 """
 
 from __future__ import annotations
@@ -37,6 +50,20 @@ from backend.memory_bank import (
     MemoryBankClient,
     create_default_memory_bank_client,
     field as mb_field,
+)
+from backend.provenance import (
+    live,
+    seeded,
+    computed,
+    static,
+    identity,
+    unmeasured,
+    NOT_RECORDED,
+    require_env,
+    LIVE_API,
+    SEEDED,
+    COMPUTED,
+    STATIC,
 )
 from backend.models import (
     AgentDescriptor,
@@ -253,7 +280,7 @@ def execute_golden_query_contract(
     try:
         from google.cloud import bigquery
 
-        bq_client = bigquery.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "abhinayboda-genai-bb"))
+        bq_client = bigquery.Client(project=require_env("GOOGLE_CLOUD_PROJECT"))
         sql_text = load_golden_sql_text(query_id)
 
         query_parameters = []
@@ -278,7 +305,12 @@ def execute_golden_query_contract(
         for row in query_job.result():
             rows.append({key: (val.isoformat() if hasattr(val, "isoformat") else val) for key, val in dict(row).items()})
     except Exception as exc:  # pragma: no cover
-        rows = [{"note": f"BigQuery execution note: {exc}"}]
+        # A failed query used to come back as a one-row result carrying the error
+        # text, which made row_count=1 and looked like data downstream. Fail loudly.
+        raise RuntimeError(
+            "Golden Query %s (%s) failed against BigQuery: %s"
+            % (contract.query_id, contract.sql_filename, exc)
+        ) from exc
 
     result = GoldenQueryExecutionResult(
         query_id=contract.query_id,
@@ -295,7 +327,7 @@ def execute_golden_query_contract(
 
 
 # ==============================================================================
-# 2. CALLABLE ADK FUNCTION TOOLS FOR THE 6 AGENTS
+# 2. CALLABLE ADK GOLDEN QUERY FUNCTION TOOLS (shared by the roster)
 # ==============================================================================
 
 def golden_01_customer_360_snapshot(customer_id: str = "CUST00001") -> Dict[str, Any]:
@@ -505,9 +537,320 @@ def run_consolidated_memory_audit_sweep() -> Dict[str, Any]:
 
 
 # ==============================================================================
-# 3. THE 6 CCB FRAUD DESK ADK AGENTS (`01` .. `06`)
+# 3. CHANNEL PRODUCER RETRIEVAL (seeded Vertex AI Memory Bank sessions)
 # ==============================================================================
 
+DEFAULT_CUSTOMER_SCOPE_ID = os.environ.get("DEMO_CUSTOMER_ID", "CUST00001")
+DEFAULT_CHANNEL_TOP_K = int(os.environ.get("CHANNEL_MEMORY_TOP_K", "5"))
+DEFAULT_CARD_ID = os.environ.get("DEMO_CARD_ID", "CARD00002")
+
+# A seeder may label a session with any spelling in this tuple and mean the same
+# channel. The tokens are matching predicates that live in code; the label the
+# agent reports back is whatever the session itself carried.
+CHANNEL_SESSION_TOKENS: Dict[str, tuple] = {
+    # The first entry of each tuple is the agent's own identity. The rest are the
+    # spellings the seeder actually writes, confirmed by reading the 52 seeded
+    # sessions: IVR(15) MOBILE_APP(14) WEB_CHAT(15) FRAUD_OPS_OUTBOUND(3) BRANCH(5).
+    # FRAUD_OPS_OUTBOUND and WEB_CHAT are the two that do not resemble the model
+    # name; without them those producers match nothing and return empty in silence,
+    # which reads as "no activity" rather than "wrong constant".
+    BankChannel.FRAUD_DETECTION.value: ("FRAUD_DETECTION", "FRAUD_OPS_OUTBOUND", "FRAUD_OPS",
+                                        "FRAUD", "FRAUD_MONITORING", "VELOCITY"),
+    BankChannel.TELEPHONY_IVR.value: ("TELEPHONY_IVR", "IVR", "TELEPHONY", "PHONE", "CONTACT_CENTER"),
+    BankChannel.MOBILE_APP.value: ("MOBILE_APP", "MOBILE", "APP", "WALLET", "DIGITAL_WALLET"),
+    BankChannel.WEB_PORTAL.value: ("WEB_PORTAL", "WEB_CHAT", "WEB", "ONLINE", "PORTAL"),
+    BankChannel.BRANCH_SUPPORT.value: ("BRANCH_SUPPORT", "BRANCH", "TELLER", "IN_PERSON"),
+}
+
+
+def _memory_bank(client: Optional[MemoryBankClient] = None) -> MemoryBankClient:
+    return client or GLOBAL_MEMORY_BANK_CLIENT
+
+
+def _tagged_value(value: Any, source: str) -> Dict[str, Any]:
+    """`seeded` when the service returned something, `unmeasured` when it did not.
+
+    A missing field renders "n/r" rather than a zero or a plausible-looking
+    default, because a wrong value is harder to spot than a missing one.
+    """
+    if value is None or value == "" or value == [] or value == NOT_RECORDED:
+        return unmeasured(source)
+    return seeded(value, source)
+
+
+def _session_customer_id(session: Dict[str, Any]) -> Any:
+    scoped = mb_field(session, "sessionState", "customer_id")
+    return scoped if scoped != NOT_RECORDED else mb_field(session, "userId")
+
+
+def _event_rows(bank: MemoryBankClient, session_name: str) -> List[Dict[str, Any]]:
+    source = "sessions.events.list:%s" % session_name
+    rows: List[Dict[str, Any]] = []
+    for event in bank.list_events(session_name):
+        parts = mb_field(event, "content", "parts", default=[])
+        text = parts[0].get("text", NOT_RECORDED) if isinstance(parts, list) and parts else NOT_RECORDED
+        rows.append({
+            "author": _tagged_value(mb_field(event, "author"), source),
+            "timestamp": _tagged_value(mb_field(event, "timestamp"), source),
+            "text": _tagged_value(text, source),
+            "invocation_id": _tagged_value(mb_field(event, "invocationId"), source),
+        })
+    return rows
+
+
+def _memory_rows(bank: MemoryBankClient, scope: Dict[str, str], query: str,
+                 top_k: int) -> List[Dict[str, Any]]:
+    """Retrieval and ranking run inside Google - `retrieve` is a service call."""
+    rows: List[Dict[str, Any]] = []
+    for item in bank.retrieve(scope=scope, query=query or None, top_k=top_k):
+        memory = item.get("memory", item)
+        memory_name = mb_field(memory, "name")
+        source = "memories.retrieve:%s" % (
+            str(memory_name).split("/")[-1] if memory_name != NOT_RECORDED else NOT_RECORDED
+        )
+        rows.append({
+            "memory_id": _tagged_value(
+                str(memory_name).split("/")[-1] if memory_name != NOT_RECORDED else NOT_RECORDED, source),
+            "fact": _tagged_value(mb_field(memory, "fact"), source),
+            "topics": _tagged_value(mb_field(memory, "topics"), source),
+            "update_time": _tagged_value(mb_field(memory, "updateTime"), source),
+            "distance": _tagged_value(mb_field(item, "distance"), source),
+        })
+    return rows
+
+
+def _produce_channel_payload(
+    channel: str,
+    channel_source: str,
+    customer_id: str,
+    memory_query: str,
+    include_events: bool = True,
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+    client: Optional[MemoryBankClient] = None,
+) -> Dict[str, Any]:
+    """One channel's slice of the seeded Memory Bank, for one customer scope.
+
+    Nothing here has a fallback. Delete the seeded corpus and every producer
+    returns empty lists with zero counts; take the service away and the
+    `MemoryBankError` from the REST client propagates to the caller instead of
+    being converted into a row that looks like data.
+    """
+    bank = _memory_bank(client)
+    scope = {"customer_id": customer_id}
+    tokens = CHANNEL_SESSION_TOKENS.get(channel, (channel,))
+
+    matched: List[Dict[str, Any]] = []
+    for session in bank.list_sessions():
+        if _session_customer_id(session) != customer_id:
+            continue
+        label = mb_field(session, "sessionState", "channel")
+        if str(label).upper() not in tokens:
+            continue
+
+        session_name = mb_field(session, "name")
+        source = "sessions.list:%s" % session_name
+        events = _event_rows(bank, session_name) if include_events and session_name != NOT_RECORDED else []
+        matched.append({
+            "session_id": _tagged_value(
+                str(session_name).split("/")[-1] if session_name != NOT_RECORDED else NOT_RECORDED, source),
+            "session_name": _tagged_value(session_name, source),
+            "display_name": _tagged_value(mb_field(session, "displayName"), source),
+            "channel_label_in_data": _tagged_value(label, source),
+            "customer_id": _tagged_value(_session_customer_id(session), source),
+            "intent": _tagged_value(mb_field(session, "sessionState", "intent"), source),
+            "create_time": _tagged_value(mb_field(session, "createTime"), source),
+            "update_time": _tagged_value(mb_field(session, "updateTime"), source),
+            "events": events,
+            "event_count": (
+                computed(len(events), "len(sessions.events.list:%s)" % session_name)
+                if include_events
+                else unmeasured("events not read: include_events=False")
+            ),
+        })
+
+    memories = _memory_rows(bank, scope, memory_query, top_k)
+
+    return {
+        "channel": identity(channel, channel_source, "agent identity constant"),
+        "customer_scope": computed(scope, "scope argument sent to sessions.list / memories.retrieve"),
+        "memory_bank_parent": computed(bank.parent, "MemoryBankClient.parent"),
+        "retrieval_query": computed(memory_query, "channel retrieval query issued by %s" % channel_source),
+        "sessions": matched,
+        "session_count": computed(len(matched), "count of sessions.list rows matching channel token + scope"),
+        "memories": memories,
+        "memory_count": computed(len(memories), "count of memories.retrieve rows"),
+    }
+
+
+def query_fraud_velocity_alerts(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    include_events: bool = True,
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+) -> Dict[str, Any]:
+    """FRAUD_DETECTION channel: seeded velocity, multi-city login and card-lock sessions."""
+    return _produce_channel_payload(
+        channel=BankChannel.FRAUD_DETECTION.value,
+        channel_source="fraud_monitoring_agent.channel",
+        customer_id=customer_id,
+        memory_query="fraud velocity alert, concurrent logins from different cities, card lock or restriction",
+        include_events=include_events,
+        top_k=top_k,
+    )
+
+
+def query_ivr_call_records(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    include_events: bool = True,
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+) -> Dict[str, Any]:
+    """TELEPHONY_IVR channel: seeded inbound call sessions, including dropped-2FA turns."""
+    return _produce_channel_payload(
+        channel=BankChannel.TELEPHONY_IVR.value,
+        channel_source="telephony_ivr_agent.channel",
+        customer_id=customer_id,
+        memory_query="inbound phone call, IVR authentication, dropped call before passcode verification",
+        include_events=include_events,
+        top_k=top_k,
+    )
+
+
+def query_mobile_wallet_events(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    include_events: bool = True,
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+) -> Dict[str, Any]:
+    """MOBILE_APP channel: seeded app and digital-wallet sessions, including tokenization failures."""
+    return _produce_channel_payload(
+        channel=BankChannel.MOBILE_APP.value,
+        channel_source="mobile_app_agent.channel",
+        customer_id=customer_id,
+        memory_query="mobile app session, digital wallet provisioning, tokenization declined, card status",
+        include_events=include_events,
+        top_k=top_k,
+    )
+
+
+def query_web_portal_activity(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    include_events: bool = True,
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+) -> Dict[str, Any]:
+    """WEB_PORTAL channel: seeded online banking sessions - logins, disputes, card toggles."""
+    return _produce_channel_payload(
+        channel=BankChannel.WEB_PORTAL.value,
+        channel_source="web_portal_agent.channel",
+        customer_id=customer_id,
+        memory_query="online banking web session, browser login, dispute filed, card controls toggled",
+        include_events=include_events,
+        top_k=top_k,
+    )
+
+
+def query_branch_teller_interactions(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    include_events: bool = True,
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+) -> Dict[str, Any]:
+    """BRANCH_SUPPORT channel: seeded in-branch sessions - banker consultations, in-person ID checks."""
+    return _produce_channel_payload(
+        channel=BankChannel.BRANCH_SUPPORT.value,
+        channel_source="branch_support_agent.channel",
+        customer_id=customer_id,
+        memory_query="branch visit, teller or banker consultation, in-person identity verification",
+        include_events=include_events,
+        top_k=top_k,
+    )
+
+
+def read_customer_memory_bank(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    query: str = "",
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+    client: Optional[MemoryBankClient] = None,
+) -> Dict[str, Any]:
+    """Synthesizer read path: scoped memories straight from Memory Bank.
+
+    An empty `query` means simple retrieval of everything in scope; a non-empty
+    one is a similarity search the service runs - this process does no ranking.
+    """
+    bank = _memory_bank(client)
+    scope = {"customer_id": customer_id}
+    memories = _memory_rows(bank, scope, query, top_k)
+    return {
+        "customer_scope": computed(scope, "scope argument sent to memories.retrieve"),
+        "memory_bank_parent": computed(bank.parent, "MemoryBankClient.parent"),
+        "retrieval_query": computed(query or NOT_RECORDED, "query argument passed to read_customer_memory_bank"),
+        "retrieval_mode": computed(
+            "similaritySearchParams" if query else "simpleRetrievalParams",
+            "MemoryBankClient.retrieve request body branch",
+        ),
+        "memories": memories,
+        "memory_count": computed(len(memories), "count of memories.retrieve rows"),
+    }
+
+
+def execute_one_click_card_unlock(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    card_id: str = DEFAULT_CARD_ID,
+    reason: str = "",
+    record_to_memory_bank: bool = True,
+    client: Optional[MemoryBankClient] = None,
+) -> Dict[str, Any]:
+    """Stages the card unlock and writes the decision trail into Memory Bank.
+
+    There is no card-issuing platform client in this process, so the tool does
+    not claim the card was unlocked. It reports the evidence it read, the audit
+    record it actually wrote, and leaves the downstream confirmation
+    `unmeasured` rather than asserting a success nobody observed.
+    """
+    bank = _memory_bank(client)
+    token_evidence = golden_10_wallet_tokens_active_on_card(card_id=card_id)
+
+    audit_session = unmeasured("audit trail not written: record_to_memory_bank=False")
+    audit_event_time = unmeasured("audit trail not written: record_to_memory_bank=False")
+    if record_to_memory_bank:
+        session_name = bank.create_session(
+            user_id=customer_id,
+            display_name="CARD UNLOCK %s" % card_id,
+            session_state={
+                "channel": BankChannel.CORE_BANKING.value,
+                "customer_id": customer_id,
+                "card_id": card_id,
+                "intent": "ONE_CLICK_CARD_UNLOCK",
+            },
+        )
+        event = bank.append_event(
+            session_name=session_name,
+            author="consumer_credit_synthesizer_agent",
+            text="One-click unlock staged for %s. Reason on record: %s" % (
+                card_id, reason or NOT_RECORDED),
+        )
+        audit_session = live(session_name, "sessions.create")
+        audit_event_time = _tagged_value(mb_field(event, "timestamp"), "sessions.appendEvent")
+
+    return {
+        "customer_scope": computed({"customer_id": customer_id},
+                                   "scope argument sent to sessions.create"),
+        "card_id": computed(card_id, "card_id argument passed to execute_one_click_card_unlock"),
+        "unlock_reason": computed(reason or NOT_RECORDED,
+                                  "reason argument passed to execute_one_click_card_unlock"),
+        "wallet_token_evidence": computed(
+            token_evidence, "golden_10_wallet_tokens_active_on_card(card_id=%s)" % card_id),
+        "audit_session": audit_session,
+        "audit_event_timestamp": audit_event_time,
+        "card_platform_confirmation": unmeasured(
+            "no card issuing platform client exists in this process"),
+    }
+
+
+# ==============================================================================
+# 4. THE 8 CCB FRAUD DESK ADK AGENTS (hub-and-spoke around the synthesizer)
+# ==============================================================================
+
+# Retained internal tree. The golden-query specialists below predate the 8-agent
+# roster and are still the cleanest way to exercise Golden Queries 01-12 on their
+# own; the desk that /api/agents/list publishes is the hub-and-spoke built by
+# create_consumer_credit_synthesizer_agent further down.
 def create_ccb_fraud_desk_orchestrator_agent(
     memory_bank_client: Optional[MemoryBankClient] = None,
     catalog_governor: Optional[CatalogGovernor] = None,
@@ -631,81 +974,268 @@ def create_ccb_fraud_desk_orchestrator_agent(
     return orchestrator
 
 
-# Backward-compatible factory alias
+def _spoke_agent(name: str, model: str, description: str, instruction: str,
+                 tools: List[Any]) -> LlmAgent:
+    """A spoke can only answer the hub.
+
+    Both transfer flags are off so a spoke cannot hand the customer to a peer or
+    walk back up the tree: every hop goes through the synthesizer, which is what
+    makes the run auditable.
+    """
+    return LlmAgent(
+        name=name,
+        model=model,
+        description=description,
+        instruction=instruction,
+        tools=tools,
+        disallow_transfer_to_parent=True,
+        disallow_transfer_to_peers=True,
+    )
+
+
 def create_consumer_credit_synthesizer_agent(
     memory_bank: Any = None,
     model: str = "gemini-2.5-flash",
 ) -> LlmAgent:
-    return create_ccb_fraud_desk_orchestrator_agent(
-        memory_bank_client=GLOBAL_MEMORY_BANK_CLIENT,
-        catalog_governor=GLOBAL_CATALOG_GOVERNOR,
+    """Builds the 8-agent hub-and-spoke desk: the synthesizer plus its 7 spokes.
+
+    `memory_bank` stays an engine-level client. `customer_id` reaches the
+    service per call, as `scope={"customer_id": customer_id}` inside each tool.
+    """
+    _ = memory_bank or GLOBAL_MEMORY_BANK_CLIENT
+
+    fraud_monitoring_agent = _spoke_agent(
+        name="fraud_monitoring_agent",
         model=model,
+        description="Fraud Velocity Specialist (CHANNEL_PRODUCER, FRAUD_DETECTION): reads seeded velocity and card-lock sessions from Memory Bank.",
+        instruction=(
+            "You are the FRAUD_DETECTION channel producer. Call query_fraud_velocity_alerts "
+            "with the customer_id you were given and report only what it returns. "
+            "If it returns no sessions and no memories, say so plainly - never supply an "
+            "example alert, and render any missing field as n/r."
+        ),
+        tools=[
+            FunctionTool(query_fraud_velocity_alerts),
+            FunctionTool(golden_03_suspicious_activity_on_card_window),
+            FunctionTool(golden_04_geo_impossible_travel),
+        ],
     )
+
+    telephony_ivr_agent = _spoke_agent(
+        name="telephony_ivr_agent",
+        model=model,
+        description="Contact Center IVR Specialist (CHANNEL_PRODUCER, TELEPHONY_IVR): reads seeded inbound call sessions from Memory Bank.",
+        instruction=(
+            "You are the TELEPHONY_IVR channel producer. Call query_ivr_call_records for the "
+            "customer in scope and quote the seeded call turns verbatim, with their recorded "
+            "timestamps. Declines and amounts come from golden_02_recent_authorizations_for_card, "
+            "never from your own recollection. Missing values render as n/r."
+        ),
+        tools=[
+            FunctionTool(query_ivr_call_records),
+            FunctionTool(golden_02_recent_authorizations_for_card),
+        ],
+    )
+
+    mobile_app_agent = _spoke_agent(
+        name="mobile_app_agent",
+        model=model,
+        description="Mobile & Digital Wallet Specialist (CHANNEL_PRODUCER, MOBILE_APP): reads seeded app and wallet sessions from Memory Bank.",
+        instruction=(
+            "You are the MOBILE_APP channel producer. Call query_mobile_wallet_events for the "
+            "customer in scope, and confirm live token state with "
+            "golden_10_wallet_tokens_active_on_card before describing any wallet outcome. "
+            "Report an empty channel as empty. Missing values render as n/r."
+        ),
+        tools=[
+            FunctionTool(query_mobile_wallet_events),
+            FunctionTool(golden_10_wallet_tokens_active_on_card),
+        ],
+    )
+
+    web_portal_agent = _spoke_agent(
+        name="web_portal_agent",
+        model=model,
+        description="Online Web Banking Specialist (CHANNEL_PRODUCER, WEB_PORTAL): reads seeded online banking sessions from Memory Bank.",
+        instruction=(
+            "You are the WEB_PORTAL channel producer. Call query_web_portal_activity for the "
+            "customer in scope. Any dispute you mention must also appear in "
+            "golden_07_open_disputes_for_customer; if it does not, say the channel record and "
+            "the ledger disagree. Missing values render as n/r."
+        ),
+        tools=[
+            FunctionTool(query_web_portal_activity),
+            FunctionTool(golden_07_open_disputes_for_customer),
+        ],
+    )
+
+    branch_support_agent = _spoke_agent(
+        name="branch_support_agent",
+        model=model,
+        description="Branch & Teller Specialist (CHANNEL_PRODUCER, BRANCH_SUPPORT): reads seeded in-branch sessions from Memory Bank.",
+        instruction=(
+            "You are the BRANCH_SUPPORT channel producer. Call "
+            "query_branch_teller_interactions for the customer in scope and report the seeded "
+            "banker and teller records as they stand. Use "
+            "golden_01_customer_360_snapshot only to confirm who the customer is. Missing "
+            "values render as n/r."
+        ),
+        tools=[
+            FunctionTool(query_branch_teller_interactions),
+            FunctionTool(golden_01_customer_360_snapshot),
+        ],
+    )
+
+    claim_veracity_validator_agent = _spoke_agent(
+        name="claim_veracity_validator_agent",
+        model=model,
+        description="Pre-Write Veracity Gatekeeper (PRE_WRITE_VALIDATOR): checks a customer claim against ground-truth avenues before anything is written to Memory Bank.",
+        instruction=(
+            "You are the pre-write gate. Nothing reaches Memory Bank without passing through "
+            "validate_and_record_customer_claim. Report the verdict and the corroborating "
+            "avenues exactly as the validator returned them, including a refusal."
+        ),
+        tools=[FunctionTool(validate_and_record_customer_claim)],
+    )
+
+    memory_bank_audit_agent = _spoke_agent(
+        name="memory_bank_audit_agent",
+        model=model,
+        description="Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR): runs the enterprise-wide consolidated memory sweep and reports anomalies.",
+        instruction=(
+            "You are the auditor. Run run_consolidated_memory_audit_sweep and report its "
+            "findings unedited, including a clean sweep. Never summarise an anomaly away."
+        ),
+        tools=[FunctionTool(run_consolidated_memory_audit_sweep)],
+    )
+
+    synthesizer = LlmAgent(
+        name="consumer_credit_synthesizer_agent",
+        model=model,
+        description="Lead Synthesizer Orchestrator (LEAD_SYNTHESIZER): reconstructs the causal chain across all channels and drives the zero-question resolution.",
+        instruction=(
+            "You are the lead synthesizer of the JPMorgan Chase CCB Fraud & Disputes Desk and "
+            "the only agent that talks to the customer. Collect each channel's account from its "
+            "producer spoke, read the consolidated view with read_customer_memory_bank, and "
+            "state the causal chain in order. Run execute_one_click_card_unlock only after the "
+            "veracity gate has passed the claim, and repeat its result as given: it stages the "
+            "unlock and writes the audit trail, it does not confirm the card platform acted. "
+            "Any value a tool did not return is n/r - never fill a gap yourself."
+        ),
+        tools=[
+            FunctionTool(read_customer_memory_bank),
+            FunctionTool(execute_one_click_card_unlock),
+        ],
+        sub_agents=[
+            fraud_monitoring_agent,
+            telephony_ivr_agent,
+            mobile_app_agent,
+            web_portal_agent,
+            branch_support_agent,
+            claim_veracity_validator_agent,
+            memory_bank_audit_agent,
+        ],
+    )
+    return synthesizer
 
 
 def list_all_agents() -> List[AgentDescriptor]:
-    """Returns AgentDescriptor models for the 6 CCB Fraud & Disputes Desk agents."""
+    """The 8 CCB Fraud & Disputes Desk agents: 5 channel producers, the veracity
+    gate, the audit sweeper, and the synthesizer hub they all report to.
+
+    Order matches the roster table in README.md and the names asserted by
+    tests/test_backend.py. `name` is the ADK agent name, because that is what
+    /api/agents/list is checked against.
+    """
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     descriptors = [
         AgentDescriptor(
-            agent_id="01_orchestrator",
-            name="01 Orchestrator",
-            role="Session Router & Case Owner",
-            model=model_name,
-            tools=["golden_01_customer_360_snapshot", "golden_07_open_disputes_for_customer"],
-            description="Owns the conversation, checks open disputes, and routes the dual-card Lisbon theft across 5 specialist subagents.",
-        ),
-        AgentDescriptor(
-            agent_id="02_identity_context",
-            name="02 Identity & Context",
-            role="Vertex AI Memory Bank & Customer 360 Specialist",
-            model=model_name,
-            tools=["retrieve_customer_memories_tool", "golden_01_customer_360_snapshot", "catalog_governance_authorize_tool"],
-            description="Retrieves 9 cross-channel sessions & temporal contradictions from Vertex AI Memory Bank; voluntarily refuses customers.ssn_last4.",
-        ),
-        AgentDescriptor(
-            agent_id="03_fraud_triage",
-            name="03 Fraud Triage",
-            role="Golden SQL Transaction & Velocity Scorer",
+            agent_id="01_fraud_monitoring_agent",
+            name="fraud_monitoring_agent",
+            role="Fraud Velocity Specialist (CHANNEL_PRODUCER)",
+            channel=BankChannel.FRAUD_DETECTION,
             model=model_name,
             tools=[
-                "golden_02_recent_authorizations_for_card",
+                "query_fraud_velocity_alerts",
                 "golden_03_suspicious_activity_on_card_window",
                 "golden_04_geo_impossible_travel",
-                "catalog_governance_authorize_tool",
             ],
-            description="Executes parameterized Golden Queries 02–06 & 12 (ad-hoc SQL = 0); voluntarily refuses cards.pan_full via Dataplex aspect.",
+            description="Reads the seeded FRAUD_DETECTION sessions for the customer in scope and scores the window with Golden Queries 03 and 04. Empty channel returns empty.",
         ),
         AgentDescriptor(
-            agent_id="04_policy_compliance",
-            name="04 Policy & Compliance",
-            role="Dataplex Glossary & Reg E / Reg Z Adjudicator",
+            agent_id="02_telephony_ivr_agent",
+            name="telephony_ivr_agent",
+            role="Contact Center IVR Specialist (CHANNEL_PRODUCER)",
+            channel=BankChannel.TELEPHONY_IVR,
             model=model_name,
             tools=[
-                "catalog_lookup_glossary_term_tool",
-                "catalog_governance_authorize_tool",
-                "golden_07_open_disputes_for_customer",
-                "golden_08_dispute_filing_window_check",
-                "golden_09_provisional_credit_due",
+                "query_ivr_call_records",
+                "golden_02_recent_authorizations_for_card",
             ],
-            description="Looks up Dataplex business glossary terms, voluntarily refuses authorizations_deprecated_v1, and computes Reg E (23 Sep credit) vs Reg Z (no provisional credit).",
+            description="Reads the seeded TELEPHONY_IVR call sessions and their recorded turns; declined amounts come from Golden Query 02, not from the transcript.",
         ),
         AgentDescriptor(
-            agent_id="05_resolution_actions",
-            name="05 Resolution & Actions",
-            role="Card Freeze, Token Revocation, & VCN Issuer",
+            agent_id="03_mobile_app_agent",
+            name="mobile_app_agent",
+            role="Mobile & Digital Wallet Specialist (CHANNEL_PRODUCER)",
+            channel=BankChannel.MOBILE_APP,
             model=model_name,
-            tools=["golden_10_wallet_tokens_active_on_card", "golden_11_dispute_event_timeline"],
-            description="Freezes CARD00002 & CARD00004, revokes 3 active wallet tokens, issues virtual card, and honors standing instruction MEM00016 (notify before closing).",
+            tools=[
+                "query_mobile_wallet_events",
+                "golden_10_wallet_tokens_active_on_card",
+            ],
+            description="Reads the seeded MOBILE_APP sessions covering wallet provisioning and tokenization outcomes, cross-checked against active tokens in Golden Query 10.",
         ),
         AgentDescriptor(
-            agent_id="06_memory_writer",
-            name="06 Memory Writer",
-            role="Asynchronous Post-Session Memory Consolidator",
+            agent_id="04_web_portal_agent",
+            name="web_portal_agent",
+            role="Online Web Banking Specialist (CHANNEL_PRODUCER)",
+            channel=BankChannel.WEB_PORTAL,
             model=model_name,
-            tools=["golden_11_dispute_event_timeline", "retrieve_customer_memories_tool"],
-            description="Triggers server-side Vertex AI Memory Bank consolidation (memories:generate) after run close with zero PII/PAN persisted.",
+            tools=[
+                "query_web_portal_activity",
+                "golden_07_open_disputes_for_customer",
+            ],
+            description="Reads the seeded WEB_PORTAL sessions - logins, dispute filings, card controls - and reconciles any dispute against the open-dispute ledger.",
+        ),
+        AgentDescriptor(
+            agent_id="05_branch_support_agent",
+            name="branch_support_agent",
+            role="Branch & Teller Specialist (CHANNEL_PRODUCER)",
+            channel=BankChannel.BRANCH_SUPPORT,
+            model=model_name,
+            tools=[
+                "query_branch_teller_interactions",
+                "golden_01_customer_360_snapshot",
+            ],
+            description="Reads the seeded BRANCH_SUPPORT sessions for banker consultations and in-person identity checks, with Golden Query 01 for customer identity only.",
+        ),
+        AgentDescriptor(
+            agent_id="06_claim_veracity_validator_agent",
+            name="claim_veracity_validator_agent",
+            role="Pre-Write Veracity Gatekeeper (PRE_WRITE_VALIDATOR)",
+            channel=None,
+            model=model_name,
+            tools=["validate_and_record_customer_claim"],
+            description="Checks a customer claim against ground-truth avenues before any write reaches Memory Bank. Implemented in backend/veracity_and_audit.py.",
+        ),
+        AgentDescriptor(
+            agent_id="07_memory_bank_audit_agent",
+            name="memory_bank_audit_agent",
+            role="Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR)",
+            channel=None,
+            model=model_name,
+            tools=["run_consolidated_memory_audit_sweep"],
+            description="Runs the enterprise-wide consolidated sweep across customer memory banks and reports anomalies. Implemented in backend/veracity_and_audit.py.",
+        ),
+        AgentDescriptor(
+            agent_id="08_consumer_credit_synthesizer_agent",
+            name="consumer_credit_synthesizer_agent",
+            role="Lead Synthesizer Orchestrator (LEAD_SYNTHESIZER)",
+            channel=BankChannel.CORE_BANKING,
+            model=model_name,
+            tools=["read_customer_memory_bank", "execute_one_click_card_unlock"],
+            description="Hub of the topology: collects every spoke's account, reconstructs the causal chain from Memory Bank, and stages the one-click unlock with its audit trail.",
         ),
     ]
     return descriptors
-
