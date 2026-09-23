@@ -16,12 +16,20 @@ Connects the three live pillars of the JPMC Consumer & Community Banking Fraud D
 2. Dataplex Universal Catalog Policy Governor (`backend/knowledge_catalog.py` -> `CatalogGovernor`)
    - Voluntary, aspect-driven governance (`lifecycle-status` & `sensitivity-class.agent_behavior`).
    - Nothing is hidden or blocked by IAM brute-force errors; agents consult `CatalogGovernor`
-     before touching tables/columns, voluntarily refuse `authorizations_deprecated_v1`,
-     `customers.ssn_last4`, and `cards.pan_full`, and log the exact aspect evidence.
+     before touching any table or column and honour whatever `agent_behavior` comes back,
+     logging the aspect evidence that decided it.
+   - No governed table or column is named in this file. Sibling tables are DISCOVERED with
+     `searchEntries` and judged on their own aspects, so the refusal is a property of the
+     catalog rather than of a constant written here. Re-label an aspect in Dataplex and the
+     agents' behaviour changes on the next run with no code edit -- which is the only
+     version of this claim worth demonstrating.
 3. Parameterized Golden Query Contract Executor (`backend/queries/golden/01..12.sql` + `INDEX.md`)
-   - Wires all 12 `.sql` contracts defined in `queries/golden/INDEX.md` as callable ADK
-     `FunctionTool` functions (`@parameterized` BigQuery execution, `ad_hoc_sql = 0`),
-     mapped to the agents authorized for them in `INDEX.md`.
+   - The 12 `.sql` contracts in `queries/golden/INDEX.md` are the ONLY route into BigQuery:
+     the text is read from disk and every value is bound as a named query parameter, so
+     there is no path by which an agent can compose SQL.
+   - 9 of the 12 are currently wrapped as callable ADK `FunctionTool` functions
+     (01, 02, 03, 04, 07, 08, 09, 10, 11), mapped to the agents authorized for them in
+     `INDEX.md`. 05, 06 and 12 have no wrapper and are unreachable by any agent.
 
 Every value that leaves this file carries a provenance tag from
 `backend/provenance.py`. The only constant allowed through is an agent's own
@@ -31,6 +39,7 @@ verifier rather than taken on trust.
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -50,6 +59,7 @@ from backend.memory_bank import (
     MemoryBankClient,
     create_default_memory_bank_client,
     field as mb_field,
+    topic_labels,
 )
 from backend.provenance import (
     live,
@@ -74,8 +84,14 @@ from backend.models import (
     SeverityLevel,
 )
 from backend.veracity_and_audit import ClaimVeracityValidatorAgent, MemoryBankAuditAgent
+from backend import obs
 
 load_dotenv()
+
+# No handler is installed here. `obs.configure()` is an explicit call made by
+# app.py and by scripts/trace_adk_agents.py; importing this module must not
+# decide where anyone's log records go.
+LOG = obs.get_logger(__name__)
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
@@ -83,6 +99,16 @@ os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 # Engine-level singletons (NOT bound to any single customer_id at initialization)
 GLOBAL_MEMORY_BANK_CLIENT: MemoryBankClient = create_default_memory_bank_client(verbose=False)
 GLOBAL_CATALOG_GOVERNOR: CatalogGovernor = create_default_catalog_governor(strict=True, verbose=False)
+
+# Import-time, so it is the first thing in any log and answers "which engine and
+# which dataset was this run actually talking to" before anything else happens.
+LOG.debug(
+    "singletons ready memory_bank_parent=%s catalog_project=%s dataset=%s strict=%s",
+    GLOBAL_MEMORY_BANK_CLIENT.parent,
+    GLOBAL_CATALOG_GOVERNOR.client.project,
+    getattr(GLOBAL_CATALOG_GOVERNOR.client, "dataset", NOT_RECORDED),
+    GLOBAL_CATALOG_GOVERNOR.strict,
+)
 
 
 # ==============================================================================
@@ -230,6 +256,73 @@ def load_golden_sql_text(query_id: str) -> str:
     return sql_path.read_text(encoding="utf-8")
 
 
+def _entry_table_name(entry: Dict[str, Any]) -> Optional[str]:
+    """The BigQuery table behind one `searchEntries` result, or None if it is not one.
+
+    A catalog search matches on descriptions as well as names, so a search for a
+    table also returns glossary terms, the dataset itself and unrelated tables
+    whose description happens to mention it. The entry type is what separates
+    "something I could query" from "something I could read about".
+    """
+    dataplex_entry = entry.get("dataplexEntry", entry) or {}
+    kind = str(dataplex_entry.get("entryType", "")).rsplit("/", 1)[-1]
+    if kind not in ("bigquery-table", "bigquery-view"):
+        return None
+    resource = str((dataplex_entry.get("entrySource") or {}).get("resource", ""))
+    if "/tables/" not in resource:
+        return None
+    return resource.rsplit("/tables/", 1)[-1] or None
+
+
+#: Discovered sibling names, keyed by the table that was searched for. The set of
+#: entries in the catalog does not change inside a run, so searching once per
+#: table per process keeps the extra latency off every golden query. The
+#: *decisions* are deliberately not cached -- each one is re-read so the aspect
+#: evidence in the audit trail is from this run and not from an earlier one.
+_SIBLING_TABLE_CACHE: Dict[str, List[str]] = {}
+
+
+def discover_sibling_tables(
+    governor: CatalogGovernor,
+    primary_table: str,
+    use_cache: bool = True,
+) -> List[str]:
+    """Tables the catalog returns alongside `primary_table`, excluding it.
+
+    This is how a superseded copy of a table is found. Nothing in this file
+    knows such a copy exists: the agent asks the catalog what sits next to the
+    table it is about to read, and the answer is whatever Dataplex currently
+    holds. Add a second deprecated twin tomorrow and it is refused tomorrow,
+    with no edit here.
+
+    A search failure is logged and returns an empty list rather than raising,
+    because losing discovery must not take the golden query down with it -- but
+    it is a WARNING, because a run with no discovery is proving less than a run
+    with it.
+    """
+    if use_cache and primary_table in _SIBLING_TABLE_CACHE:
+        siblings = _SIBLING_TABLE_CACHE[primary_table]
+        LOG.debug("catalog discovery cache hit for %s -> %s", primary_table, siblings)
+        return siblings
+
+    with obs.turn("catalog.discover", LOG, level=logging.DEBUG, search=primary_table) as span:
+        try:
+            entries = governor.client.search_entries(primary_table)
+        except Exception as exc:  # noqa: BLE001 - discovery is best effort, the query is not
+            LOG.warning(
+                "catalog search for %r failed (%s: %s); this run proves no sibling refusal",
+                primary_table, type(exc).__name__, exc,
+            )
+            return []
+
+        names = [name for name in (_entry_table_name(e) for e in entries) if name]
+        siblings = sorted({name for name in names if name != primary_table})
+        span.detail(entries=len(entries), tables=len(names), siblings=siblings)
+
+    _SIBLING_TABLE_CACHE[primary_table] = siblings
+    return siblings
+
+
 def execute_golden_query_contract(
     query_id: str,
     calling_agent: AgentId,
@@ -239,91 +332,159 @@ def execute_golden_query_contract(
     """Executes one of the 12 approved Golden Queries after consulting `CatalogGovernor`.
 
     1. Verifies that `calling_agent` is authorized in `queries/golden/INDEX.md`.
-    2. Calls `CatalogGovernor.check_table()` on the target tables (and logs the voluntary
-       refusal of `authorizations_deprecated_v1` if authorizations are being queried) and
-       `CatalogGovernor.check_column()` on governed columns (`ssn_last4`, `pan_full`).
+    2. Asks the catalog what else sits alongside the target table, checks the lifecycle
+       aspect of each, and records a refusal for any the catalog says is unfit. Also
+       checks `CatalogGovernor.check_column()` on the columns this contract declares.
     3. Executes the parameterized `.sql` file on BigQuery (`@named` parameters, `ad_hoc_sql = 0`).
+
+    Note on step 2: the refusals are recorded, not enforced -- the query in step 3 runs
+    either way. That is deliberate and is what `CATALOG_ADVISORY_NOTE` in
+    `veracity_and_audit.py` describes: Dataplex advises, the agent's visible decision to
+    decline is the control. Enforcement of a declined column happens downstream, where
+    `_redact()` blanks it out of the rows.
     """
     governor = catalog_governor or GLOBAL_CATALOG_GOVERNOR
     contract = GOLDEN_QUERY_CONTRACTS[query_id]
 
-    if calling_agent not in contract.authorized_agents:
-        return {
-            "allowed": False,
-            "error": (
-                f"Agent {calling_agent.value} is not authorized in queries/golden/INDEX.md "
-                f"to call {contract.sql_filename}. Allowed: {[a.value for a in contract.authorized_agents]}"
-            ),
-        }
+    with obs.turn(
+        "golden_query.%s" % query_id, LOG,
+        tool=contract.tool_name, agent=calling_agent.value,
+    ) as span:
+        if calling_agent not in contract.authorized_agents:
+            LOG.warning(
+                "golden query %s refused: %s is not in INDEX.md's authorized set %s",
+                query_id, calling_agent.value, [a.value for a in contract.authorized_agents],
+            )
+            span.detail(allowed=False, reason="agent_not_authorized")
+            return {
+                "allowed": False,
+                "error": (
+                    f"Agent {calling_agent.value} is not authorized in queries/golden/INDEX.md "
+                    f"to call {contract.sql_filename}. Allowed: {[a.value for a in contract.authorized_agents]}"
+                ),
+            }
 
-    # Step 1: Pre-query Dataplex Catalog Governance checks (Voluntary Refusal Proof)
-    voluntary_refusals: List[Dict[str, Any]] = []
-    primary_table = contract.governed_tables[0]
-    table_decision = governor.check_table(primary_table)
+        span.debug_payload("params", params)
 
-    # Whenever an agent queries `authorizations`, it also checks the sibling table
-    # `authorizations_deprecated_v1` discovered via catalog search and voluntarily refuses it
-    if "authorizations" in contract.governed_tables:
-        dep_decision = governor.check_table("authorizations_deprecated_v1")
-        if not dep_decision.allowed:
-            voluntary_refusals.append(dep_decision.to_dict())
+        # Step 1: Pre-query Dataplex Catalog Governance checks (Voluntary Refusal Proof)
+        voluntary_refusals: List[Dict[str, Any]] = []
+        primary_table = contract.governed_tables[0]
 
-    for col_spec in contract.governed_columns_checked:
-        if "." in col_spec:
-            tbl_name, col_name = col_spec.split(".", 1)
-            col_decision = governor.check_column(tbl_name, col_name)
-            if not col_decision.allowed:
-                voluntary_refusals.append(col_decision.to_dict())
+        with obs.turn("catalog.check_table", LOG, level=logging.DEBUG, table=primary_table) as check:
+            table_decision = governor.check_table(primary_table)
+            check.detail(action=table_decision.action, evidence=table_decision.evidence)
+        if not table_decision.allowed:
+            # The primary table itself being unfit is a louder event than a
+            # sibling being unfit, and it is not currently enforced, so it has to
+            # be visible in the log or it is invisible entirely.
+            LOG.warning(
+                "catalog says the PRIMARY table %s is unfit (%s); the query still runs "
+                "because this gate is advisory",
+                primary_table, table_decision.reason,
+            )
 
-    # Step 2: Run the parameterized SQL on BigQuery
-    rows: List[Dict[str, Any]] = []
-    try:
-        from google.cloud import bigquery
+        # Siblings are discovered, never named. The catalog is asked what sits
+        # next to this table and each answer is judged on its own aspects.
+        for sibling in discover_sibling_tables(governor, primary_table):
+            with obs.turn("catalog.check_table", LOG, level=logging.DEBUG, table=sibling) as check:
+                decision = governor.check_table(sibling)
+                check.detail(action=decision.action, evidence=decision.evidence)
+            if not decision.allowed:
+                LOG.info(
+                    "voluntary refusal: %s declined on %s (%s)",
+                    sibling, decision.evidence, decision.reason,
+                )
+                voluntary_refusals.append(decision.to_dict())
 
-        bq_client = bigquery.Client(project=require_env("GOOGLE_CLOUD_PROJECT"))
-        sql_text = load_golden_sql_text(query_id)
+        for col_spec in contract.governed_columns_checked:
+            if "." in col_spec:
+                tbl_name, col_name = col_spec.split(".", 1)
+                with obs.turn("catalog.check_column", LOG, level=logging.DEBUG, column=col_spec) as check:
+                    col_decision = governor.check_column(tbl_name, col_name)
+                    check.detail(action=col_decision.action, evidence=col_decision.evidence)
+                if not col_decision.allowed:
+                    LOG.info(
+                        "voluntary refusal: %s declined on %s (agent_behavior=%s)",
+                        col_spec, col_decision.evidence, col_decision.action,
+                    )
+                    voluntary_refusals.append(col_decision.to_dict())
 
-        query_parameters = []
-        for k, v in params.items():
-            if isinstance(v, list):
-                query_parameters.append(bigquery.ArrayQueryParameter(k, "STRING", v))
-            elif isinstance(v, int):
-                query_parameters.append(bigquery.ScalarQueryParameter(k, "INT64", v))
-            elif isinstance(v, float):
-                query_parameters.append(bigquery.ScalarQueryParameter(k, "FLOAT64", v))
-            elif isinstance(v, bool):
-                query_parameters.append(bigquery.ScalarQueryParameter(k, "BOOL", v))
-            elif isinstance(v, datetime):
-                query_parameters.append(bigquery.ScalarQueryParameter(k, "TIMESTAMP", v))
-            elif isinstance(v, date):
-                query_parameters.append(bigquery.ScalarQueryParameter(k, "DATE", v))
-            else:
-                query_parameters.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
+        # Step 2: Run the parameterized SQL on BigQuery
+        rows: List[Dict[str, Any]] = []
+        try:
+            from google.cloud import bigquery
 
-        job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
-        query_job = bq_client.query(sql_text, job_config=job_config)
-        for row in query_job.result():
-            rows.append({key: (val.isoformat() if hasattr(val, "isoformat") else val) for key, val in dict(row).items()})
-    except Exception as exc:  # pragma: no cover
-        # A failed query used to come back as a one-row result carrying the error
-        # text, which made row_count=1 and looked like data downstream. Fail loudly.
-        raise RuntimeError(
-            "Golden Query %s (%s) failed against BigQuery: %s"
-            % (contract.query_id, contract.sql_filename, exc)
-        ) from exc
+            bq_client = bigquery.Client(project=require_env("GOOGLE_CLOUD_PROJECT"))
+            sql_text = load_golden_sql_text(query_id)
+            LOG.debug("loaded %s (%d chars) from disk", contract.sql_filename, len(sql_text))
 
-    result = GoldenQueryExecutionResult(
-        query_id=contract.query_id,
-        tool_name=contract.tool_name,
-        calling_agent=calling_agent,
-        parameters_bound={k: str(v) for k, v in params.items()},
-        catalog_verdict=table_decision.to_dict(),
-        voluntary_refusals_logged=voluntary_refusals,
-        row_count=len(rows),
-        rows=rows[:25],
-        ad_hoc_sql_used=False,
-    )
-    return result.model_dump(mode="json")
+            query_parameters = []
+            for k, v in params.items():
+                # Order matters twice here, and both cases are subclass traps:
+                #   bool is a subclass of int, so `isinstance(v, int)` first made
+                #     the bool branch unreachable and bound True as INT64, which
+                #     BigQuery rejects with "Bad int64 value: True".
+                #   datetime is a subclass of date, so datetime must also precede
+                #     date or every timestamp would be truncated to a day.
+                if isinstance(v, list):
+                    query_parameters.append(bigquery.ArrayQueryParameter(k, "STRING", v))
+                elif isinstance(v, bool):
+                    query_parameters.append(bigquery.ScalarQueryParameter(k, "BOOL", v))
+                elif isinstance(v, int):
+                    query_parameters.append(bigquery.ScalarQueryParameter(k, "INT64", v))
+                elif isinstance(v, float):
+                    query_parameters.append(bigquery.ScalarQueryParameter(k, "FLOAT64", v))
+                elif isinstance(v, datetime):
+                    query_parameters.append(bigquery.ScalarQueryParameter(k, "TIMESTAMP", v))
+                elif isinstance(v, date):
+                    query_parameters.append(bigquery.ScalarQueryParameter(k, "DATE", v))
+                else:
+                    query_parameters.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
+
+            # The bound parameters are the proof that no value was interpolated
+            # into the SQL text, so they are worth a line of their own at DEBUG.
+            LOG.debug(
+                "bound %d named parameters: %s",
+                len(query_parameters),
+                [(p.name, getattr(p, "type_", None) or getattr(p, "array_type", None)) for p in query_parameters],
+            )
+
+            job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
+            with obs.turn("bigquery.query", LOG, level=logging.DEBUG, sql=contract.sql_filename) as job_span:
+                query_job = bq_client.query(sql_text, job_config=job_config)
+                for row in query_job.result():
+                    rows.append({key: (val.isoformat() if hasattr(val, "isoformat") else val) for key, val in dict(row).items()})
+                job_span.detail(
+                    job_id=getattr(query_job, "job_id", NOT_RECORDED),
+                    bytes_billed=getattr(query_job, "total_bytes_billed", None),
+                    rows=len(rows),
+                )
+        except Exception as exc:  # pragma: no cover
+            # A failed query used to come back as a one-row result carrying the error
+            # text, which made row_count=1 and looked like data downstream. Fail loudly.
+            raise RuntimeError(
+                "Golden Query %s (%s) failed against BigQuery: %s"
+                % (contract.query_id, contract.sql_filename, exc)
+            ) from exc
+
+        if rows:
+            span.debug_payload("first row", rows[0])
+        else:
+            LOG.debug("%s returned no rows; reporting empty, not a stand-in", contract.sql_filename)
+
+        result = GoldenQueryExecutionResult(
+            query_id=contract.query_id,
+            tool_name=contract.tool_name,
+            calling_agent=calling_agent,
+            parameters_bound={k: str(v) for k, v in params.items()},
+            catalog_verdict=table_decision.to_dict(),
+            voluntary_refusals_logged=voluntary_refusals,
+            row_count=len(rows),
+            rows=rows[:25],
+            ad_hoc_sql_used=False,
+        )
+        span.detail(rows=len(rows), refusals=len(voluntary_refusals))
+        return result.model_dump(mode="json")
 
 
 # ==============================================================================
@@ -331,7 +492,7 @@ def execute_golden_query_contract(
 # ==============================================================================
 
 def golden_01_customer_360_snapshot(customer_id: str = "CUST00001") -> Dict[str, Any]:
-    """Golden Query 01: Who is this customer and what do their last 90 days look like? (Omits ssn_last4 per Dataplex aspect)."""
+    """Golden Query 01: Who is this customer and what do their last 90 days look like? Column selection follows the catalog's sensitivity aspects."""
     return execute_golden_query_contract(
         query_id="01",
         calling_agent=AgentId.IDENTITY_CONTEXT,
@@ -344,7 +505,7 @@ def golden_02_recent_authorizations_for_card(
     lookback_days: int = 14,
     row_limit: int = 25,
 ) -> Dict[str, Any]:
-    """Golden Query 02: What are the most recent charges on this card? (Uses pan_masked, refuses pan_full)."""
+    """Golden Query 02: What are the most recent charges on this card? Column selection follows the catalog's sensitivity aspects."""
     return execute_golden_query_contract(
         query_id="02",
         calling_agent=AgentId.FRAUD_TRIAGE,
@@ -361,7 +522,7 @@ def golden_03_suspicious_activity_on_card_window(
     card_id: str = "CARD00002",
     min_risk_score: float = 0.65,
 ) -> Dict[str, Any]:
-    """Golden Query 03: Between two moments, what on this card is worth a second look, and why? (Never reads is_fraud answer key)."""
+    """Golden Query 03: Between two moments, what on this card is worth a second look, and why? Scores on signals only, never on a stored label."""
     return execute_golden_query_contract(
         query_id="03",
         calling_agent=AgentId.FRAUD_TRIAGE,
@@ -393,7 +554,7 @@ def golden_04_geo_impossible_travel(
 
 
 def golden_07_open_disputes_for_customer(customer_id: str = "CUST00001") -> Dict[str, Any]:
-    """Golden Query 07: What disputes does this customer already have running? (`DSP00033` Reg E + `DSP00034` Reg Z)."""
+    """Golden Query 07: What disputes does this customer already have running, and which regulation does the ledger record for each?"""
     return execute_golden_query_contract(
         query_id="07",
         calling_agent=AgentId.POLICY_COMPLIANCE,
@@ -406,7 +567,7 @@ def golden_07_open_disputes_for_customer(customer_id: str = "CUST00001") -> Dict
 
 
 def golden_08_dispute_filing_window_check(dispute_id: str = "DSP00034") -> Dict[str, Any]:
-    """Golden Query 08: Was this dispute filed in time, and what does the bank now owe and by when? (Reg E vs Reg Z)."""
+    """Golden Query 08: Was this dispute filed in time, and what does the bank now owe and by when, under the regulation the ledger records for it?"""
     return execute_golden_query_contract(
         query_id="08",
         calling_agent=AgentId.POLICY_COMPLIANCE,
@@ -461,35 +622,94 @@ def retrieve_customer_memories_tool(
     query: str = "Where is this customer travelling and what standing instructions exist?",
 ) -> Dict[str, Any]:
     """Calls Vertex AI Memory Bank (`memories:retrieve`) with per-request `scope={"customer_id": customer_id}`."""
-    scope = {"customer_id": customer_id}
-    memories = GLOBAL_MEMORY_BANK_CLIENT.retrieve(scope=scope, query=query, top_k=8)
-    extracted = []
-    for item in memories:
-        mem = item.get("memory", item)
-        extracted.append({
-            "fact": mb_field(mem, "fact"),
-            "updateTime": mb_field(mem, "updateTime"),
-            "topics": mb_field(mem, "topics"),
-        })
-    return {
-        "scope": scope,
-        "engine_parent": GLOBAL_MEMORY_BANK_CLIENT.parent,
-        "count": len(extracted),
-        "memories": extracted,
-    }
+    with obs.turn("memory.retrieve", LOG, customer_id=customer_id) as span:
+        span.debug_payload("query", query)
+        scope = {"customer_id": customer_id}
+        memories = GLOBAL_MEMORY_BANK_CLIENT.retrieve(scope=scope, query=query, top_k=8)
+        extracted = []
+        for item in memories:
+            mem = item.get("memory", item)
+            extracted.append({
+                "fact": mb_field(mem, "fact"),
+                "updateTime": mb_field(mem, "updateTime"),
+                # Flattened to plain labels so they line up with what
+                # list_memory_topics_tool() reports. The raw API shape here is
+                # {"customMemoryTopicLabel": "..."}, which does not.
+                "topics": topic_labels(mem),
+            })
+        # The facts themselves are the thing you actually want to see when a turn
+        # reasons oddly, so they go in at DEBUG rather than just the count.
+        span.debug_payload("facts", [m["fact"] for m in extracted])
+        if not extracted:
+            LOG.warning(
+                "memory retrieve returned nothing for scope %s; the turn will proceed ungrounded",
+                scope,
+            )
+        span.detail(count=len(extracted))
+        return {
+            "scope": scope,
+            "engine_parent": GLOBAL_MEMORY_BANK_CLIENT.parent,
+            "count": len(extracted),
+            "memories": extracted,
+        }
+
+
+def list_memory_topics_tool() -> Dict[str, Any]:
+    """Returns the topic vocabulary this Memory Bank was configured with.
+
+    Call this BEFORE retrieving memories. Every stored memory is filed under one
+    of these topics by the extraction model, so the labels and their descriptions
+    tell you what kinds of fact exist for a customer and what words will actually
+    match them. Retrieval is a semantic search: a query phrased in the vocabulary
+    the memories were filed under finds them; a guess may not.
+
+    The list is read from the live Agent Engine on first use, not held in code,
+    so it is whatever the deployment is configured with right now.
+    """
+    with obs.turn("memory.list_topics", LOG) as span:
+        topics = GLOBAL_MEMORY_BANK_CLIENT.memory_topics()
+        span.debug_payload("topics", topics)
+        if not topics:
+            # No vocabulary means extraction is unconstrained. That is a real
+            # deployment state and the agent should be told, not left to assume
+            # the call failed.
+            LOG.warning(
+                "engine %s has no memory topics configured; extraction is unconstrained",
+                GLOBAL_MEMORY_BANK_CLIENT.parent,
+            )
+        span.detail(count=len(topics), labels=[t["label"] for t in topics])
+        return {
+            "engine_parent": GLOBAL_MEMORY_BANK_CLIENT.parent,
+            "source": "reasoningEngines.get -> contextSpec.memoryBankConfig.customizationConfigs[].memoryTopics[]",
+            "count": len(topics),
+            "topics": topics,
+        }
 
 
 def catalog_governance_authorize_tool(
-    table: str = "authorizations_deprecated_v1",
+    table: str,
     columns: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Consults Dataplex `CatalogGovernor.authorize(table, columns)` to check live `lifecycle-status` and `sensitivity-class` aspects."""
-    return GLOBAL_CATALOG_GOVERNOR.authorize(table=table, columns=columns or [])
+    """Consults Dataplex `CatalogGovernor.authorize(table, columns)` to check live `lifecycle-status` and `sensitivity-class` aspects.
+
+    `table` is deliberately required. ADK publishes a parameter's default value in
+    the schema the model reads, so a default here would name a governed table in
+    every prompt and the model would call it with that name because it was
+    suggested one -- which is not the same as the model discovering it.
+    """
+    with obs.turn("catalog.authorize", LOG, table=table, columns=columns or []) as span:
+        verdict = GLOBAL_CATALOG_GOVERNOR.authorize(table=table, columns=columns or [])
+        span.debug_payload("verdict", verdict)
+        span.detail(allowed=verdict.get("allowed"))
+        return verdict
 
 
 def catalog_lookup_glossary_term_tool(term_id: str = "provisional-credit") -> Dict[str, Any]:
-    """Looks up an authoritative business term (`provisional-credit`, `regulation-e`, `regulation-z`) in Dataplex Glossary."""
-    return GLOBAL_CATALOG_GOVERNOR.lookup_term(term_id)
+    """Looks up an authoritative business term in the Dataplex Glossary (`glossaries/*/terms/*`)."""
+    with obs.turn("catalog.lookup_term", LOG, term_id=term_id) as span:
+        term = GLOBAL_CATALOG_GOVERNOR.lookup_term(term_id)
+        span.debug_payload("term", term)
+        return term
 
 
 # Legacy tool wrappers preserved for backward compatibility with existing endpoints
@@ -639,47 +859,85 @@ def _produce_channel_payload(
     scope = {"customer_id": customer_id}
     tokens = CHANNEL_SESSION_TOKENS.get(channel, (channel,))
 
-    matched: List[Dict[str, Any]] = []
-    for session in bank.list_sessions():
-        if _session_customer_id(session) != customer_id:
-            continue
-        label = mb_field(session, "sessionState", "channel")
-        if str(label).upper() not in tokens:
-            continue
+    span = obs.turn("channel.produce", LOG, channel=channel, customer_id=customer_id)
+    with span as turn_handle:
+        turn_handle.debug_payload("accepted channel tokens", list(tokens))
+        if channel not in CHANNEL_SESSION_TOKENS:
+            # A channel with no token tuple matches only its own exact spelling,
+            # which is the silent-empty bug this map exists to prevent.
+            LOG.warning(
+                "channel %r has no entry in CHANNEL_SESSION_TOKENS; matching on the literal "
+                "name only, so any other spelling in the seeded data will be missed",
+                channel,
+            )
 
-        session_name = mb_field(session, "name")
-        source = "sessions.list:%s" % session_name
-        events = _event_rows(bank, session_name) if include_events and session_name != NOT_RECORDED else []
-        matched.append({
-            "session_id": _tagged_value(
-                str(session_name).split("/")[-1] if session_name != NOT_RECORDED else NOT_RECORDED, source),
-            "session_name": _tagged_value(session_name, source),
-            "display_name": _tagged_value(mb_field(session, "displayName"), source),
-            "channel_label_in_data": _tagged_value(label, source),
-            "customer_id": _tagged_value(_session_customer_id(session), source),
-            "intent": _tagged_value(mb_field(session, "sessionState", "intent"), source),
-            "create_time": _tagged_value(mb_field(session, "createTime"), source),
-            "update_time": _tagged_value(mb_field(session, "updateTime"), source),
-            "events": events,
-            "event_count": (
-                computed(len(events), "len(sessions.events.list:%s)" % session_name)
-                if include_events
-                else unmeasured("events not read: include_events=False")
-            ),
-        })
+        matched: List[Dict[str, Any]] = []
+        considered = 0
+        skipped_scope = 0
+        skipped_channel = 0
+        seen_labels: Dict[str, int] = {}
 
-    memories = _memory_rows(bank, scope, memory_query, top_k)
+        for session in bank.list_sessions():
+            considered += 1
+            if _session_customer_id(session) != customer_id:
+                skipped_scope += 1
+                continue
+            label = mb_field(session, "sessionState", "channel")
+            seen_labels[str(label)] = seen_labels.get(str(label), 0) + 1
+            if str(label).upper() not in tokens:
+                skipped_channel += 1
+                continue
 
-    return {
-        "channel": identity(channel, channel_source, "agent identity constant"),
-        "customer_scope": computed(scope, "scope argument sent to sessions.list / memories.retrieve"),
-        "memory_bank_parent": computed(bank.parent, "MemoryBankClient.parent"),
-        "retrieval_query": computed(memory_query, "channel retrieval query issued by %s" % channel_source),
-        "sessions": matched,
-        "session_count": computed(len(matched), "count of sessions.list rows matching channel token + scope"),
-        "memories": memories,
-        "memory_count": computed(len(memories), "count of memories.retrieve rows"),
-    }
+            session_name = mb_field(session, "name")
+            source = "sessions.list:%s" % session_name
+            events = _event_rows(bank, session_name) if include_events and session_name != NOT_RECORDED else []
+            matched.append({
+                "session_id": _tagged_value(
+                    str(session_name).split("/")[-1] if session_name != NOT_RECORDED else NOT_RECORDED, source),
+                "session_name": _tagged_value(session_name, source),
+                "display_name": _tagged_value(mb_field(session, "displayName"), source),
+                "channel_label_in_data": _tagged_value(label, source),
+                "customer_id": _tagged_value(_session_customer_id(session), source),
+                "intent": _tagged_value(mb_field(session, "sessionState", "intent"), source),
+                "create_time": _tagged_value(mb_field(session, "createTime"), source),
+                "update_time": _tagged_value(mb_field(session, "updateTime"), source),
+                "events": events,
+                "event_count": (
+                    computed(len(events), "len(sessions.events.list:%s)" % session_name)
+                    if include_events
+                    else unmeasured("events not read: include_events=False")
+                ),
+            })
+
+        turn_handle.debug_payload("channel labels seen in scope", seen_labels)
+        if not matched:
+            # An empty channel and a channel whose label spelling is not in the
+            # token tuple produce identical output. Only the log can tell them
+            # apart, so it has to say which one happened.
+            LOG.warning(
+                "channel %s matched 0 of %d sessions (%d wrong scope, %d wrong channel label). "
+                "Labels present for this customer: %s. If one of those is this channel under "
+                "another name, CHANNEL_SESSION_TOKENS is missing an alias.",
+                channel, considered, skipped_scope, skipped_channel, sorted(seen_labels),
+            )
+
+        memories = _memory_rows(bank, scope, memory_query, top_k)
+
+        turn_handle.detail(
+            sessions=len(matched),
+            memories=len(memories),
+            considered=considered,
+        )
+        return {
+            "channel": identity(channel, channel_source, "agent identity constant"),
+            "customer_scope": computed(scope, "scope argument sent to sessions.list / memories.retrieve"),
+            "memory_bank_parent": computed(bank.parent, "MemoryBankClient.parent"),
+            "retrieval_query": computed(memory_query, "channel retrieval query issued by %s" % channel_source),
+            "sessions": matched,
+            "session_count": computed(len(matched), "count of sessions.list rows matching channel token + scope"),
+            "memories": memories,
+            "memory_count": computed(len(memories), "count of memories.retrieve rows"),
+        }
 
 
 def query_fraud_velocity_alerts(
@@ -868,14 +1126,19 @@ def create_ccb_fraud_desk_orchestrator_agent(
     identity_context_agent = LlmAgent(
         name="identity_and_context_agent",
         model=model,
-        description="02 Identity & Context Agent: Retrieves scoped customer facts from Vertex AI Memory Bank and runs Golden Query 01 while refusing customers.ssn_last4.",
+        description="02 Identity & Context Agent: Retrieves scoped customer facts from Vertex AI Memory Bank and runs Golden Query 01 within whatever the catalog's sensitivity aspects permit.",
         instruction=(
-            "You are Agent 02 (Identity & Context). Always retrieve scoped customer memories "
+            "You are Agent 02 (Identity & Context). Call list_memory_topics_tool first to see "
+            "what kinds of fact this Memory Bank files, then phrase your retrieval in that "
+            "vocabulary - retrieval is a semantic search, so a query worded like the topic it "
+            "lives under finds it and a guess may not. Then retrieve scoped customer memories "
             "using retrieve_customer_memories_tool(customer_id=...) and run golden_01_customer_360_snapshot. "
-            "Consult catalog_governance_authorize_tool before selecting sensitive columns and voluntarily "
-            "refuse customers.ssn_last4 (sensitivity-class.agent_behavior = REFUSE)."
+            "Before selecting any column, call catalog_governance_authorize_tool and honour the "
+            "agent_behavior it returns. Report which columns you declined and the aspect that "
+            "decided it; a refusal you cannot cite is not a refusal."
         ),
         tools=[
+            FunctionTool(list_memory_topics_tool),
             FunctionTool(retrieve_customer_memories_tool),
             FunctionTool(golden_01_customer_360_snapshot),
             FunctionTool(catalog_governance_authorize_tool),
@@ -885,11 +1148,13 @@ def create_ccb_fraud_desk_orchestrator_agent(
     fraud_triage_agent = LlmAgent(
         name="fraud_triage_agent",
         model=model,
-        description="03 Fraud Triage Agent: Executes Golden Queries 02, 03, 04 on BigQuery to score Lisbon travel-window activity without reading is_fraud ground truth or cards.pan_full.",
+        description="03 Fraud Triage Agent: Executes Golden Queries 02, 03, 04 on BigQuery to score travel-window activity within whatever the catalog's sensitivity aspects permit.",
         instruction=(
             "You are Agent 03 (Fraud Triage). Use only approved Golden Queries (02, 03, 04) "
-            "with named @parameters (zero ad-hoc SQL). Never select cards.pan_full (use pan_masked) "
-            "and never read authorizations.is_fraud during triage."
+            "with named @parameters (zero ad-hoc SQL). Before selecting any column, call "
+            "catalog_governance_authorize_tool and honour the agent_behavior it returns; where "
+            "it offers a replacement column, use the replacement. Triage on the signals only - "
+            "never read a stored fraud label, because scoring against the answer proves nothing."
         ),
         tools=[
             FunctionTool(golden_02_recent_authorizations_for_card),
@@ -902,13 +1167,18 @@ def create_ccb_fraud_desk_orchestrator_agent(
     policy_compliance_agent = LlmAgent(
         name="policy_and_compliance_agent",
         model=model,
-        description="04 Policy & Compliance Agent: Looks up Dataplex Glossary terms (provisional-credit, Reg E, Reg Z), refuses authorizations_deprecated_v1, and runs Golden Queries 07, 08, 09.",
+        description="04 Policy & Compliance Agent: Resolves the governing regulation for each dispute from the disputes ledger and the Dataplex glossary, and runs Golden Queries 07, 08, 09.",
         instruction=(
-            "You are Agent 04 (Policy & Compliance). Resolve Regulation E (12 CFR 1005, debit card CARD00002, "
-            "DSP00033 — provisional credit due within 10 business days -> 23 Sep 2026) vs Regulation Z "
-            "(12 CFR 1026.13, credit card CARD00004, DSP00034 — NO provisional credit; withhold collection "
-            "and finance charges across 2 billing cycles / max 90 days). Always refuse authorizations_deprecated_v1 "
-            "when CatalogGovernor reports lifecycle-status.status = DEPRECATED."
+            "You are Agent 04 (Policy & Compliance). For each dispute in scope, read the "
+            "regulation the ledger records against that dispute - do not infer it from the "
+            "card, and do not carry one dispute's regulation over to another. Then call "
+            "catalog_lookup_glossary_term_tool for that regulation and state the remedy it "
+            "defines, including the case where the remedy is that none exists: 'no date "
+            "recorded' and 'no such remedy under this regulation' are different answers and "
+            "you must say which one applies. Every deadline you quote must come from a query "
+            "result, never from your own knowledge of the regulation. Before reading any "
+            "table, call catalog_governance_authorize_tool and honour the lifecycle status it "
+            "returns."
         ),
         tools=[
             FunctionTool(catalog_lookup_glossary_term_tool),
@@ -922,15 +1192,27 @@ def create_ccb_fraud_desk_orchestrator_agent(
     resolution_actions_agent = LlmAgent(
         name="resolution_and_actions_agent",
         model=model,
-        description="05 Resolution & Actions Agent: Freezes compromised cards, revokes active device wallet tokens (Golden Query 10), issues VCN, and obeys standing instruction MEM00016.",
+        description="05 Resolution & Actions Agent: Freezes compromised cards, revokes active device wallet tokens (Golden Query 10), issues VCN, and obeys the customer's standing instructions as retrieved from Memory Bank.",
         instruction=(
             "You are Agent 05 (Resolution & Actions). Check active wallet tokens via "
             "golden_10_wallet_tokens_active_on_card and event history via golden_11_dispute_event_timeline. "
-            "Respect customer standing instruction MEM00016: never close a dispute without notifying the customer first."
+            "Before any irreversible action, retrieve the customer's standing instructions and "
+            "comply with whichever apply. Call list_memory_topics_tool first and pick the topic "
+            "whose description covers commitments the bank has made to this customer, then "
+            "retrieve using that topic's wording. Quote the instruction you are complying with, "
+            "and the topic it was filed under; if the retrieval returns none, say that you found "
+            "none rather than proceeding as though you had checked."
         ),
         tools=[
             FunctionTool(golden_10_wallet_tokens_active_on_card),
             FunctionTool(golden_11_dispute_event_timeline),
+            # Without these two the instruction above is uncallable: the agent
+            # would be told to retrieve standing instructions and given no way to
+            # do it, which is exactly the kind of gap a hardcoded instruction
+            # hides. The topics tool is what lets it find the right wording
+            # instead of being told the topic name.
+            FunctionTool(list_memory_topics_tool),
+            FunctionTool(retrieve_customer_memories_tool),
         ],
     )
 
@@ -955,9 +1237,11 @@ def create_ccb_fraud_desk_orchestrator_agent(
         description="01 Orchestrator Agent: Owns the customer conversation and coordinates the 6-agent JPMC CCB Fraud & Disputes Desk.",
         instruction=(
             "You are Agent 01 (Orchestrator) of the JPMorgan Chase CCB Fraud & Disputes Desk. "
-            "Route the customer's stolen-wallet case (CUST00001 in Lisbon, debit DSP00033 under Reg E + "
-            "credit DSP00034 under Reg Z) across Identity & Context (02), Fraud Triage (03), "
-            "Policy & Compliance (04), Resolution & Actions (05), and Memory Writer (06)."
+            "Route the customer's case across Identity & Context (02), Fraud Triage (03), "
+            "Policy & Compliance (04), Resolution & Actions (05), and Memory Writer (06). "
+            "Establish the facts from the tools and the spokes. Do not assume which regulation "
+            "governs a dispute, and do not assume two disputes on the same customer are "
+            "governed the same way - that is Agent 04's finding to report, not your premise."
         ),
         tools=[
             FunctionTool(golden_01_customer_360_snapshot),
@@ -971,7 +1255,40 @@ def create_ccb_fraud_desk_orchestrator_agent(
             memory_writer_agent,
         ],
     )
+    _log_agent_tree(orchestrator, "create_ccb_fraud_desk_orchestrator_agent")
     return orchestrator
+
+
+def _log_agent_tree(root: LlmAgent, built_by: str) -> None:
+    """Writes the constructed topology to the log, once, at construction time.
+
+    This is the only place the real shape of the graph is visible without
+    reading the source: which agent owns which spoke, and exactly which tools
+    each one can reach. It matters here more than usual, because these factories
+    are not currently called by the request path -- so a reader who assumes the
+    graph is live gets no contradicting evidence anywhere else.
+    """
+    if not LOG.isEnabledFor(logging.DEBUG):
+        return
+
+    def tool_names(agent: LlmAgent) -> List[str]:
+        names = []
+        for tool in getattr(agent, "tools", []) or []:
+            func = getattr(tool, "func", None)
+            names.append(getattr(func, "__name__", None) or getattr(tool, "name", repr(tool)))
+        return names
+
+    spokes = getattr(root, "sub_agents", []) or []
+    LOG.debug("%s built hub=%s spokes=%d", built_by, root.name, len(spokes))
+    LOG.debug("  hub %s tools=%s", root.name, tool_names(root))
+    for spoke in spokes:
+        LOG.debug(
+            "  spoke %s tools=%s no_parent_transfer=%s no_peer_transfer=%s",
+            spoke.name,
+            tool_names(spoke),
+            getattr(spoke, "disallow_transfer_to_parent", None),
+            getattr(spoke, "disallow_transfer_to_peers", None),
+        )
 
 
 def _spoke_agent(name: str, model: str, description: str, instruction: str,
@@ -1117,12 +1434,15 @@ def create_consumer_credit_synthesizer_agent(
             "You are the lead synthesizer of the JPMorgan Chase CCB Fraud & Disputes Desk and "
             "the only agent that talks to the customer. Collect each channel's account from its "
             "producer spoke, read the consolidated view with read_customer_memory_bank, and "
+            "use list_memory_topics_tool to know what the bank files and to say which topic a "
+            "fact came from when it matters, and "
             "state the causal chain in order. Run execute_one_click_card_unlock only after the "
             "veracity gate has passed the claim, and repeat its result as given: it stages the "
             "unlock and writes the audit trail, it does not confirm the card platform acted. "
             "Any value a tool did not return is n/r - never fill a gap yourself."
         ),
         tools=[
+            FunctionTool(list_memory_topics_tool),
             FunctionTool(read_customer_memory_bank),
             FunctionTool(execute_one_click_card_unlock),
         ],
@@ -1136,6 +1456,7 @@ def create_consumer_credit_synthesizer_agent(
             memory_bank_audit_agent,
         ],
     )
+    _log_agent_tree(synthesizer, "create_consumer_credit_synthesizer_agent")
     return synthesizer
 
 

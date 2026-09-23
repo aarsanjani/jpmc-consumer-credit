@@ -34,6 +34,10 @@
     replayRunning: false,
     replayTimers: [],
     currentTraceKey: "policy",
+    // The operator's preset choice. Sent as preset_id so the backend does not
+    // have to guess the scenario from the question's wording.
+    scenario: "",
+    scenarios: [],
     testbedData: null,
     scorecardData: null,
     stream: null,
@@ -99,162 +103,216 @@
   // 1. 6-AGENT BLACK BAR TRACE NAVIGATION (AGENTS, buildMenu, headline, readout, pick, renderTrace, openMenu, closeMenu, setTrace)
   // =========================================================================
   /* newest first: 06 memory writer -> 01 orchestrator */
-  const AGENTS = [
-    {
-      k: "writer",
-      i: "06",
-      name: "memory writer",
-      ms: "0.9s",
-      state: "done",
-      refusals: 0,
-      tools: 1,
-      deny: 0,
-      sql: 0,
-      started: "+6.200s",
-      ended: "+7.100s",
-      pending: "Generation is asynchronous — memories appear after the run closes.",
-      spans: [
-        ["+6.200s", "tool", "memorybank.generate_memories(scope=CUST00001)", "640ms", ""],
-        ["+6.840s", "think", "session held 2 contradictions and 3 must-not-store items", "260ms", "nest"],
-        ["+7.100s", "out", "3 durable memories written · MEM00015 & MEM00017 supersede stale facts", "—", ""],
-      ],
-      foot: [
-        ["tokens", "980 in / 260 out"],
-        ["tools", "1"],
-        ["refusals", "0"],
-        ["ad-hoc sql", "0"],
-      ],
-    },
-    {
-      k: "actions",
-      i: "05",
-      name: "resolution & actions",
-      ms: "1.6s",
-      state: "done",
-      refusals: 1,
-      tools: 3,
-      deny: 1,
-      sql: 0,
-      started: "+4.600s",
-      ended: "+6.200s",
-      spans: [
-        ["+4.600s", "tool", "cards.freeze(CARD00002, CARD00004)", "180ms", ""],
-        ["+4.780s", "tool", "wallet.revoke_tokens(device=DEV00001) · 3 tokens", "210ms", "nest"],
-        ["+4.990s", "tool", "cards.issue_virtual(account=ACCT000003)", "150ms", "nest"],
-        ["+5.140s", "deny", "did not close dispute — standing instruction: notify first", "4ms", ""],
-        ["+6.200s", "out", "2 frozen · 3 revoked · VCN issued · courier rerouted to NYC home", "—", ""],
-      ],
-      foot: [
-        ["tokens", "1,420 in / 380 out"],
-        ["tools", "3"],
-        ["refusals", "1"],
-        ["ad-hoc sql", "0"],
-      ],
-    },
-    {
-      k: "compliance",
-      i: "04",
-      name: "policy & compliance",
-      ms: "1.9s",
-      state: "done",
-      refusals: 1,
-      tools: 3,
-      deny: 1,
-      sql: 0,
-      started: "+2.700s",
-      ended: "+4.600s",
-      spans: [
-        ["+2.700s", "tool", 'catalog.lookup_term("provisional credit") · owner: Disputes Policy', "142ms", ""],
-        ["+2.842s", "think", "regulation_path = REG_Z → provisional credit does not apply", "610ms", "nest"],
-        ["+3.452s", "tool", "bq.query(golden_08_filing_window) · {dispute_id: DSP00034}", "310ms", ""],
-        ["+3.762s", "deny", "refused authorizations_deprecated_v1 — lifecycle DEPRECATED", "8ms", ""],
-        ["+3.770s", "tool", 'catalog.lookup_term("Regulation Z") · 12 CFR 1026.13', "98ms", "nest"],
-        ["+4.600s", "out", "Reg E → 23 Sep (business days) · Reg Z → none, withhold payment", "—", ""],
-      ],
-      foot: [
-        ["tokens", "3,140 in / 890 out"],
-        ["tools", "3"],
-        ["refusals", "1"],
-        ["ad-hoc sql", "0"],
-      ],
-    },
-    {
-      k: "triage",
-      i: "03",
-      name: "transaction & evidence",
-      ms: "1.4s",
-      state: "done",
-      refusals: 1,
-      tools: 2,
-      deny: 1,
-      sql: 0,
-      started: "+1.300s",
-      ended: "+2.700s",
-      spans: [
-        ["+1.300s", "tool", "bq.query(golden_03_suspicious_activity) · {card_id: CARD00002}", "640ms", ""],
-        ["+1.940s", "think", "37 flagged · 5 LOST_STOLEN inside the travel window", "320ms", "nest"],
-        ["+2.260s", "tool", "bq.query(golden_05_geo_impossible) · {customer_id: CUST00001}", "410ms", ""],
-        ["+2.670s", "deny", "skipped cards.pan_full — catalog sensitivity RESTRICTED", "3ms", ""],
-        ["+2.700s", "out", "37 of 17,954 · 2 cards implicated · Lisbon 05–08 Sep", "—", ""],
-      ],
-      foot: [
-        ["tokens", "2,610 in / 740 out"],
-        ["tools", "2"],
-        ["refusals", "1"],
-        ["ad-hoc sql", "0"],
-      ],
-    },
-    {
-      k: "context",
-      i: "02",
-      name: "customer & context",
-      ms: "1.2s",
-      state: "done",
-      refusals: 1,
-      tools: 2,
-      deny: 1,
-      sql: 0,
-      started: "+0.400s",
-      ended: "+1.600s",
-      spans: [
-        ["+0.400s", "tool", "memory.retrieve_memories(scope=CUST00001, top_k=5)", "240ms", ""],
-        ["+0.640s", "think", "2 candidate travel facts, one superseded by a later session", "180ms", "nest"],
-        ["+0.820s", "deny", "discarded MEM00003 — invalidated 08 Sep by MEM00015", "4ms", ""],
-        ["+0.824s", "tool", "memory.retrieve_memories(topic=EXPLICIT_INSTRUCTIONS)", "88ms", "nest"],
-        ["+1.600s", "out", "9 sessions · 5 channels · 14 facts · 1 standing instruction", "—", ""],
-      ],
-      foot: [
-        ["tokens", "1,890 in / 420 out"],
-        ["tools", "2"],
-        ["refusals", "1"],
-        ["ad-hoc sql", "0"],
-      ],
-    },
-    {
-      k: "orchestrator",
-      i: "01",
-      name: "orchestrator",
-      ms: "0.4s",
-      state: "done",
-      refusals: 0,
-      tools: 1,
-      deny: 0,
-      sql: 0,
-      started: "+0.000s",
-      ended: "+0.400s",
-      spans: [
-        ["+0.000s", "tool", "session.open(channel=IVR, customer=CUST00001)", "60ms", ""],
-        ["+0.060s", "think", "lost-card-abroad intent · two cards on file · route to context", "300ms", "nest"],
-        ["+0.400s", "out", "plan: context → triage → compliance → actions → writer", "—", ""],
-      ],
-      foot: [
-        ["tokens", "740 in / 210 out"],
-        ["tools", "1"],
-        ["refusals", "0"],
-        ["ad-hoc sql", "0"],
-      ],
-    },
-  ];
+  
+let AGENTS = [];
+window.AGENTS = AGENTS;
+
+/* Hard refusals. Anything else non-ALLOW (e.g. ALLOW_TO_OWNER_ONLY) is a
+   conditional allow and is reported separately. */
+const REFUSAL_ACTIONS = new Set(["REFUSE", "DENY", "BLOCK", "QUARANTINE"]);
+
+/* Phase labels come from the backend as `phase.1_evidence`; show them as
+   "1 · evidence" rather than leaking the span id into the UI. */
+function phaseName(label) {
+  const m = /^phase\.(\d+)_(.+)$/.exec(label);
+  if (!m) return label;
+  return m[1] + " · " + m[2].replace(/_/g, " ");
+}
+
+/* A step is one depth-0 span: a phase of the turn. Everything below it (golden
+   query contracts, catalog checks, BigQuery calls) is nested underneath. Spans
+   are buffered on exit, so a parent lands after its children: sort by start
+   time to recover causal order. */
+function groupSpansIntoSteps(spans, t0) {
+  const steps = [];
+  let current = null;
+
+  const rel = (ms) => "+" + ((ms - t0) / 1000).toFixed(2) + "s";
+  const secs = (ms) => (ms / 1000).toFixed(1) + "s";
+
+  spans.forEach((span) => {
+    const f = span.fields || {};
+    const o = span.outcome || {};
+
+    if (span.depth === 0) {
+      current = {
+        k: span.label,
+        i: "",
+        name: phaseName(span.label),
+        ms: secs(span.elapsed_ms),
+        state: span.state === "ok" ? "done" : "error",
+        refusals: 0,
+        tools: 0,
+        deny: 0,
+        sql: 0,
+        jobs: 0,
+        conditional: 0,
+        contracts: 0,
+        started: rel(span.started_ms),
+        ended: rel(span.started_ms + span.elapsed_ms),
+        spans: [],
+        foot: [],
+      };
+      steps.push(current);
+      return;
+    }
+    if (!current) return;
+
+    const subject = f.table || f.column || f.sql || f.search || f.scope || "";
+    let kind = "tool";
+    let what = span.label + (subject ? " " + subject : "");
+
+    if (o.action) {
+      // A catalog verdict. The aspect that decided it is the whole point.
+      // ALLOW_TO_OWNER_ONLY is a conditional allow, not a refusal: counting it
+      // as one would overstate how much the catalog actually blocked.
+      if (REFUSAL_ACTIONS.has(o.action)) {
+        kind = "deny";
+        current.deny++;
+        current.refusals++;
+      } else if (o.action !== "ALLOW") {
+        current.conditional++;
+      }
+      what = subject + " → " + o.action + (o.evidence ? " · " + o.evidence : "");
+    } else if (/^golden_query\./.test(span.label)) {
+      // `agent` is the contract's authorised caller, not proof an agent ran.
+      current.contracts++;
+      what =
+        span.label + (f.tool ? " · " + f.tool : "") +
+        (f.agent ? " · authorised for " + f.agent : "") +
+        (o.rows != null ? " · " + o.rows + " rows" : "");
+    } else if (span.label === "bigquery.query") {
+      kind = "out";
+      current.jobs++;
+      // Ad-hoc means SQL that did not come from a reviewed golden contract file.
+      if (!/\.sql$/.test(String(f.sql || ""))) current.sql++;
+      what =
+        (f.sql || "query") +
+        " · " + (o.rows != null ? o.rows + " rows" : "n/r rows") +
+        (o.job_id ? " · job " + o.job_id : "");
+    } else if (span.label === "catalog.discover") {
+      what =
+        "searched " + (f.search || "") +
+        " · " + (o.entries != null ? o.entries : "n/r") + " entries" +
+        " · " + (o.tables != null ? o.tables : "n/r") + " tables" +
+        (o.siblings && o.siblings.length ? " · " + o.siblings.join(", ") : "");
+    }
+
+    // Indent by nesting depth so the call tree is legible in a flat list.
+    if (span.depth > 1) what = "\u00a0\u00a0".repeat(span.depth - 1) + "└ " + what;
+
+    if (span.state === "error") {
+      kind = "deny";
+      current.deny++;
+      what += " · " + (span.error || "failed");
+    }
+
+    current.tools++;
+    current.spans.push([rel(span.started_ms), kind, what, span.elapsed_ms.toFixed(0) + "ms", "nest"]);
+  });
+
+  steps.forEach((s, n) => {
+    s.i = n + 1 < 10 ? "0" + (n + 1) : String(n + 1);
+    s.foot = [
+      ["contracts", String(s.contracts)],
+      ["tools", String(s.tools)],
+      ["refusals", String(s.refusals)],
+      ["owner-only", String(s.conditional)],
+      ["bq jobs", String(s.jobs)],
+      ["ad-hoc sql", String(s.sql)],
+    ];
+  });
+  return steps;
+}
+
+async function fetchAndRenderTrace(runId) {
+  try {
+    const resp = await fetch("/api/trace/" + (runId || "latest"));
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const spans = (data.spans || []).slice().sort((a, b) => a.started_ms - b.started_ms);
+    if (!spans.length) return;
+
+    const t0 = spans[0].started_ms;
+    const last = spans.reduce((m, s) => Math.max(m, s.started_ms + s.elapsed_ms), t0);
+    const wall = ((last - t0) / 1000).toFixed(1) + "s";
+    const steps = groupSpansIntoSteps(spans, t0);
+    const runMeta = "Run " + (data.run_id || "n/r");
+
+    AGENTS = steps.slice().reverse(); // the bar reads newest first
+    window.AGENTS = AGENTS;
+
+    const totals = steps.reduce(
+      (acc, s) => ({ deny: acc.deny + s.deny, sql: acc.sql + s.sql, jobs: acc.jobs + s.jobs }),
+      { deny: 0, sql: 0, jobs: 0 }
+    );
+
+    setAgentCountText(steps.length + " phases");
+    setRunMetaText(runMeta + " · " + steps.length + " steps · " + wall);
+    setStampText(runMeta + " · " + wall + " · ad-hoc SQL " + totals.sql);
+    setTruthEngineText(
+      steps.length + " governed steps · " + wall + " · " + totals.jobs +
+      " BigQuery jobs · " + totals.deny + " refusals · ad-hoc SQL " + totals.sql
+    );
+    pick(0);
+    buildMenu();
+    renderRoster();
+    renderGovernanceTraps(spans);
+  } catch (err) {
+    console.error("fetchAndRenderTrace failed", err);
+  }
+}
+
+function renderRoster() {
+  const rosterList = $("agentRosterList");
+  if (!rosterList) return;
+  if (!AGENTS.length) {
+    rosterList.innerHTML = "<div class='item'><p class='rd'>n/r — no run traced yet.</p></div>";
+    return;
+  }
+  rosterList.innerHTML = AGENTS.map((a, idx) => {
+    return `<div class="item ${a.state}" style="cursor:pointer" data-step="${idx}">
+      <div class="item-top"><span class="dot"></span>
+      <span class="nm">${escapeHtml(a.name)}</span><span class="tag ok">${escapeHtml(a.ms)}</span></div>
+      <p class="rd">${a.contracts} golden &middot; ${a.deny} refused &middot; ${a.conditional} owner-only &middot; ${a.jobs} bq</p></div>`;
+  }).join("");
+  rosterList.querySelectorAll("[data-step]").forEach((el) => {
+    el.addEventListener("click", () => {
+      pick(Number(el.getAttribute("data-step")));
+      setTrace(true);
+    });
+  });
+}
+
+/* Only non-ALLOW verdicts are traps. Each one names the aspect that decided it,
+   so the panel can be checked against Dataplex rather than taken on trust. */
+function renderGovernanceTraps(spans) {
+  const box = $("govTrapsContainer");
+  if (!box) return;
+  const seen = new Set();
+  const traps = [];
+  spans.forEach((span) => {
+    const o = span.outcome || {};
+    const f = span.fields || {};
+    if (!o.action || o.action === "ALLOW") return;
+    const subject = f.table || f.column || f.sql || "unknown";
+    const key = subject + "|" + o.action;
+    if (seen.has(key)) return;
+    seen.add(key);
+    traps.push({ subject, action: o.action, evidence: o.evidence || "" });
+  });
+
+  if (!traps.length) {
+    box.innerHTML = "<div class='item'><p class='rd'>n/r — no catalog refusals in this run.</p></div>";
+    return;
+  }
+  box.innerHTML = traps.map((t) => {
+    return `<div class="item done"><div class="item-top"><span class="dot"></span>
+      <span class="nm">${escapeHtml(t.subject)}</span><span class="tag ok">${escapeHtml(t.action)}</span></div>
+      <p class="rd"><code>${escapeHtml(t.evidence)}</code></p></div>`;
+  }).join("");
+}
+
 
   let idx = 0;
 
@@ -282,7 +340,7 @@
         '    <span class="cv" aria-hidden="true">▾</span>' +
         "  </button>" +
         '  <div class="menu" id="menu" role="listbox" aria-label="Choose an agent" hidden>' +
-        '    <div class="menu-head"><span>Run 0412 · 6 agents</span><span>Newest first</span></div>' +
+        '    <div class="menu-head"><span>Trace</span><span>Newest first</span></div>' +
         '    <div id="menuList"></div>' +
         '    <div class="menu-foot"><span>Selecting changes the trace. Use <b>Trace</b> to show or hide it.</span></div>' +
         "  </div>" +
@@ -293,7 +351,7 @@
         '  <span class="bm" id="biMetrics"></span>' +
         "</p>" +
         '<button class="barbtn" id="traceBtn" type="button" aria-expanded="false" aria-controls="drop">Trace ▾</button>' +
-        '<span class="stamp" id="liveLogStamp">Run 0412 · 7.1s</span>';
+        '<span class="stamp" id="liveLogStamp">Waiting for trace...</span>';
     } else {
       const pulseEl = $("livePulse") || document.querySelector(".livebar .pulse");
       if (pulseEl && !pulseEl.id) pulseEl.id = "livePulse";
@@ -530,6 +588,75 @@
     if (eyebrow) eyebrow.textContent = text;
   }
 
+  function setTruthEngineText(text) {
+    const el = $("truthEngine");
+    if (el) el.textContent = text;
+  }
+
+  // =========================================================================
+  // 1b. SCENARIO PICKER (/api/scenarios)
+  // The list is served by the backend, derived from AVENUE_PLANS. The UI holds
+  // no copy of it: a picker that offers a preset the backend cannot run is a
+  // demo failure, so there must be exactly one source of truth.
+  // =========================================================================
+  async function loadScenarios() {
+    const sel = $("scenarioSelect");
+    if (!sel) return;
+    try {
+      const resp = await fetch("/api/scenarios");
+      const data = await resp.json();
+      const list = data.scenarios || [];
+      if (!resp.ok || !list.length) {
+        sel.innerHTML = "<option value=''>n/r — scenarios unavailable</option>";
+        return;
+      }
+      STATE.scenarios = list;
+      STATE.scenario = data.default || list[0].id;
+      sel.innerHTML = list
+        .map(
+          (s) =>
+            `<option value="${escapeHtml(s.id)}"${s.id === STATE.scenario ? " selected" : ""}>` +
+            `${escapeHtml(s.label)}</option>`
+        )
+        .join("");
+      applyScenario(STATE.scenario, { rerun: false });
+      sel.addEventListener("change", () => applyScenario(sel.value, { rerun: true }));
+    } catch (err) {
+      console.error("loadScenarios failed", err);
+      sel.innerHTML = "<option value=''>n/r — scenarios unavailable</option>";
+    }
+  }
+
+  /* Swaps the case framing to the chosen preset. The avenue list shown is the
+     plan the backend will actually execute, not a description of it. */
+  function applyScenario(scenarioId, opts) {
+    const spec = (STATE.scenarios || []).filter((s) => s.id === scenarioId)[0];
+    if (!spec) return;
+    STATE.scenario = scenarioId;
+
+    const lede = $("heroLede");
+    if (lede) lede.textContent = spec.lede;
+
+    // Retarget the preset question chips at the selected case.
+    const chips = document.querySelectorAll(".ask-preset-chip");
+    if (chips.length) {
+      chips[0].setAttribute("data-q", spec.suggested_question);
+      chips[0].textContent = spec.label;
+    }
+    const askInput = $("askInput");
+    if (askInput) askInput.placeholder = spec.suggested_question;
+
+    // Show the plan that will run, so the operator knows what to expect.
+    const planned = (spec.avenues || [])
+      .map((a) => a.probe_kind + " · " + a.probe_target)
+      .join("  |  ");
+    setRunMetaText(spec.avenues.length + " avenues planned · " + planned);
+
+    if (opts && opts.rerun) {
+      submitAskQuestion(spec.suggested_question);
+    }
+  }
+
   function openOpsDrawer() {
     const drawer = $("consoleDrawer");
     const btnOps = $("btnToggleOps");
@@ -567,159 +694,79 @@
   }
 
   // =========================================================================
-  // 2. 6-AGENT PIPELINE STEPS FOR LIVE REPLAY ANIMATION (#btnReplayRun)
+  // 2. REPLAY: RE-RUNS THE REAL PIPELINE (#btnReplayRun)
   // =========================================================================
-  const PIPELINE_STEPS = [
-    {
-      id: "agentItem1",
-      name: "Orchestrator",
-      duration: "0.4s",
-      cumTime: "0.4s",
-      desc: "Owns the conversation, routes the case",
-    },
-    {
-      id: "agentItem2",
-      name: "Customer & Context",
-      duration: "1.2s",
-      cumTime: "1.6s",
-      desc: "Memory Bank · 9 sessions, 5 channels",
-    },
-    {
-      id: "agentItem3",
-      name: "Transaction & Evidence",
-      duration: "1.4s",
-      cumTime: "3.0s",
-      desc: "Golden query 03 · 37 flagged of 17,954",
-    },
-    {
-      id: "agentItem4",
-      name: "Policy & Compliance",
-      duration: "1.9s",
-      cumTime: "4.9s",
-      desc: "Reading glossary · resolving both paths",
-    },
-    {
-      id: "agentItem5",
-      name: "Resolution & Actions",
-      duration: "1.6s",
-      cumTime: "6.5s",
-      desc: "Freeze · revoke · virtual card · courier",
-    },
-    {
-      id: "agentItem6",
-      name: "Memory Writer",
-      duration: "0.9s",
-      cumTime: "7.1s",
-      desc: "Consolidates the session after close",
-    },
-  ];
+  // The old version animated a hardcoded six-step script against DOM ids that
+  // no longer exist, so it threw on the first click and left the button stuck.
+  // This asks the backend to actually run the turn again and renders its trace.
 
   function clearReplayTimers() {
     STATE.replayTimers.forEach((t) => clearTimeout(t));
     STATE.replayTimers = [];
   }
 
-  function setAgentItemState(stepIdx, mode) {
-    const step = PIPELINE_STEPS[stepIdx];
-    if (!step) return;
-    const itemEl = $(step.id);
-    if (!itemEl) return;
-
-    itemEl.classList.remove("done", "active");
-    const tagEl = itemEl.querySelector(".tag");
-    const rdEl = itemEl.querySelector(".rd");
-    if (rdEl) rdEl.textContent = step.desc;
-
-    if (mode === "done") {
-      itemEl.classList.add("done");
-      if (tagEl) {
-        tagEl.className = "tag ok";
-        tagEl.textContent = step.duration;
-      }
-    } else if (mode === "active") {
-      itemEl.classList.add("active");
-      if (tagEl) {
-        tagEl.className = "tag on";
-        tagEl.textContent = "running";
-      }
-    } else {
-      if (tagEl) {
-        tagEl.className = "tag";
-        tagEl.textContent = "queued";
-      }
+  /* Reveals the already-completed steps one at a time. The sequencing is
+     presentation; every duration shown is the one the backend measured. */
+  function revealStepsInOrder() {
+    clearReplayTimers();
+    const total = AGENTS.length;
+    if (!total) return;
+    const stepDelayMs = 320;
+    for (let n = total - 1; n >= 0; n--) {
+      const order = total - 1 - n;
+      const timer = setTimeout(() => {
+        pick(n);
+        setAgentCountText(order + 1 + " / " + total + " done");
+      }, order * stepDelayMs);
+      STATE.replayTimers.push(timer);
     }
   }
 
-  function runReplayAnimation() {
+  async function runReplayAnimation() {
     if (STATE.replayRunning) return;
     STATE.replayRunning = true;
     clearReplayTimers();
 
     const btn = $("btnReplayRun");
     const livePulse = getLivePulseEl();
-
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Running 6 agents...";
+      btn.textContent = "Running pipeline...";
     }
-    if (livePulse) {
-      livePulse.classList.remove("done");
-    }
-    setRunMetaText("Run 0412 · 22 Sep 2026 · replaying...");
+    if (livePulse) livePulse.classList.remove("done");
+    setRunMetaText("Running the desk against live GCP...");
+    setStampText("in flight");
 
-    for (let i = 0; i < PIPELINE_STEPS.length; i++) {
-      setAgentItemState(i, "queued");
-      AGENTS[5 - i].state = "queue";
-    }
-    setAgentCountText("00 / 6 done");
-    buildMenu();
+    const question =
+      (STATE.lastQuestion && String(STATE.lastQuestion)) ||
+      "Why does the credit card have no provisional credit date?";
 
-    const stepDelayMs = 480;
-
-    PIPELINE_STEPS.forEach((step, stepIdx) => {
-      const timer = setTimeout(() => {
-        for (let r = 0; r < PIPELINE_STEPS.length; r++) {
-          if (r < stepIdx) {
-            setAgentItemState(r, "done");
-            AGENTS[5 - r].state = "done";
-          } else if (r === stepIdx) {
-            setAgentItemState(r, "active");
-            AGENTS[5 - r].state = "run";
-          } else {
-            setAgentItemState(r, "queued");
-            AGENTS[5 - r].state = "queue";
-          }
-        }
-        buildMenu();
-        pick(5 - stepIdx);
-        setAgentCountText(`0${stepIdx} / 6 done`);
-        setStampText(`Run 0412 · ${step.cumTime}`);
-      }, stepIdx * stepDelayMs);
-      STATE.replayTimers.push(timer);
-    });
-
-    const finishTimer = setTimeout(() => {
-      for (let i = 0; i < 6; i++) {
-        setAgentItemState(i, "done");
-        AGENTS[i].state = "done";
-      }
-      setAgentCountText("06 / 6 done");
-      if (livePulse) {
-        livePulse.classList.add("done");
-      }
-      buildMenu();
-      pick(0);
-      setRunMetaText("Run 0412 · 22 Sep 2026 · simulation");
-      setStampText("Run 0412 · 7.1s");
-
+    try {
+      const resp = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customer_id: DEFAULT_CUSTOMER_ID,
+          preset_id: STATE.scenario || undefined,
+          message: question,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "HTTP " + resp.status);
+      await fetchAndRenderTrace(data.run_id);
+      revealStepsInOrder();
+      if (livePulse) livePulse.classList.add("done");
+    } catch (err) {
+      console.error("replay failed", err);
+      setRunMetaText("Replay failed — " + err.message);
+      setStampText("n/r");
+    } finally {
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "Replay run →";
+        btn.textContent = "Replay run \u2192";
       }
       STATE.replayRunning = false;
-    }, PIPELINE_STEPS.length * stepDelayMs + 260);
-
-    STATE.replayTimers.push(finishTimer);
+    }
   }
 
   // =========================================================================
@@ -732,6 +779,7 @@
       const resp = await fetch(`/api/testbed?customer_id=${encodeURIComponent(cid)}`);
       const data = await resp.json();
       STATE.testbedData = data;
+      if (data.run_id) { fetchAndRenderTrace(data.run_id); }
 
       if (!resp.ok) {
         // A failed upstream call is shown, not hidden behind stale markup.
@@ -760,7 +808,8 @@
               const id = escapeHtml(m.memory_id || NOT_RECORDED);
               const fact = escapeHtml(m.fact || NOT_RECORDED);
               const when = escapeHtml(m.update_time || NOT_RECORDED);
-              return `<div style="margin-bottom:4px;"><code>${id}</code>: ${fact} <small>${when}</small></div>`;
+              const topic = escapeHtml(m.topic || NOT_RECORDED);
+              return `<div style="margin-bottom:4px;"><code>${id}</code> <span style="font-size:0.85em; background:var(--ink); color:var(--bg); padding:1px 4px; border-radius:2px; margin-right:4px;">${topic}</span>: ${fact} <small>${when}</small></div>`;
             })
             .join("") + `<div style="margin-top:6px;">${pvChip(block)}</div>`;
         }
@@ -920,6 +969,7 @@
 
     const customerId = DEFAULT_CUSTOMER_ID;
     const channel = STATE.channel || "WEB_PORTAL";
+    STATE.lastQuestion = query; // so Replay re-runs what the user actually asked
 
     const askBtn = $("btnAskSend");
     if (askBtn) {
@@ -932,14 +982,14 @@
     // this bundle. It threw a ReferenceError here, so the /api/chat fetch below
     // never ran and the console appeared to hang on every single question.
     setTrace(true);
-    setStampText("Run 0412 · WORKING");
+    setStampText("WORKING");
 
     if ($("askAnswerTitle")) {
       $("askAnswerTitle").textContent = `Working case · ${customerId}`;
     }
     if ($("askAnswerTag")) {
       $("askAnswerTag").className = "tag on";
-      $("askAnswerTag").textContent = "RUNNING 6 AGENTS";
+      $("askAnswerTag").textContent = "RUNNING";
     }
     if ($("askAnswerBody")) {
       $("askAnswerBody").innerHTML =
@@ -957,6 +1007,7 @@
         body: JSON.stringify({
           customer_id: customerId,
           channel: channel,
+          preset_id: STATE.scenario || undefined,
           message: query,
         }),
       });
@@ -1166,7 +1217,7 @@
         appendStreamLine("<b>a2ui</b> — synthesis card delivered");
         source.close();
         STATE.stream = null;
-        setStampText("Run 0412 · stream complete");
+        setStampText("stream complete");
       }
     };
 
@@ -1296,7 +1347,7 @@
         return;
       }
       updateOversightUI(data);
-      setStampText("Run 0412 · SUPERVISOR LOGGED");
+      setStampText("SUPERVISOR LOGGED");
     } catch (err) {
       console.error("Card oversight decision error:", err);
     } finally {
@@ -1410,14 +1461,7 @@
   function init() {
     ensureLiveBarDom();
 
-    // 1. Initialize default completed state across all 6 agents
-    for (let i = 0; i < 6; i++) {
-      setAgentItemState(i, "done");
-      AGENTS[i].state = "done";
-    }
-    setAgentCountText("06 / 6 done");
-    setRunMetaText("Run 0412 · 22 Sep 2026 · simulation");
-    setStampText("Run 0412 · 7.1s");
+    // 1. Trace will be fetched on load.
     const livePulse = getLivePulseEl();
     if (livePulse) {
       livePulse.classList.add("done");
@@ -1475,17 +1519,6 @@
       if (e.key === "Escape") closeMenu();
     });
 
-    // Wire #agentItem1..#agentItem6 in the Agent Roster to select that agent in .livebar and open #drop
-    for (let rosterIdx = 0; rosterIdx < 6; rosterIdx++) {
-      const itemEl = $(`agentItem${rosterIdx + 1}`);
-      if (itemEl) {
-        itemEl.style.cursor = "pointer";
-        itemEl.addEventListener("click", () => {
-          pick(5 - rosterIdx);
-          setTrace(true);
-        });
-      }
-    }
 
     // Deep-link support (#menu, #trace, #agent=...)
     const h = window.location.hash;
@@ -1569,10 +1602,20 @@
     }
 
     // Initial background data hydration for canonical CUST00001
+    // Panels that only fill on a question say so, rather than sitting blank and
+    // looking broken.
+    const streamList = $("eventStreamList");
+    if (streamList && !streamList.children.length) {
+      streamList.innerHTML =
+        "<li><span class='t'>n/r</span><span class='e'>Ask a question to stream this case</span></li>";
+    }
+    loadScenarios();
     loadDeploymentIdentity(DEFAULT_CUSTOMER_ID);
     loadEvalScorecard();
     loadLiveTestbed(DEFAULT_CUSTOMER_ID);
     loadCardOversight(DEFAULT_CUSTOMER_ID);
+    // Only operator turns belong in the Pipeline; page load also fires probes.
+    fetchAndRenderTrace('latest?kind=chat');
   }
 
   if (document.readyState === "loading") {

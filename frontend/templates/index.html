@@ -23,7 +23,7 @@
       </button>
       <div class="menu" id="menu" role="listbox" hidden>
         <div class="menu-hd">
-          <span>Run 0412 · 6 agents</span>
+          <span id="mobileMenuTitle">Waiting for trace...</span>
           <span>Newest first</span>
         </div>
         <div id="menuList"></div>
@@ -41,7 +41,7 @@
     </p>
 
     <button class="barbtn" id="traceBtn" type="button" aria-expanded="false" aria-controls="drop">Trace ▾</button>
-    <span class="stamp" id="liveLogStamp">Run 0412 · 7.1s</span>
+    <span class="stamp" id="liveLogStamp">Waiting for trace...</span>
   </div>
 </div>
 
@@ -63,14 +63,17 @@
     <a class="brand" href="#">CCB Fraud Desk</a>
     <div class="mast-right">
       <span class="tagline">Consumer &amp; Community Banking</span>
-      <span class="chip" id="customerSelect" data-value="CUST00001">CUST00001 · Lisbon</span>
+      <span class="chip" id="customerSelect" data-value="CUST00001">CUST00001</span>
+      <select class="chip chip-select" id="scenarioSelect" aria-label="Demo scenario">
+        <option value="">Loading scenarios...</option>
+      </select>
       <button type="button" class="chip" id="btnToggleOps">Operations</button>
       <button type="button" class="cta" id="btnReplayRun">Replay run →</button>
     </div>
   </header>
 
   <section class="runhead">
-    <p class="eyebrow">Run 0412 · 22 Sep 2026 · simulation · complete</p>
+    <p class="eyebrow">Waiting for trace...</p>
     <p class="sum" id="heroLede">A stolen wallet in Lisbon holds a debit card and a credit card.
       <mark>One theft, two disputes</mark>, two different correct answers.
       Everything below is <mark>one run</mark> of the desk working that case.</p>
@@ -81,39 +84,15 @@
           <span id="truthReported">Reported 09 Sep 08:14 WEST</span>
           <span id="truthPaths"><mark>2 disputes · Reg E + Reg Z</mark></span>
         </div>
-        <p class="ts-sub" id="truthEngine">Simulation on synthetic data · 6 agents · 7.1s · ad-hoc SQL 0</p>
+        <p class="ts-sub" id="truthEngine">Waiting for trace...</p>
       </div>
   </section>
 
   <!-- ============ DECK 1 ============ -->
   <div class="deck" id="deckPrimary1">
     <div class="col">
-      <div class="colhead"><h2>Agents</h2><span class="n" id="agentCountPill"><span id="agentsColIndex">06 / 6 done</span></span></div>
-      <div class="roster" id="agentRosterList">
-        <div class="item done" id="agentItem1" data-step="01" data-agent="orchestrator"><div class="item-top"><span class="dot"></span>
-          <span class="nm">Orchestrator</span><span class="tag ok" id="agentTag1">0.4s</span></div>
-          <p class="rd">Owns the conversation, routes the case</p></div>
-
-        <div class="item done" id="agentItem2" data-step="02" data-agent="context"><div class="item-top"><span class="dot"></span>
-          <span class="nm">Identity &amp; Context</span><span class="tag ok" id="agentTag2">1.2s</span></div>
-          <p class="rd">Memory Bank · 9 sessions, 5 channels</p></div>
-
-        <div class="item done" id="agentItem3" data-step="03" data-agent="triage"><div class="item-top"><span class="dot"></span>
-          <span class="nm">Fraud Triage</span><span class="tag ok" id="agentTag3">2.8s</span></div>
-          <p class="rd">Golden query 03 · 37 flagged of 17,954</p></div>
-
-        <div class="item done" id="agentItem4" data-step="04" data-agent="compliance"><div class="item-top"><span class="dot"></span>
-          <span class="nm">Policy &amp; Compliance</span><span class="tag ok" id="agentTag4">1.9s</span></div>
-          <p class="rd">Reading glossary · resolving both paths</p></div>
-
-        <div class="item done" id="agentItem5" data-step="05" data-agent="actions"><div class="item-top"><span class="dot"></span>
-          <span class="nm">Resolution &amp; Actions</span><span class="tag ok" id="agentTag5">1.6s</span></div>
-          <p class="rd">Freeze · revoke · virtual card · courier</p></div>
-
-        <div class="item done" id="agentItem6" data-step="06" data-agent="writer"><div class="item-top"><span class="dot"></span>
-          <span class="nm">Memory Writer</span><span class="tag ok" id="agentTag6">0.9s</span></div>
-          <p class="rd">Consolidates the session after close</p></div>
-      </div>
+      <div class="colhead"><h2>Pipeline</h2><span class="n" id="agentCountPill"><span id="agentsColIndex"></span></span></div>
+      <div class="roster" id="agentRosterList"></div>
     </div>
 
     <div class="col">
@@ -191,36 +170,12 @@
 
     <div class="col">
       <div class="colhead"><h2>Event stream</h2><span class="n">04 / this case</span></div>
-      <ul class="tl" id="eventStreamList">
-        <li><span class="t">05 Sep 09:01</span><span class="e">First fraudulent tap · Lisbon</span></li>
-        <li><span class="t">08 Sep 21:15</span><span class="e">Customer reports theft · IVR</span></li>
-        <li class="key"><span class="t">09 Sep 09:02</span><span class="e">Card frozen · both cards</span></li>
-        <li><span class="t">09 Sep 09:02</span><span class="e">3 wallet tokens revoked</span></li>
-        <li><span class="t">09 Sep 09:04</span><span class="e">Virtual card issued</span></li>
-        <li class="key"><span class="t">09 Sep 09:06</span><span class="e">Two disputes opened · Reg E + Reg Z</span></li>
-        <li><span class="t">09 Sep 11:40</span><span class="e">Replacement dispatched · hotel</span></li>
-        <li class="key"><span class="t">10 Sep 07:20</span><span class="e">Returns home early — travel notice superseded</span></li>
-        <li><span class="t">23 Sep</span><span class="e">Provisional credit due · debit only</span></li>
-      </ul>
+      <ul class="tl" id="eventStreamList"></ul>
     </div>
 
     <div class="col">
-      <div class="colhead"><h2>Governance</h2><span class="n">05 / traps held</span></div>
-      <div class="item done" id="govTrap1"><div class="item-top"><span class="dot"></span>
-        <span class="nm">Deprecated table</span><span class="tag ok">refused</span></div>
-        <p class="rd"><code>authorizations_deprecated_v1</code></p></div>
-      <div class="item done" id="govTrap2"><div class="item-top"><span class="dot"></span>
-        <span class="nm">Restricted columns</span><span class="tag ok">withheld</span></div>
-        <p class="rd"><code>ssn_last4</code> · <code>pan_full</code></p></div>
-      <div class="item done" id="govTrap3"><div class="item-top"><span class="dot"></span>
-        <span class="nm">Outside filing window</span><span class="tag ok">declined 3</span></div>
-        <p class="rd">Said no, and said why</p></div>
-      <div class="item done" id="govTrap4"><div class="item-top"><span class="dot"></span>
-        <span class="nm">Reg Z provisional credit</span><span class="tag ok">refused 2</span></div>
-        <p class="rd">The rule has no such remedy</p></div>
-      <div class="item done" id="govTrap5"><div class="item-top"><span class="dot"></span>
-        <span class="nm">Her flight</span><span class="tag ok">not flagged</span></div>
-        <p class="rd">A plane is not an impossible journey</p></div>
+      <div class="colhead"><h2>Governance</h2><span class="n">05 / catalog decisions</span></div>
+      <div id="govTrapsContainer"></div>
     </div>
   </div>
 
@@ -237,15 +192,8 @@
           <span class="nm" id="askAnswerTitle">Governed desk response</span>
           <span class="tag ok" id="askAnswerTag">CATALOG + MEMORY</span>
         </div>
-        <div class="rd" id="askAnswerBody" style="color:var(--ink);font-size:11px;line-height:1.55;margin-top:6px;">
-          Under <strong>12 CFR 1026.13 (Regulation Z)</strong>, open-end credit cards have no provisional credit deadline. Instead, the cardholder may withhold payment on the disputed €1,480.00 (<code>DSP00034 · CARD00002</code>) while the bank resolves the billing error within 2 billing cycles (max 90 days). Provisional credit by <strong>23 Sep</strong> applies strictly to the checking debit card (<code>DSP00033 · CARD00004</code>) under <strong>12 CFR 1005.11 (Regulation E)</strong>.
-        </div>
-        <div id="askToolTags" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;">
-          <span class="tag ok">freeze_card</span>
-          <span class="tag ok">revoke_wallet_token</span>
-          <span class="tag ok">issue_virtual_card</span>
-          <span class="tag on">order_replacement_card</span>
-        </div>
+        <div class="rd" id="askAnswerBody" style="color:var(--ink);font-size:11px;line-height:1.55;margin-top:6px;">n/r</div>
+        <div id="askToolTags" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;">n/r</div>
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
         <button type="button" class="chip ask-preset-chip" data-q="Why does the credit card have no provisional credit date?">Reg Z vs Reg E</button>
@@ -264,10 +212,7 @@
           <span class="nm">Pre-write claim audit</span>
           <span class="tag ok" id="veracityStatusTag">VERIFIED_TRUE · 98%</span>
         </div>
-        <div class="rd" id="veracityAuditOutput" style="margin-top:6px;line-height:1.5;">
-          <div><b>1. Travel &amp; Flight Telemetry:</b> <code>TRV00001</code> Lisbon registered; <code>MEM00015</code> confirmed early return to JFK on 10 Sep 2026.</div>
-          <div style="margin-top:4px;"><b>2. Dual-Card Ledger:</b> <code>DSP00033</code> (Debit Reg E) &amp; <code>DSP00034</code> (Credit Reg Z) corroborated in BigQuery.</div>
-        </div>
+        <div class="rd" id="veracityAuditOutput" style="margin-top:6px;line-height:1.5;">n/r</div>
       </div>
 
       <div class="item" id="oversightCardBox">

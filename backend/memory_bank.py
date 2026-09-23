@@ -156,6 +156,10 @@ class MemoryBankClient:
         self.verbose = verbose
         self._token = access_token
         self.calls: List[str] = []   # every request made, for the demo narrative
+        # The engine resource holds the topic vocabulary. It is deployment
+        # configuration rather than per-request data, so it is fetched once and
+        # kept; `memory_topics(refresh=True)` re-reads it.
+        self._engine: Optional[Dict[str, Any]] = None
 
     # -- plumbing ----------------------------------------------------------
 
@@ -376,6 +380,88 @@ class MemoryBankClient:
     def list_memories(self) -> List[Dict[str, Any]]:
         return self._request("GET", self.base_url + "/memories").get("memories", [])
 
+    # -- topic vocabulary --------------------------------------------------
+
+    def get_engine(self, refresh: bool = False) -> Dict[str, Any]:
+        """The Agent Engine resource itself, which carries the Memory Bank config.
+
+        `GET reasoningEngines/{id}`. This is the same resource the console shows;
+        `contextSpec.memoryBankConfig` is the part that governs how memories are
+        extracted and which topics they can be filed under.
+        """
+        if self._engine is None or refresh:
+            self._engine = self._request("GET", self.base_url)
+        return self._engine
+
+    def memory_topics(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        """The topic vocabulary this Memory Bank was configured with.
+
+        Read from the live engine, never restated here. That matters: the topics
+        are what the extraction model files each fact under, so a copy kept in
+        code would be a second source of truth that silently goes stale the
+        moment someone edits the engine. Add a topic in the console and it turns
+        up on the next process start with no edit to this file.
+
+        Two kinds come back, normalised to the same shape:
+          * CUSTOM  - defined for this deployment, with the description that was
+                      written for it. That description is the useful part: it is
+                      the instruction the extraction model was given, so it tells
+                      a reader exactly what will and will not land in the topic.
+          * MANAGED - a topic Google defines; identified by an enum, and there is
+                      no per-deployment description to report.
+
+        Returns an empty list when the engine has no topic configuration, which
+        means extraction is unconstrained - a real and reportable state, not an
+        error.
+        """
+        engine = self.get_engine(refresh=refresh)
+        config = (
+            engine.get("contextSpec", {})
+            .get("memoryBankConfig", {})
+            .get("customizationConfigs", [])
+        )
+
+        topics: List[Dict[str, Any]] = []
+        seen: set = set()
+        for customization in config:
+            for entry in customization.get("memoryTopics", []) or []:
+                if "customMemoryTopic" in entry:
+                    spec = entry["customMemoryTopic"]
+                    label = spec.get("label", NOT_RECORDED)
+                    record = {
+                        "label": label,
+                        "kind": "CUSTOM",
+                        "description": spec.get("description", NOT_RECORDED),
+                    }
+                elif "managedMemoryTopic" in entry:
+                    spec = entry["managedMemoryTopic"]
+                    label = spec.get("managedTopicEnum", NOT_RECORDED)
+                    record = {
+                        "label": label,
+                        "kind": "MANAGED",
+                        # Managed topics are defined by Google, so there is no
+                        # deployment-specific description to quote. Saying so is
+                        # better than inventing one.
+                        "description": NOT_RECORDED,
+                    }
+                else:
+                    # An unrecognised topic kind is reported rather than dropped:
+                    # a silently skipped topic looks identical to one that was
+                    # never configured.
+                    record = {
+                        "label": NOT_RECORDED,
+                        "kind": "UNRECOGNISED",
+                        "description": "unrecognised topic entry: %s" % sorted(entry),
+                    }
+                    label = None
+
+                if label is not None:
+                    if label in seen:
+                        continue
+                    seen.add(label)
+                topics.append(record)
+        return topics
+
     def create_memory(self, fact: str, scope: Dict[str, str]) -> Dict[str, Any]:
         """Writes one already-extracted fact directly, bypassing generation.
 
@@ -418,6 +504,34 @@ class MemoryBankClient:
 # ---------------------------------------------------------------------------
 
 
+def topic_labels(memory: Dict[str, Any]) -> List[str]:
+    """The topic labels on one memory, flattened to plain strings.
+
+    The API reports a topic on a *memory* differently from how it is declared on
+    the *engine*: here it arrives as `{"customMemoryTopicLabel": "TRAVEL_STATUS"}`
+    or `{"managedMemoryTopicEnum": "..."}`, not as the nested object used in the
+    engine config. Both shapes are handled, and an unrecognised one is rendered
+    rather than dropped so it cannot hide.
+    """
+    raw = memory.get("topics")
+    if not isinstance(raw, list):
+        return []
+    labels: List[str] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            labels.append(entry)
+        elif isinstance(entry, dict):
+            labels.append(
+                entry.get("customMemoryTopicLabel")
+                or entry.get("managedMemoryTopicEnum")
+                or entry.get("label")
+                or str(entry)
+            )
+        else:
+            labels.append(str(entry))
+    return labels
+
+
 def memory_line(item: Dict[str, Any]) -> str:
     """One retrieved memory as a printable line.
 
@@ -428,9 +542,10 @@ def memory_line(item: Dict[str, Any]) -> str:
     fact = field(memory, "fact")
     updated = field(memory, "updateTime")
     distance = field(item, "distance")
-    topics = field(memory, "topics")
-    if isinstance(topics, list):
-        topics = ", ".join(str(t) for t in topics)
+    # Was str()-ing the raw dicts, which printed
+    # {'customMemoryTopicLabel': 'TRAVEL_STATUS'} where the label alone was meant.
+    labels = topic_labels(memory)
+    topics = ", ".join(labels) if labels else NOT_RECORDED
     return "  - %s\n      updated %s | distance %s | topics %s" % (
         fact, updated, distance, topics,
     )

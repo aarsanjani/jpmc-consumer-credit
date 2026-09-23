@@ -698,6 +698,25 @@ code {
   cursor: pointer;
 }
 
+/* A <select> carries its own platform chrome, which would break the mono
+   typography of the masthead. Reset it and supply our own caret. */
+.chip-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 26px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink) 50%),
+    linear-gradient(135deg, var(--ink) 50%, transparent 50%);
+  background-position: calc(100% - 14px) calc(50% + 1px), calc(100% - 9px) calc(50% + 1px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  max-width: 260px;
+}
+
+.chip-select:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
 .chip:hover,
 .chip.active {
   background: var(--lime);

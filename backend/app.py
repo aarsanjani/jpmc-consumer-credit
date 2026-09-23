@@ -49,6 +49,7 @@ from backend.provenance import (
     unmeasured,
 )
 from backend.memory_bank import (
+    topic_labels,
     LISBON_THEFT_TURNS,
     MemoryBankClient,
     MemoryBankError,
@@ -121,6 +122,11 @@ template_dir = str(Path(__file__).resolve().parent.parent / "frontend" / "templa
 static_dir = str(Path(__file__).resolve().parent.parent / "frontend" / "static")
 
 app = Flask(__name__, template_folder=template_dir, static_folder=static_dir)
+import backend.obs as obs
+
+LOG = obs.get_logger(__name__)
+obs.configure()
+obs.enable_tracing()
 CORS(app)
 
 
@@ -254,8 +260,9 @@ def memory_record(item: Dict[str, Any]) -> Dict[str, Any]:
         "memory_id": name.split("/")[-1] if name != NOT_RECORDED else NOT_RECORDED,
         "name": name,
         "fact": mb_field(body, "fact"),
-        "update_time": mb_field(body, "updateTime"),
+                "update_time": mb_field(body, "updateTime"),
         "distance": item.get("distance", NOT_RECORDED),
+        "topic": ", ".join(topic_labels(body)) if topic_labels(body) else NOT_RECORDED,
         "topics": body.get("topics", []),
         "scope": body.get("scope", {}),
     }
@@ -313,95 +320,108 @@ def get_all_agents():
 @app.route("/api/session", methods=["GET"])
 def get_session():
     """Session context. Engine reachability is probed, not asserted."""
-    customer_id = arg_customer()
-    try:
-        sessions = memory_client().list_sessions()
-        memory_bank_status = live("ONLINE", "aiplatform.reasoningEngines.sessions.list")
-        session_count = live(len(sessions), "aiplatform.reasoningEngines.sessions.list")
-    except MemoryBankError as exc:
-        memory_bank_status = live("UNREACHABLE: %s" % exc, "aiplatform.reasoningEngines.sessions.list")
-        session_count = unmeasured("aiplatform.reasoningEngines.sessions.list")
+    # Wrapped so the catalog probe below is attributable, and so the run_id
+    # reported in the response is a real one rather than an undefined name.
+    with obs.run_context(kind="probe") as run_id:
+        customer_id = arg_customer()
+        try:
+            sessions = memory_client().list_sessions()
+            memory_bank_status = live("ONLINE", "aiplatform.reasoningEngines.sessions.list")
+            session_count = live(len(sessions), "aiplatform.reasoningEngines.sessions.list")
+        except MemoryBankError as exc:
+            memory_bank_status = live("UNREACHABLE: %s" % exc, "aiplatform.reasoningEngines.sessions.list")
+            session_count = unmeasured("aiplatform.reasoningEngines.sessions.list")
 
-    try:
-        verdict = catalog_governor().check_table("disputes", dataset=BIGQUERY_DATASET)
-        catalog_status = live(
-            "ONLINE" if verdict.allowed else "ONLINE (refused: %s)" % verdict.reason,
-            "dataplex.entries.lookupEntry",
+        try:
+            verdict = catalog_governor().check_table("disputes", dataset=BIGQUERY_DATASET)
+            catalog_status = live(
+                "ONLINE" if verdict.allowed else "ONLINE (refused: %s)" % verdict.reason,
+                "dataplex.entries.lookupEntry",
+            )
+        except CatalogError as exc:
+            catalog_status = live("UNREACHABLE: %s" % exc, "dataplex.entries.lookupEntry")
+
+        return jsonify(
+            {
+                "run_id": run_id,
+                "customer_id": computed(customer_id, "request.args.customer_id"),
+                "project_id": identity(PROJECT_ID, "env:GOOGLE_CLOUD_PROJECT", "deployment parameter"),
+                "agent_engine_id": identity(
+                    AGENT_ENGINE_ID, "env:VERTEX_AGENT_ENGINE_ID", "deployment parameter"
+                ),
+                "dataset": identity(BIGQUERY_DATASET, "env:BIGQUERY_DATASET", "deployment parameter"),
+                "glossary": identity(DATAPLEX_GLOSSARY, "env:DATAPLEX_GLOSSARY", "deployment parameter"),
+                "memory_bank_status": memory_bank_status,
+                "open_session_count": session_count,
+                "knowledge_catalog_status": catalog_status,
+                # Never invented here: the desk reads these from BigQuery per request.
+                "customer_name": unmeasured("golden_01_customer_360_snapshot"),
+                "card_product": unmeasured("golden_01_customer_360_snapshot"),
+                "account_status": unmeasured("golden_01_customer_360_snapshot"),
+            }
         )
-    except CatalogError as exc:
-        catalog_status = live("UNREACHABLE: %s" % exc, "dataplex.entries.lookupEntry")
-
-    return jsonify(
-        {
-            "customer_id": computed(customer_id, "request.args.customer_id"),
-            "project_id": identity(PROJECT_ID, "env:GOOGLE_CLOUD_PROJECT", "deployment parameter"),
-            "agent_engine_id": identity(
-                AGENT_ENGINE_ID, "env:VERTEX_AGENT_ENGINE_ID", "deployment parameter"
-            ),
-            "dataset": identity(BIGQUERY_DATASET, "env:BIGQUERY_DATASET", "deployment parameter"),
-            "glossary": identity(DATAPLEX_GLOSSARY, "env:DATAPLEX_GLOSSARY", "deployment parameter"),
-            "memory_bank_status": memory_bank_status,
-            "open_session_count": session_count,
-            "knowledge_catalog_status": catalog_status,
-            # Never invented here: the desk reads these from BigQuery per request.
-            "customer_name": unmeasured("golden_01_customer_360_snapshot"),
-            "card_product": unmeasured("golden_01_customer_360_snapshot"),
-            "account_status": unmeasured("golden_01_customer_360_snapshot"),
-        }
-    )
 
 
 @app.route("/api/testbed", methods=["GET"])
 def get_live_testbed_status():
     """Everything the desk can prove about one customer, from three services."""
-    customer_id = arg_customer()
+    # The whole body must sit inside the run context: spans emitted outside it
+    # carry no run id and the trace buffer discards them.
+    with obs.run_context(kind="probe") as run_id:
+        customer_id = arg_customer()
 
-    try:
-        memories = memory_client().retrieve(
-            scope_for(customer_id),
-            query=request.args.get("query", "travel notice, disputes, card status"),
-            top_k=int(request.args.get("top_k", 10)),
-        )
-        memory_block = live([memory_record(m) for m in memories], "reasoningEngines.memories:retrieve")
-    except MemoryBankError as exc:
-        return _upstream_error(exc, "reasoningEngines.memories:retrieve")
+        try:
+            memories = memory_client().retrieve(
+                scope_for(customer_id),
+                query=request.args.get("query", "travel notice, disputes, card status"),
+                top_k=int(request.args.get("top_k", 10)),
+            )
+            memory_block = live([memory_record(m) for m in memories], "reasoningEngines.memories:retrieve")
+        except MemoryBankError as exc:
+            return _upstream_error(exc, "reasoningEngines.memories:retrieve")
 
-    customer_360 = golden("golden_01_customer_360_snapshot", customer_id=customer_id)
-    disputes = golden("golden_07_open_disputes_for_customer", customer_id=customer_id)
+        customer_360 = golden("golden_01_customer_360_snapshot", customer_id=customer_id)
+        disputes = golden("golden_07_open_disputes_for_customer", customer_id=customer_id)
 
-    governance: Dict[str, Any]
-    try:
-        gov = catalog_governor()
-        governance = live(
+        governance: Dict[str, Any]
+        try:
+            gov = catalog_governor()
+            governance = live(
+                {
+                    "disputes": gov.check_table("disputes", dataset=BIGQUERY_DATASET).to_dict(),
+                    "authorizations": gov.check_table("authorizations", dataset=BIGQUERY_DATASET).to_dict(),
+                    "authorizations_deprecated_v1": gov.check_table(
+                        "authorizations_deprecated_v1", dataset=BIGQUERY_DATASET
+                    ).to_dict(),
+                },
+                "dataplex.entries.lookupEntry",
+            )
+        except CatalogError as exc:
+            return _upstream_error(exc, "dataplex.entries.lookupEntry")
+
+        try:
+            topics = memory_client().memory_topics()
+        except Exception as exc:
+            topics = {"error": str(exc)}
+
+        return jsonify(
             {
-                "disputes": gov.check_table("disputes", dataset=BIGQUERY_DATASET).to_dict(),
-                "authorizations": gov.check_table("authorizations", dataset=BIGQUERY_DATASET).to_dict(),
-                "authorizations_deprecated_v1": gov.check_table(
-                    "authorizations_deprecated_v1", dataset=BIGQUERY_DATASET
-                ).to_dict(),
-            },
-            "dataplex.entries.lookupEntry",
+                "status": "LIVE_ON_GCP",
+                "customer_id": computed(customer_id, "request.args.customer_id"),
+                "project_id": identity(PROJECT_ID, "env:GOOGLE_CLOUD_PROJECT", "deployment parameter"),
+                "agent_engine_id": identity(
+                    AGENT_ENGINE_ID, "env:VERTEX_AGENT_ENGINE_ID", "deployment parameter"
+                ),
+                "vertex_memory_bank_live_memories": memory_block,
+                "vertex_memory_bank_memory_topics": live(topics, "reasoningEngines.memories.topics"),
+                "customer_360": golden_value(customer_360, "golden_01_customer_360_snapshot"),
+                "disputes": golden_value(disputes, "golden_07_open_disputes_for_customer"),
+                # No golden query exposes travel_notices, so this stays unmeasured
+                # rather than borrowing a number from somewhere it does not live.
+                "travel_notices": unmeasured("no golden query contract covers travel_notices"),
+                "dataplex_catalog_governance": governance,
+            }
         )
-    except CatalogError as exc:
-        return _upstream_error(exc, "dataplex.entries.lookupEntry")
-
-    return jsonify(
-        {
-            "status": "LIVE_ON_GCP",
-            "customer_id": computed(customer_id, "request.args.customer_id"),
-            "project_id": identity(PROJECT_ID, "env:GOOGLE_CLOUD_PROJECT", "deployment parameter"),
-            "agent_engine_id": identity(
-                AGENT_ENGINE_ID, "env:VERTEX_AGENT_ENGINE_ID", "deployment parameter"
-            ),
-            "vertex_memory_bank_live_memories": memory_block,
-            "customer_360": golden_value(customer_360, "golden_01_customer_360_snapshot"),
-            "disputes": golden_value(disputes, "golden_07_open_disputes_for_customer"),
-            # No golden query exposes travel_notices, so this stays unmeasured
-            # rather than borrowing a number from somewhere it does not live.
-            "travel_notices": unmeasured("no golden query contract covers travel_notices"),
-            "dataplex_catalog_governance": governance,
-        }
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -758,14 +778,19 @@ def _run_avenue(spec: Dict[str, Any], customer_id: str) -> Dict[str, Any]:
     }
 
     if kind == "memory":
-        try:
-            hits = memory_client().retrieve(scope_for(customer_id), query=target, top_k=5)
-        except MemoryBankError as exc:
-            avenue["evidence"] = unmeasured("reasoningEngines.memories:retrieve (%s)" % exc)
-            avenue["row_count"] = unmeasured("reasoningEngines.memories:retrieve")
-            avenue["finding_summary"] = unmeasured("reasoningEngines.memories:retrieve")
-            return avenue
-        records = [memory_record(h) for h in hits]
+        # This probe used to call the client directly, so its wall time showed
+        # up in the phase total with no child span to account for it.
+        with obs.turn("memory.retrieve", LOG, query=target, scope=customer_id) as span:
+            try:
+                hits = memory_client().retrieve(scope_for(customer_id), query=target, top_k=5)
+            except MemoryBankError as exc:
+                span.detail(error=str(exc))
+                avenue["evidence"] = unmeasured("reasoningEngines.memories:retrieve (%s)" % exc)
+                avenue["row_count"] = unmeasured("reasoningEngines.memories:retrieve")
+                avenue["finding_summary"] = unmeasured("reasoningEngines.memories:retrieve")
+                return avenue
+            records = [memory_record(h) for h in hits]
+            span.detail(memories=len(records))
         avenue["evidence"] = live(records, "reasoningEngines.memories:retrieve")
         avenue["row_count"] = computed(len(records), "reasoningEngines.memories:retrieve")
         avenue["finding_summary"] = computed(
@@ -811,6 +836,67 @@ def _run_avenue(spec: Dict[str, Any], customer_id: str) -> Dict[str, Any]:
     return avenue
 
 
+# Human-readable framing for each preset. Kept beside the plans rather than in
+# the template so the picker cannot drift from what the backend will actually
+# run: anything added to AVENUE_PLANS shows up in the UI on the next reload.
+SCENARIO_LABELS: Dict[str, Dict[str, str]] = {
+    "lisbon": {
+        "label": "Lisbon · wallet theft",
+        "lede": "A stolen wallet in Lisbon holds a debit card and a credit card. "
+                "One theft, two disputes, two different correct answers.",
+        "question": "Why does the credit card have no provisional credit date?",
+    },
+    "contradiction": {
+        "label": "Early return · superseded travel",
+        "lede": "A newer memory says she flew home on 10 Sep, while the travel notice "
+                "is still marked active. The desk has to notice the contradiction.",
+        "question": "She came back early on 10 Sep. Where is her replacement courier going?",
+    },
+    "london": {
+        "label": "London · decline on notice",
+        "lede": "A decline against a registered travel notice is a different case "
+                "from a decline without one.",
+        "question": "Her card was declined in London even though she filed a travel notice. Why?",
+    },
+    "chicago": {
+        "label": "Chicago · step-up reply",
+        "lede": "A YES to a step-up SMS is only as good as the device that sent it.",
+        "question": "She replied YES to the step-up SMS. Was that really her?",
+    },
+}
+
+
+@app.route("/api/scenarios", methods=["GET"])
+def list_scenarios():
+    """The presets the operator may pick, derived from the plans themselves.
+
+    The UI must not carry its own copy of this list. A picker offering a
+    scenario the backend cannot run is a demo failure in front of an audience.
+    """
+    scenarios = []
+    for scenario_id, plan in AVENUE_PLANS.items():
+        meta = SCENARIO_LABELS.get(scenario_id, {})
+        scenarios.append(
+            {
+                "id": scenario_id,
+                "label": meta.get("label", scenario_id),
+                "lede": meta.get("lede", NOT_RECORDED),
+                "suggested_question": meta.get("question", NOT_RECORDED),
+                "avenues": [
+                    {
+                        "avenue_id": spec["avenue_id"],
+                        "title": spec["avenue_title"],
+                        "probe_kind": spec["probe"][0],
+                        "probe_target": spec["probe"][1],
+                    }
+                    for spec in plan
+                ],
+                "glossary_terms": GLOSSARY_TERMS_BY_SCENARIO.get(scenario_id, []),
+            }
+        )
+    return jsonify({"status": "SUCCESS", "default": "lisbon", "scenarios": scenarios})
+
+
 def _containment_trajectory() -> List[Dict[str, Any]]:
     """The mandated tool order. Nothing executed it here, so status and latency
     stay "n/r" instead of borrowing a plausible-looking number."""
@@ -839,58 +925,77 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
     ).strip()
     scenario = _scenario_of(body, claim_text)
 
-    avenues = [_run_avenue(spec, customer_id) for spec in AVENUE_PLANS[scenario]]
+    # Each phase is traced so the UI can show the real shape of a turn rather
+    # than a flat list of whichever contracts happened to fire. Note that phase
+    # 1 and phase 3 both execute golden contracts: the evidence pass gathers
+    # them, and the validator independently re-runs what it needs rather than
+    # trusting a result handed to it. That is why the same query id appears
+    # twice in one turn.
+    with obs.turn("phase.1_evidence", LOG, scenario=scenario,
+                  avenues=len(AVENUE_PLANS[scenario])) as _t:
+        avenues = [_run_avenue(spec, customer_id) for spec in AVENUE_PLANS[scenario]]
+        _t.detail(avenues_run=len(avenues))
 
     glossary: List[Dict[str, Any]] = []
-    for term_id in GLOSSARY_TERMS_BY_SCENARIO.get(scenario, []):
-        try:
-            glossary.append(live(catalog_governor().lookup_term(term_id), "dataplex.glossaryTerms.get"))
-        except CatalogError as exc:
-            glossary.append(unmeasured("dataplex.glossaryTerms.get:%s (%s)" % (term_id, exc)))
+    with obs.turn("phase.2_glossary", LOG,
+                  terms=len(GLOSSARY_TERMS_BY_SCENARIO.get(scenario, []))) as _t:
+        for term_id in GLOSSARY_TERMS_BY_SCENARIO.get(scenario, []):
+            try:
+                glossary.append(live(catalog_governor().lookup_term(term_id), "dataplex.glossaryTerms.get"))
+            except CatalogError as exc:
+                glossary.append(unmeasured("dataplex.glossaryTerms.get:%s (%s)" % (term_id, exc)))
+        _t.detail(resolved=sum(1 for g in glossary if isinstance(g, dict) and g.get("value")))
 
-    if _veracity is None:
-        verdict = {
-            "veracity_status": unmeasured("backend.veracity_and_audit"),
-            "confidence_score": unmeasured("backend.veracity_and_audit"),
-            "discrepancy_details": unmeasured("backend.veracity_and_audit"),
-            "error": _DEGRADED.get("backend.veracity_and_audit", NOT_RECORDED),
-        }
-    else:
-        try:
-            evaluation = _veracity.ClaimVeracityValidatorAgent().validate_claim_against_telemetry(
-                customer_id=customer_id,
-                claim_text=claim_text,
-                channel=as_channel(channel_str),
-            )
-            dumped = evaluation.model_dump(mode="json")
+    with obs.turn("phase.3_veracity", LOG, validator="ClaimVeracityValidatorAgent") as _t:
+        if _veracity is None:
             verdict = {
-                "veracity_status": live(dumped.get("veracity_status"), "ClaimVeracityValidatorAgent"),
-                "confidence_score": live(dumped.get("confidence_score"), "ClaimVeracityValidatorAgent"),
-                "discrepancy_details": live(
-                    dumped.get("discrepancy_details", NOT_RECORDED), "ClaimVeracityValidatorAgent"
-                ),
-                "raw": dumped,
+                "veracity_status": unmeasured("backend.veracity_and_audit"),
+                "confidence_score": unmeasured("backend.veracity_and_audit"),
+                "discrepancy_details": unmeasured("backend.veracity_and_audit"),
+                "error": _DEGRADED.get("backend.veracity_and_audit", NOT_RECORDED),
             }
-        except Exception as exc:  # noqa: BLE001 - the verdict must not be guessed
-            logging.error("Veracity validation failed: %s", exc)
-            verdict = {
-                "veracity_status": unmeasured("ClaimVeracityValidatorAgent"),
-                "confidence_score": unmeasured("ClaimVeracityValidatorAgent"),
-                "discrepancy_details": unmeasured("ClaimVeracityValidatorAgent"),
-                "error": "%s: %s" % (type(exc).__name__, exc),
-            }
+            _t.detail(status="module_unavailable")
+        else:
+            try:
+                evaluation = _veracity.ClaimVeracityValidatorAgent().validate_claim_against_telemetry(
+                    customer_id=customer_id,
+                    claim_text=claim_text,
+                    channel=as_channel(channel_str),
+                )
+                dumped = evaluation.model_dump(mode="json")
+                verdict = {
+                    "veracity_status": live(dumped.get("veracity_status"), "ClaimVeracityValidatorAgent"),
+                    "confidence_score": live(dumped.get("confidence_score"), "ClaimVeracityValidatorAgent"),
+                    "discrepancy_details": live(
+                        dumped.get("discrepancy_details", NOT_RECORDED), "ClaimVeracityValidatorAgent"
+                    ),
+                    "raw": dumped,
+                }
+                _t.detail(status=dumped.get("veracity_status"), confidence=dumped.get("confidence_score"))
+            except Exception as exc:  # noqa: BLE001 - the verdict must not be guessed
+                logging.error("Veracity validation failed: %s", exc)
+                verdict = {
+                    "veracity_status": unmeasured("ClaimVeracityValidatorAgent"),
+                    "confidence_score": unmeasured("ClaimVeracityValidatorAgent"),
+                    "discrepancy_details": unmeasured("ClaimVeracityValidatorAgent"),
+                    "error": "%s: %s" % (type(exc).__name__, exc),
+                }
+                _t.detail(status="failed", error=str(exc))
 
     # Hand the turn to Memory Bank. Extraction and consolidation run inside the
     # managed service; this process never decides what is worth remembering.
-    try:
-        operation = memory_client().generate_from_contents(
-            turns=[{"role": "user", "text": claim_text}] if claim_text else [],
-            scope=scope_for(customer_id),
-            wait=False,
-        )
-        write_back = live(operation.get("name", NOT_RECORDED), "reasoningEngines.memories:generate")
-    except MemoryBankError as exc:
-        write_back = unmeasured("reasoningEngines.memories:generate (%s)" % exc)
+    with obs.turn("phase.4_memory_write", LOG, scope=customer_id) as _t:
+        try:
+            operation = memory_client().generate_from_contents(
+                turns=[{"role": "user", "text": claim_text}] if claim_text else [],
+                scope=scope_for(customer_id),
+                wait=False,
+            )
+            write_back = live(operation.get("name", NOT_RECORDED), "reasoningEngines.memories:generate")
+            _t.detail(operation=operation.get("name", NOT_RECORDED))
+        except MemoryBankError as exc:
+            write_back = unmeasured("reasoningEngines.memories:generate (%s)" % exc)
+            _t.detail(status="failed", error=str(exc))
 
     return {
         "status": "SUCCESS",
@@ -919,7 +1024,11 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
 @app.route("/api/chat", methods=["POST"])
 @app.route("/api/session/channel/record", methods=["POST"])
 def handle_workbench_chat():
-    return jsonify(_evaluate_interactive_workbench_turn(payload()))
+    with obs.run_context(kind="chat") as run_id:
+        result = _evaluate_interactive_workbench_turn(payload())
+        result["run_id"] = run_id
+        return jsonify(result)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1576,6 +1685,23 @@ def get_customer_telemetry(customer_id: str):
 # ---------------------------------------------------------------------------
 
 
+
+@app.route("/api/trace/<run_id>", methods=["GET"])
+def get_run_trace(run_id: str):
+    spans = obs.get_trace(run_id)
+    return jsonify({"run_id": run_id, "spans": spans})
+
+@app.route("/api/trace/latest", methods=["GET"])
+def get_latest_trace():
+    # Page load fires background probes and an operator turn at once. Without a
+    # kind filter the Pipeline can render whichever probe finished last.
+    kind = request.args.get("kind") or None
+    run_id = obs.get_latest_run_id(kind)
+    if not run_id:
+        return jsonify({"error": "no trace found"}), 404
+    spans = obs.get_trace(run_id)
+    return jsonify({"run_id": run_id, "kind": obs.get_run_kind(run_id), "spans": spans})
+
 @app.route("/api/chat/stream", methods=["GET", "POST"])
 def chat_stream():
     """Streams the synthesizer's JSON-RPC 2.0 trace frames.
@@ -1606,8 +1732,12 @@ def chat_stream():
     client = memory_client()
 
     def sse_event_encoder() -> Generator[str, None, None]:
-        for frame in agent.stream_synthesis_workflow(session_id, customer_id, prompt, client):
-            yield "data: %s\n\n" % frame
+        # The generator is consumed after the view returns, so the run context
+        # has to live in here; opening it around Response() would already be
+        # closed by the time the first frame is produced.
+        with obs.run_context(kind="stream"):
+            for frame in agent.stream_synthesis_workflow(session_id, customer_id, prompt, client):
+                yield "data: %s\n\n" % frame
 
     return Response(
         sse_event_encoder(),
