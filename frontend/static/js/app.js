@@ -844,24 +844,71 @@
   }
 
   function renderAbComparison(ab) {
-    if (!ab) return;
-    const rows = [
-      ["Tokens / session", ab.memory_off_tokens_per_session, ab.memory_on_tokens_per_session],
-      ["Questions re-asked", ab.questions_reasked_off, ab.questions_reasked_on],
-    ];
-    const draw = (el, index) => {
-      if (!el) return;
-      el.innerHTML = rows
-        .map(
-          (r) =>
-            `<div class="kv"><span>${escapeHtml(r[0])}</span><b>${escapeHtml(
-              pvText(r[index])
-            )}</b> ${pvChip(r[index])}</div>`
-        )
-        .join("");
+    const host = $("abComparison");
+    const foot = $("abFootnote");
+    if (!host) return;
+
+    if (!ab || !Array.isArray(ab.measured) || !ab.measured.length) {
+      host.innerHTML =
+        '<p class="fine">No off-vs-on comparison in the scorecard payload.</p>';
+      if (foot) foot.textContent = "";
+      return;
+    }
+
+    // A score of 1.0 measured over 0 turns is not a pass, it is an absence.
+    // With memory off, cross_scope_leakage scores 1.0 on 0 of 32 turns purely
+    // because nothing was retrieved, so nothing could leak. Showing that as a
+    // green tick next to the memory-on tick would invert the result.
+    const cell = (side) => {
+      if (!side) return '<td class="none">n/r</td>';
+      const score = pvText(side.score);
+      const vacuous = pvText(side.vacuous) === true || pvText(side.vacuous) === "true";
+      const measured = pvText(side.turns_measured);
+      const total = pvText(side.turns_total);
+      if (score === NOT_RECORDED) return '<td class="none">n/r</td>';
+
+      const pct = `${Math.round(Number(score) * 100)}%`;
+      if (vacuous) {
+        return `<td class="none" title="scored on 0 turns - nothing was retrieved, so nothing could be measured">${pct} <small>(0 turns)</small></td>`;
+      }
+      const cls = Number(score) >= 1 ? "ok" : "none";
+      return `<td class="${cls}" title="${escapeHtml(
+        `${measured} of ${total} turns measured · ${pvSource(side.score)}`
+      )}">${pct}</td>`;
     };
-    draw($("abCardOff"), 1);
-    draw($("abCardOn"), 2);
+
+    host.innerHTML = `
+      <table class="kv" style="width:100%;border-collapse:collapse;">
+        <thead>
+          <tr>
+            <th style="text-align:left;">Measured</th>
+            <th style="text-align:right;">Memory off</th>
+            <th style="text-align:right;">Memory on</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${ab.measured
+            .map(
+              (m) =>
+                `<tr><td>${escapeHtml(m.name)}</td>${cell(m.memory_off)}${cell(
+                  m.memory_on
+                )}</tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>`;
+
+    // The panel used to end with "68.8% fewer tokens" whether or not anything
+    // had been measured. The harness says plainly that it measured no tokens;
+    // that sentence is shown instead of a number nobody recorded.
+    if (foot) {
+      const why = pvText(ab.why_not_measured);
+      const how = pvText(ab.how_to_measure);
+      foot.innerHTML =
+        `Tokens per session and questions re-asked are <b>not measured</b>. ` +
+        `${escapeHtml(why === NOT_RECORDED ? "" : why)} ` +
+        `<i>${escapeHtml(how === NOT_RECORDED ? "" : how)}</i>`;
+    }
   }
 
   // =========================================================================

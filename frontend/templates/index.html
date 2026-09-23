@@ -176,24 +176,17 @@
   <div class="deck" id="deckPrimary2">
     <div class="col">
       <div class="colhead"><h2>Memory A/B</h2><span class="n">03 / off vs on</span></div>
-      <div class="item" id="abCardOff"><div class="item-top"><span class="dot" style="background:var(--pink)"></span>
-        <span class="nm">Memory off</span><span class="tag no">baseline</span></div>
-        <dl class="kv" style="margin-top:8px;">
-          <div><dt>Questions re-asked</dt><dd>6</dd></div>
-          <div><dt>Knew about the trip</dt><dd class="none">No</dd></div>
-          <div><dt>Credit card provisional</dt><dd class="none">Offered · wrong</dd></div>
-          <div><dt>Tokens / session</dt><dd>41,200</dd></div>
-        </dl></div>
-      <div class="item" id="abCardOn"><div class="item-top"><span class="dot done" style="background:var(--good)"></span>
-        <span class="nm">Memory on</span><span class="tag ok">under test</span></div>
-        <dl class="kv" style="margin-top:8px;">
-          <div><dt>Questions re-asked</dt><dd class="ok">0</dd></div>
-          <div><dt>Knew she came home early</dt><dd class="ok">Yes · 10 Sep</dd></div>
-          <div><dt>Credit card provisional</dt><dd class="ok">Refused</dd></div>
-          <div><dt>Tokens / session</dt><dd>12,850</dd></div>
-        </dl></div>
-      <p class="fine">68.8% fewer tokens. Memory replaces replaying the transcript with a
-        handful of consolidated facts, so cost falls as the relationship lengthens.</p>
+
+      <!-- Both cards used to carry invented numbers in markup (6 re-asks,
+           41,200 tokens, 0 re-asks, 12,850 tokens) which app.js then overwrote
+           with "n/r", so the panel showed four unexplained blanks under a
+           caption asserting a 68.8% saving. The numbers are filled from
+           /api/eval-scorecard now, and the caption states what was measured. -->
+      <div id="abComparison">
+        <p class="fine">Loading the off-vs-on comparison…</p>
+      </div>
+
+      <p class="fine" id="abFootnote"></p>
     </div>
 
     <div class="col">

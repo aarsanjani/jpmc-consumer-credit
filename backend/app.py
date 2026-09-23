@@ -525,16 +525,82 @@ def get_eval_scorecard():
         ],
     }
 
-    ab = mem_on.get("ab_comparison", {}) or {}
-    ab_off = mem_off.get("ab_comparison", {}) or {}
+    # ---------------------------------------------------------------------
+    # Memory off vs memory on.
+    #
+    # This used to read `ab_comparison.tokens_per_session`. No version of the
+    # harness has ever written that key, so all four tiles rendered "n/r" on
+    # every run and the panel looked broken rather than honest -- while the
+    # caption under it still asserted a token saving.
+    #
+    # The harness is explicit about why it has no token numbers: `operational`
+    # carries `available: false` and a reason. That reason is passed through
+    # verbatim instead of being flattened to "n/r" with no explanation.
+    #
+    # What the harness DOES measure is the memory_layer comparison between the
+    # two runs, and it is a far stronger result than a token count: with memory
+    # off, retrieval returns nothing, so extraction fidelity, precision, recall
+    # and staleness handling all score 0.
+    # ---------------------------------------------------------------------
+    off_summary = (mem_off.get("memory_layer", {}) or {}).get("summary", {}) or {}
+    on_summary = l1_summary
+    operational = mem_on.get("operational", {}) or {}
+    unmeasured_reason = operational.get("reason") or "the harness recorded no reason"
+
+    AB_METRICS = (
+        ("extraction_fidelity", "Facts extracted correctly"),
+        ("recall_at_k", "Recall@5"),
+        ("precision_at_k", "Precision@5"),
+        ("staleness_penalty", "Contradiction handled"),
+        ("cross_scope_leakage", "No cross-customer leakage"),
+    )
+
+    def _ab_side(summary: Dict[str, Any], key: str, source_file: str) -> Dict[str, Any]:
+        """One side of the comparison, carrying how many turns backed it.
+
+        `turns_measured` is included deliberately. With memory off,
+        cross_scope_leakage scores 1.0 -- but on 0 of 32 turns, because nothing
+        was retrieved and so nothing could leak. A pass on zero turns is not a
+        pass, and the UI cannot tell the difference unless it is given the
+        count.
+        """
+        source = "%s#memory_layer.summary.%s" % (source_file, key)
+        entry = summary.get(key)
+        if not isinstance(entry, dict) or entry.get("score") is None:
+            return {"score": unmeasured(source), "turns_measured": unmeasured(source)}
+        measured = entry.get("turns_measured")
+        return {
+            "score": seeded(entry["score"], source),
+            "passed": seeded(entry.get("passed"), source) if "passed" in entry else unmeasured(source),
+            "turns_measured": seeded(measured, source) if measured is not None else unmeasured(source),
+            "turns_total": seeded(entry["turns_total"], source) if "turns_total" in entry else unmeasured(source),
+            "vacuous": computed(
+                measured == 0,
+                "turns_measured == 0: scored without measuring anything",
+            ),
+        }
+
     ab_comparison = {
-        "memory_off_tokens_per_session": _count(ab_off, "tokens_per_session", off_file, "ab_comparison"),
-        "memory_on_tokens_per_session": _count(ab, "tokens_per_session", on_file, "ab_comparison"),
-        "tokens_saved_pct": _count(ab, "tokens_saved_pct", on_file, "ab_comparison"),
-        "questions_reasked_off": _count(ab_off, "questions_reasked", off_file, "ab_comparison"),
-        "questions_reasked_on": _count(ab, "questions_reasked", on_file, "ab_comparison"),
-        "contradictions_resolved": _count(ab, "contradictions_resolved", on_file, "ab_comparison"),
-        "negative_memories_withheld": _count(ab, "negative_memories_withheld", on_file, "ab_comparison"),
+        "measured": [
+            {
+                "id": key,
+                "name": name,
+                "memory_off": _ab_side(off_summary, key, off_file),
+                "memory_on": _ab_side(on_summary, key, on_file),
+            }
+            for key, name in AB_METRICS
+        ],
+        # Kept as explicit fields so the UI can show the gap rather than hide
+        # it, each carrying the harness's own sentence about why it is absent.
+        "not_measured": {
+            "tokens_per_session": unmeasured("%s#operational - %s" % (on_file, unmeasured_reason)),
+            "questions_reasked": unmeasured("%s#operational - %s" % (on_file, unmeasured_reason)),
+        },
+        "why_not_measured": computed(unmeasured_reason, "%s#operational.reason" % on_file),
+        "how_to_measure": computed(
+            "Re-run the eval harness with --run-record to capture latency and tokens.",
+            "%s#operational.source" % on_file,
+        ),
     }
 
     return jsonify(
