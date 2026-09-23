@@ -643,8 +643,8 @@ def create_consumer_credit_synthesizer_agent(
     )
 
 
-def list_all_agents() -> List[Dict[str, Any]]:
-    """Returns metadata for the 6 CCB Fraud & Disputes Desk agents."""
+def list_all_agents() -> List[AgentDescriptor]:
+    """Returns AgentDescriptor models for the 6 CCB Fraud & Disputes Desk agents."""
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     descriptors = [
         AgentDescriptor(
@@ -707,4 +707,5 @@ def list_all_agents() -> List[Dict[str, Any]]:
             description="Triggers server-side Vertex AI Memory Bank consolidation (memories:generate) after run close with zero PII/PAN persisted.",
         ),
     ]
-    return [d.model_dump() for d in descriptors]
+    return descriptors
+
