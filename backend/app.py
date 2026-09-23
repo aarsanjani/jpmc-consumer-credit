@@ -912,6 +912,40 @@ def _containment_trajectory() -> List[Dict[str, Any]]:
     ]
 
 
+def _measured_tool_trajectory(run_id: str) -> List[Dict[str, Any]]:
+    """Builds the live tool trajectory from the spans actually recorded in `run_id`."""
+    spans = sorted(obs.get_trace(run_id) or [], key=lambda s: s.get("started_ms", 0.0))
+    if not spans:
+        return _containment_trajectory()
+
+    steps: List[Dict[str, Any]] = []
+    seen = set()
+    for span in spans:
+        lbl = str(span.get("label") or "")
+        fields = span.get("fields") or {}
+        if lbl.startswith("catalog.check_") or lbl == "catalog.discover":
+            continue
+        tool_name = (
+            fields.get("tool")
+            or (("%s:%s" % (fields.get("agent"), lbl)) if fields.get("agent") else lbl)
+        )
+        dedup_key = "%s|%s" % (tool_name, round(span.get("started_ms", 0.0), -1))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        elapsed = float(span.get("elapsed_ms") or 0.0)
+        state = str(span.get("state") or "ok").upper()
+        steps.append(
+            {
+                "step": len(steps) + 1,
+                "tool": live(tool_name, "obs.trace:%s" % lbl),
+                "status": live(state, "obs.trace:%s" % lbl),
+                "latency": live("%.0fms" % elapsed, "obs.trace:%s" % lbl),
+            }
+        )
+    return steps or _containment_trajectory()
+
+
 def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]:
     """One workbench turn: gather evidence, ask the validator, record the turn.
 
@@ -1194,6 +1228,7 @@ def handle_workbench_chat():
     with obs.run_context(kind="chat") as run_id:
         result = _evaluate_interactive_workbench_turn(payload())
         result["run_id"] = run_id
+        result["tool_trajectory"] = _measured_tool_trajectory(run_id)
         return jsonify(result)
 
 
@@ -1226,35 +1261,75 @@ def handle_card_oversight_decision():
             }
         )
 
-    body = payload()
-    customer_id = body_customer(body)
-    raw_action = str(body.get("decision") or body.get("action") or "UNLOCK").upper()
-    admin_notes = body.get("admin_notes") or body.get("reason")
+    with obs.run_context(kind="chat") as run_id:
+        body = payload()
+        customer_id = body_customer(body)
+        raw_action = str(body.get("decision") or body.get("action") or "UNLOCK").upper()
+        admin_notes = body.get("admin_notes") or body.get("reason") or "Supervisor card oversight action"
 
-    is_unlock = any(word in raw_action for word in ("UNLOCK", "APPROVE", "YES", "ACTIVE"))
-    decision_code = "APPROVED_YES" if is_unlock else "REJECTED_NO"
+        is_unlock = any(word in raw_action for word in ("UNLOCK", "APPROVE", "YES", "ACTIVE"))
+        decision_code = "APPROVED_YES" if is_unlock else "REJECTED_NO"
 
-    try:
-        case = manager.execute_admin_decision(
-            customer_id=customer_id, decision=decision_code, admin_notes=admin_notes
+        with obs.turn(
+            "oversight.card_decision",
+            LOG,
+            agent="consumer_credit_synthesizer_agent" if is_unlock else "fraud_monitoring_agent",
+            customer_id=customer_id,
+            decision=decision_code,
+        ) as _ov_span:
+            try:
+                case = manager.execute_admin_decision(
+                    customer_id=customer_id, decision=decision_code, admin_notes=admin_notes
+                )
+            except Exception as exc:  # noqa: BLE001
+                _ov_span.detail(error=str(exc))
+                return _upstream_error(exc, "AdminCardOversightManager.execute_admin_decision")
+
+            adk_action_result = {}
+            if _adk is not None:
+                try:
+                    if is_unlock and hasattr(_adk, "execute_one_click_card_unlock"):
+                        adk_action_result = _adk.execute_one_click_card_unlock(
+                            customer_id=customer_id,
+                            card_id=DEFAULT_CREDIT_CARD_ID,
+                            reason=str(admin_notes),
+                            record_to_memory_bank=True,
+                        )
+                    elif not is_unlock and hasattr(_adk, "execute_fraud_card_control_or_escalate"):
+                        adk_action_result = _adk.execute_fraud_card_control_or_escalate(
+                            customer_id=customer_id,
+                            card_id=DEFAULT_CREDIT_CARD_ID,
+                            action="SUPERVISOR_KEEP_RESTRICTED",
+                            reason=str(admin_notes),
+                            record_to_memory_bank=True,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logging.error("Supervisor ADK tool execution failed: %s", exc)
+            _ov_span.detail(decision=decision_code, card_status=case.card_status)
+
+        badge = "ACTIVE_UNLOCKED" if is_unlock else "SECURITY_LOCKED"
+        snapshot = (
+            _adk.produce_all_channels_snapshot(customer_id=customer_id)
+            if _adk and hasattr(_adk, "produce_all_channels_snapshot")
+            else None
         )
-    except Exception as exc:  # noqa: BLE001
-        return _upstream_error(exc, "AdminCardOversightManager.execute_admin_decision")
-
-    badge = "ACTIVE_UNLOCKED" if is_unlock else "SECURITY_LOCKED"
-    return jsonify(
-        {
-            "status": "SUCCESS",
-            "customer_id": customer_id,
-            "decision": decision_code,
-            "card_status": badge,
-            "oversight_badge_text": badge,
-            "oversight_badge_class": "badge ok" if is_unlock else "badge stop",
-            "admin_review_case": case.model_dump(mode="json"),
-            "customer_notification_message": case.customer_notification_message,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+        return jsonify(
+            {
+                "status": "SUCCESS",
+                "run_id": run_id,
+                "customer_id": customer_id,
+                "decision": decision_code,
+                "card_status": badge,
+                "oversight_badge_text": badge,
+                "oversight_badge_class": "badge ok" if is_unlock else "badge stop",
+                "admin_review_case": case.model_dump(mode="json"),
+                "adk_tool_result": adk_action_result,
+                "snapshot": snapshot,
+                "tool_trajectory": _measured_tool_trajectory(run_id),
+                "customer_notification_message": case.customer_notification_message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
 
 @app.route("/api/admin/card-review", methods=["GET"])
@@ -1684,51 +1759,81 @@ def _compaction_report(body: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
     counts are not values the API exposes, so they read "n/r" instead of a
     number that would look convincing and mean nothing.
     """
-    customer_id = body_customer(body)
-    session_name = body.get("session_name")
-    client = memory_client()
+    with obs.run_context(kind="chat") as run_id:
+        customer_id = body_customer(body)
+        session_name = body.get("session_name")
+        client = memory_client()
 
-    try:
-        before = client.retrieve(scope_for(customer_id))
-    except MemoryBankError as exc:
+        if _adk is not None and hasattr(_adk, "list_memory_topics_tool"):
+            try:
+                _adk.list_memory_topics_tool()
+            except Exception:  # noqa: BLE001
+                pass
+
+        with obs.turn("memory.retrieve", LOG, agent="consumer_credit_synthesizer_agent",
+                      scope=customer_id, query="all_in_scope") as _r_span:
+            try:
+                before = client.retrieve(scope_for(customer_id))
+                _r_span.detail(memories=len(before))
+            except MemoryBankError as exc:
+                _r_span.detail(error=str(exc))
+                return {
+                    "status": "UPSTREAM_ERROR",
+                    "run_id": run_id,
+                    "source": "reasoningEngines.memories:retrieve",
+                    "error": "%s: %s" % (type(exc).__name__, exc),
+                }, 502
+
+        if not session_name:
+            try:
+                for s in client.list_sessions():
+                    scoped = s.get("sessionState", {}).get("customer_id") or s.get("userId")
+                    if scoped == customer_id and s.get("name"):
+                        session_name = s.get("name")
+                        break
+            except Exception:  # noqa: BLE001
+                session_name = None
+
+        with obs.turn("memory.consolidate", LOG, agent="consumer_credit_synthesizer_agent",
+                      scope=customer_id, session=str(session_name or NOT_RECORDED).split("/")[-1]) as _c_span:
+            if session_name:
+                try:
+                    operation = client.generate_from_session(session_name, scope_for(customer_id), wait=False)
+                    op_name = operation.get("name", NOT_RECORDED)
+                    triggered = live(op_name, "reasoningEngines.memories:generate")
+                    _c_span.detail(operation=op_name, status="TRIGGERED")
+                except MemoryBankError as exc:
+                    triggered = unmeasured("reasoningEngines.memories:generate (%s)" % exc)
+                    _c_span.detail(error=str(exc))
+            else:
+                triggered = unmeasured(
+                    "no session_name supplied; consolidation runs server side when a session is generated from"
+                )
+                _c_span.detail(status="no_session_in_scope")
+
         return {
-            "status": "UPSTREAM_ERROR",
-            "source": "reasoningEngines.memories:retrieve",
-            "error": "%s: %s" % (type(exc).__name__, exc),
-        }, 502
-
-    if session_name:
-        try:
-            operation = client.generate_from_session(session_name, scope_for(customer_id), wait=False)
-            triggered = live(operation.get("name", NOT_RECORDED), "reasoningEngines.memories:generate")
-        except MemoryBankError as exc:
-            triggered = unmeasured("reasoningEngines.memories:generate (%s)" % exc)
-    else:
-        triggered = unmeasured(
-            "no session_name supplied; consolidation runs server side when a session is generated from"
-        )
-
-    return {
-        "status": "SUCCESS",
-        "customer_id": customer_id,
-        "compaction_report": {
-            "consolidation_location": identity(
-                "Vertex AI Agent Engine Memory Bank (server side)",
-                "backend/memory_bank.py:MemoryBankClient.generate_from_session",
-                "states where the work runs; not a measurement",
-            ),
-            "memories_in_scope_before": live(len(before), "reasoningEngines.memories:retrieve"),
-            "generate_operation": triggered,
-            "tokens_before": unmeasured("Memory Bank does not report token counts"),
-            "tokens_after": unmeasured("Memory Bank does not report token counts"),
-            "compression_ratio": unmeasured("depends on two unmeasured token counts"),
-            "token_reduction_pct": unmeasured("depends on two unmeasured token counts"),
-            "nodes_consolidated": unmeasured(
-                "the generate operation is asynchronous and does not return a consolidation count"
-            ),
-        },
-        "memories": live([memory_record(m) for m in before], "reasoningEngines.memories:retrieve"),
-    }, 200
+            "status": "SUCCESS",
+            "run_id": run_id,
+            "customer_id": customer_id,
+            "tool_trajectory": _measured_tool_trajectory(run_id),
+            "compaction_report": {
+                "consolidation_location": identity(
+                    "Vertex AI Agent Engine Memory Bank (server side)",
+                    "backend/memory_bank.py:MemoryBankClient.generate_from_session",
+                    "states where the work runs; not a measurement",
+                ),
+                "memories_in_scope_before": live(len(before), "reasoningEngines.memories:retrieve"),
+                "generate_operation": triggered,
+                "tokens_before": unmeasured("Memory Bank does not report token counts"),
+                "tokens_after": unmeasured("Memory Bank does not report token counts"),
+                "compression_ratio": unmeasured("depends on two unmeasured token counts"),
+                "token_reduction_pct": unmeasured("depends on two unmeasured token counts"),
+                "nodes_consolidated": unmeasured(
+                    "the generate operation is asynchronous and does not return a consolidation count"
+                ),
+            },
+            "memories": live([memory_record(m) for m in before], "reasoningEngines.memories:retrieve"),
+        }, 200
 
 
 @app.route("/api/memory/compact", methods=["POST"])
@@ -1881,10 +1986,12 @@ def chat_stream():
         prompt = body.get("prompt", "")
         session_id = body.get("session_id", NOT_RECORDED)
         customer_id = body_customer(body)
+        req_run_id = body.get("run_id")
     else:
         prompt = request.args.get("prompt", "")
         session_id = request.args.get("session_id", NOT_RECORDED)
         customer_id = arg_customer()
+        req_run_id = request.args.get("run_id")
 
     # The customer's own words move the oversight card; that is the arc's hinge.
     if _veracity is not None and prompt:
@@ -1902,7 +2009,7 @@ def chat_stream():
         # The generator is consumed after the view returns, so the run context
         # has to live in here; opening it around Response() would already be
         # closed by the time the first frame is produced.
-        with obs.run_context(kind="stream"):
+        with obs.run_context(run_id=req_run_id or None, kind="chat"):
             for frame in agent.stream_synthesis_workflow(session_id, customer_id, prompt, client):
                 yield "data: %s\n\n" % frame
 

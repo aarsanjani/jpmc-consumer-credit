@@ -47,8 +47,11 @@ from backend.models import (
     VeracityStatus,
     VerificationCheckItem,
 )
+from backend import obs
 from backend.knowledge_catalog import CatalogGovernor, create_default_catalog_governor
 from backend.memory_bank import MemoryBankClient, create_default_memory_bank_client
+
+LOG = obs.get_logger(__name__)
 from backend.provenance import (
     NOT_RECORDED,
     computed,
@@ -609,9 +612,11 @@ class ClaimVeracityValidatorAgent:
 
     def build_evidence(self, customer_id: str, claim_text: str) -> Dict[str, Any]:
         """Catalog gate, then the authorised golden queries, then the cross-check."""
-        authorization = self.authorize_sources()
-        declined_columns = value_of(authorization["columns_declined"]) or []
-        allowed_by_avenue = value_of(authorization["allowed_tables_by_avenue"]) or {}
+        with obs.turn("veracity.authorize_sources", LOG, agent="claim_veracity_validator_agent") as _s:
+            authorization = self.authorize_sources()
+            declined_columns = value_of(authorization["columns_declined"]) or []
+            allowed_by_avenue = value_of(authorization["allowed_tables_by_avenue"]) or {}
+            _s.detail(declined_columns=len(declined_columns))
 
         card_ids, card_record = self._resolve_cards(customer_id, declined_columns)
         claimed_cards = [c.upper() for c in _CARD_RE.findall(claim_text or "")]
@@ -619,13 +624,18 @@ class ClaimVeracityValidatorAgent:
 
         avenues: Dict[str, Any] = {}
         for spec in AVENUE_SPECS:
-            avenues[spec["avenue_id"]] = self._avenue_evidence(
-                spec,
-                customer_id=customer_id,
-                card_id=card_id,
-                allowed_tables=allowed_by_avenue.get(spec["avenue_id"], []),
-                declined_columns=declined_columns,
-            )
+            av_id = spec["avenue_id"]
+            with obs.turn("veracity.avenue." + av_id, LOG, agent="claim_veracity_validator_agent",
+                          avenue=av_id, card_id=card_id or NOT_RECORDED) as _av_span:
+                av_res = self._avenue_evidence(
+                    spec,
+                    customer_id=customer_id,
+                    card_id=card_id,
+                    allowed_tables=allowed_by_avenue.get(av_id, []),
+                    declined_columns=declined_columns,
+                )
+                avenues[av_id] = av_res
+                _av_span.detail(tables=len(allowed_by_avenue.get(av_id, [])))
 
         disputes = self._dispute_evidence(customer_id, declined_columns)
 
@@ -641,7 +651,8 @@ class ClaimVeracityValidatorAgent:
             "disputes": disputes,
         }
         evidence.update(avenues)
-        evidence["amount_cross_check"] = self._amount_cross_check(claim_text, evidence)
+        with obs.turn("veracity.amount_cross_check", LOG, agent="claim_veracity_validator_agent"):
+            evidence["amount_cross_check"] = self._amount_cross_check(claim_text, evidence)
         return evidence
 
     # -- verdict -------------------------------------------------------------
@@ -681,27 +692,35 @@ RULES:
             evidence=json.dumps(evidence, indent=2, default=str),
         )
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=ClaimVeracityGenAIOutput,
-                ),
-            )
-            parsed = response.parsed
-        except Exception as error:
-            # No fallback verdict. An invented judgement on a customer's honesty
-            # is the single most damaging thing this file could produce.
-            raise VeracityServiceError(
-                "Vertex AI evaluation failed for %s and no verdict was invented: %s" % (customer_id, error)
-            )
+        with obs.turn("veracity.gemini_evaluate", LOG, agent="claim_veracity_validator_agent",
+                      model=self.model_name, customer_id=customer_id) as _eval_span:
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema=ClaimVeracityGenAIOutput,
+                    ),
+                )
+                parsed = response.parsed
+            except Exception as error:
+                _eval_span.detail(error=str(error))
+                # No fallback verdict. An invented judgement on a customer's honesty
+                # is the single most damaging thing this file could produce.
+                raise VeracityServiceError(
+                    "Vertex AI evaluation failed for %s and no verdict was invented: %s" % (customer_id, error)
+                )
 
-        if parsed is None:
-            raise VeracityServiceError(
-                "Vertex AI returned no parsable ClaimVeracityGenAIOutput for %s." % customer_id
+            if parsed is None:
+                raise VeracityServiceError(
+                    "Vertex AI returned no parsable ClaimVeracityGenAIOutput for %s." % customer_id
+                )
+            _eval_span.detail(
+                status=str(parsed.veracity_status),
+                confidence=parsed.confidence_score,
+                avenues=len(parsed.relevant_avenues_checked or []),
             )
 
         return ClaimVeracityEvaluation(

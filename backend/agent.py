@@ -24,9 +24,12 @@ import certifi
 from dotenv import load_dotenv
 from google import genai
 
+from backend import obs
 from backend.models import BankChannel, CausalStep, SynthesisResult
 from backend.memory_bank import MemoryBankClient, MemoryBankError, field as mb_field
 from backend.provenance import NOT_RECORDED, computed, identity, live, require_env, unmeasured
+
+LOG = obs.get_logger(__name__)
 
 load_dotenv()
 
@@ -334,7 +337,10 @@ class MemoryBankSynthesizerAgent:
             },
         )
 
-        grounding = self.gather_grounding(customer_id, user_prompt, memory_client)
+        with obs.turn("synthesizer.gather_grounding", LOG, agent="consumer_credit_synthesizer_agent",
+                      scope=customer_id) as _g_span:
+            grounding = self.gather_grounding(customer_id, user_prompt, memory_client)
+            _g_span.detail(memories=len(grounding.get("memories", [])))
 
         yield self._encode_rpc_frame(
             "onMemoryBankAccess",
@@ -360,7 +366,10 @@ class MemoryBankSynthesizerAgent:
             },
         )
 
-        result = self.synthesize_customer_issue(customer_id, user_prompt, memory_client, channel)
+        with obs.turn("synthesizer.generate_answer", LOG, agent="consumer_credit_synthesizer_agent",
+                      model=self.model_name, scope=customer_id) as _s_span:
+            result = self.synthesize_customer_issue(customer_id, user_prompt, memory_client, channel)
+            _s_span.detail(causal_steps=len(result.causal_chain))
 
         yield self._encode_rpc_frame(
             "onAgentSynthesis",

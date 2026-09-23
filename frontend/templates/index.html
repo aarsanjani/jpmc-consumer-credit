@@ -15,7 +15,7 @@
   <div class="in">
     <span class="pulse done" id="livePulse"></span>
 
-    <div class="pickwrap" id="pickwrap">
+    <div class="pickwrap" id="pickwrap" hidden>
       <button class="tok" id="tok" type="button" aria-haspopup="listbox" aria-expanded="false">
         <span class="ix" id="tokIx">01</span>
         <span class="an" id="tokName">fraud_monitoring_agent</span>
@@ -23,8 +23,8 @@
       </button>
       <div class="menu" id="menu" role="listbox" hidden>
         <div class="menu-hd">
-          <span id="mobileMenuTitle">Waiting for trace...</span>
-          <span>Newest first</span>
+          <span id="mobileMenuTitle">Logged agents in this run</span>
+          <span>Live spans only</span>
         </div>
         <div id="menuList"></div>
         <div class="menu-foot">
@@ -35,13 +35,13 @@
     </div>
 
     <p class="barinfo" id="barinfo">
-      <span class="kind" id="biKind"></span>
-      <span id="biText"></span>
-      <span class="metrics" id="biMetrics"></span>
+      <span class="bk" id="biKind">IDLE</span>
+      <span class="bt" id="biText">No trace logged yet — run a scenario, ask a question, or trigger an action</span>
+      <span class="bm" id="biMetrics"></span>
     </p>
 
-    <button class="barbtn" id="traceBtn" type="button" aria-expanded="false" aria-controls="drop">Trace ▾</button>
-    <span class="stamp" id="liveLogStamp">Waiting for trace...</span>
+    <button class="barbtn" id="traceBtn" type="button" aria-expanded="false" aria-controls="drop" hidden>Trace ▾</button>
+    <span class="stamp" id="liveLogStamp">IDLE</span>
   </div>
 </div>
 
@@ -338,6 +338,6 @@
   </div>
 </div>
 
-<script src="/static/js/app.js?v=20260923c"></script>
+<script src="/static/js/app.js?v=20260923d"></script>
 </body>
 </html>

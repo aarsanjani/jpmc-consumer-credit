@@ -320,6 +320,39 @@ function formatLiveSpanRow(span, t0) {
       " entries · " +
       (o.tables != null ? o.tables : "n/r") +
       " tables";
+  } else if (/^veracity\./.test(span.label)) {
+    kind = span.label === "veracity.gemini_evaluate" ? "out" : "tool";
+    what =
+      span.label +
+      (f.avenue ? " [" + f.avenue + "]" : "") +
+      (o.status ? " · verdict=" + o.status : "") +
+      (o.confidence != null ? " · conf=" + o.confidence : "") +
+      (o.declined_columns != null ? " · declined_cols=" + o.declined_columns : "");
+  } else if (/^synthesizer\./.test(span.label)) {
+    kind = "out";
+    what =
+      span.label +
+      (f.model ? " [" + f.model + "]" : "") +
+      (o.memories != null ? " · " + o.memories + " memories" : "") +
+      (o.causal_steps != null ? " · " + o.causal_steps + " causal steps" : "");
+  } else if (span.label === "oversight.card_decision") {
+    kind = "out";
+    what =
+      "oversight.card_decision [" +
+      (f.decision || o.decision || "DECIDED") +
+      "] · status=" +
+      (o.card_status || "updated");
+  } else if (span.label === "memory.consolidate") {
+    kind = "out";
+    what =
+      "memory.consolidate [session=" +
+      (f.session || "n/r") +
+      "] · status=" +
+      (o.status || "TRIGGERED") +
+      (o.operation ? " · op=" + String(o.operation).split("/").pop() : "");
+  } else if (span.label === "memory.list_topics") {
+    kind = "tool";
+    what = "memory.list_topics · " + (o.topics != null ? o.topics + " custom topics" : "vocabulary read");
   } else if (/^phase\./.test(span.label)) {
     kind = "out";
     what =
@@ -358,12 +391,19 @@ function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
   const ch = (f.channel || "").toUpperCase();
   const tool = f.tool || activeGoldenTool || "";
 
-  // Anything inside phase.3_veracity belongs to 06 claim_veracity_validator_agent
-  if (activePhase === "phase.3_veracity" || lbl === "phase.3_veracity") {
+  if (activePhase === "phase.3_veracity" || lbl === "phase.3_veracity" || /^veracity\./.test(lbl)) {
     return ["claim_veracity_validator_agent"];
   }
   if (lbl === "audit.consolidated_sweep" || ag === "memory_bank_audit_agent") {
     return ["memory_bank_audit_agent"];
+  }
+  if (/^synthesizer\./.test(lbl) || lbl === "memory.consolidate" || lbl === "memory.list_topics") {
+    return ["consumer_credit_synthesizer_agent"];
+  }
+  if (lbl === "oversight.card_decision") {
+    return ag === "fraud_monitoring_agent"
+      ? ["fraud_monitoring_agent", "consumer_credit_synthesizer_agent"]
+      : ["consumer_credit_synthesizer_agent", "mobile_app_agent"];
   }
   if (lbl === "channel.produce") {
     if (ag) return [ag, "consumer_credit_synthesizer_agent"];
@@ -392,7 +432,7 @@ function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
     return ["telephony_ivr_agent"];
   }
   if (tool.indexOf("golden_10") >= 0) {
-    return ["mobile_app_agent"];
+    return ["mobile_app_agent", "consumer_credit_synthesizer_agent"];
   }
   if (tool.indexOf("golden_07") >= 0 || lbl === "phase.2_glossary" || lbl === "catalog.lookup_term") {
     return ["web_portal_agent", "consumer_credit_synthesizer_agent"];
@@ -405,6 +445,37 @@ function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
 
 let LAST_TRACED_SPANS = [];
 let LAST_TRACED_RUN_ID = "";
+let ALL_DESK_AGENTS = [];
+
+function syncTraceBarVisibility() {
+  const pickwrap = $("pickwrap");
+  const traceBtn = $("traceBtn");
+  const drop = $("drop");
+  const menuTitle = $("mobileMenuTitle");
+  const hasLogged = AGENTS.length > 0;
+
+  if (pickwrap) pickwrap.hidden = !hasLogged;
+  if (traceBtn) traceBtn.hidden = !hasLogged;
+  if (!hasLogged) {
+    if (drop) drop.hidden = true;
+    const kind = $("biKind");
+    const text = $("biText");
+    const metrics = $("biMetrics");
+    if (kind) {
+      kind.className = "bk";
+      kind.textContent = "IDLE";
+    }
+    if (text) {
+      text.className = "bt";
+      text.textContent = "No trace logged yet — run a scenario, ask a question, or trigger an action";
+    }
+    if (metrics) {
+      metrics.innerHTML = "";
+    }
+  } else if (menuTitle) {
+    menuTitle.textContent = `Run ${LAST_TRACED_RUN_ID || "live"} · ${AGENTS.length} logged agent(s)`;
+  }
+}
 
 function buildDeskAgentEntries(summary, rawSpans, runId) {
   const deskAgents = (summary && Array.isArray(summary.agents)) ? summary.agents : [];
@@ -510,7 +581,7 @@ function buildDeskAgentEntries(summary, rawSpans, runId) {
       ? `[run ${runId}] ${bucket.rows.length} live spans · ${bucket.jobs} bq · ${bucket.deny} refused · ${secsLabel}`
       : (isAudit
           ? `[run ${runId}] 0 spans (async 95s sweep kept off synchronous turn path)`
-          : `[run ${runId}] 0 spans triggered in this scenario`);
+          : `[run ${runId}] 0 spans triggered in this action`);
 
     return {
       k: ag.agent_id || ag.name,
@@ -545,17 +616,20 @@ async function fetchAndRenderTrace(runId) {
   try {
     if (!runId) {
       renderRoster();
+      syncTraceBarVisibility();
       return;
     }
     const resp = await fetch("/api/trace/" + runId);
     if (!resp.ok) {
       renderRoster();
+      syncTraceBarVisibility();
       return;
     }
     const data = await resp.json();
     const spans = (data.spans || []).slice().sort((a, b) => a.started_ms - b.started_ms);
     if (!spans.length) {
       renderRoster();
+      syncTraceBarVisibility();
       return;
     }
 
@@ -568,7 +642,9 @@ async function fetchAndRenderTrace(runId) {
     const steps = groupSpansIntoSteps(spans, t0);
     const runMeta = "Run " + LAST_TRACED_RUN_ID;
 
-    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, spans, LAST_TRACED_RUN_ID);
+    ALL_DESK_AGENTS = buildDeskAgentEntries(STATE.channelsSummary, spans, LAST_TRACED_RUN_ID);
+    // Only agents that actually logged spans in this run appear in the black trace nav dropdown!
+    AGENTS = ALL_DESK_AGENTS.filter((a) => a.spans && a.spans.length > 0);
     window.AGENTS = AGENTS;
 
     const totals = steps.reduce(
@@ -576,17 +652,19 @@ async function fetchAndRenderTrace(runId) {
       { deny: 0, sql: 0, jobs: 0 }
     );
 
-    setAgentCountText("8 agents · " + spans.length + " live spans");
-    setRunMetaText(runMeta + " · 8-agent desk · " + spans.length + " live spans · " + wall);
+    setAgentCountText(AGENTS.length + " / 8 active · " + spans.length + " spans");
+    setRunMetaText(runMeta + " · " + AGENTS.length + " logged agent(s) · " + spans.length + " live spans · " + wall);
     setStampText(runMeta + " · " + wall + " · ad-hoc SQL " + totals.sql);
     setTruthEngineText(
-      runMeta + " · 8-agent hub-and-spoke · " + spans.length + " live spans in " + wall + " · " +
+      runMeta + " · " + AGENTS.length + " active agent(s) · " + spans.length + " live spans in " + wall + " · " +
       totals.jobs + " BigQuery jobs · " + totals.deny + " refusals · ad-hoc SQL " + totals.sql
     );
+    syncTraceBarVisibility();
     buildMenu();
-    const firstActive = AGENTS.findIndex((a) => a.spans && a.spans.length > 0);
-    pick(firstActive >= 0 ? firstActive : 0);
-    setTrace(true);
+    if (AGENTS.length) {
+      pick(0);
+      setTrace(true);
+    }
     renderRoster();
     renderGovernanceTraps(spans);
   } catch (err) {
@@ -598,32 +676,40 @@ function renderRoster() {
   const rosterList = $("agentRosterList");
   if (!rosterList) return;
 
-  if (!AGENTS.length && STATE.channelsSummary) {
-    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_SPANS, LAST_TRACED_RUN_ID);
+  if (!ALL_DESK_AGENTS.length && STATE.channelsSummary) {
+    ALL_DESK_AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_SPANS, LAST_TRACED_RUN_ID);
+    AGENTS = ALL_DESK_AGENTS.filter((a) => a.spans && a.spans.length > 0);
     window.AGENTS = AGENTS;
+    syncTraceBarVisibility();
     buildMenu();
     if (AGENTS.length) pick(0);
   }
 
-  if (!AGENTS.length) {
+  if (!ALL_DESK_AGENTS.length) {
     rosterList.innerHTML = "<div class='item'><p class='rd'>Loading 8-agent desk &amp; 5 live channels…</p></div>";
     return;
   }
 
-  rosterList.innerHTML = AGENTS.map((a, idx) => {
+  rosterList.innerHTML = ALL_DESK_AGENTS.map((a) => {
     const label = (a.i ? a.i + " · " : "") + a.name;
     const sub = a.subline || "Idle";
-    const badgeClass = a.spans && a.spans.length ? "tag ok" : "tag";
-    return `<div class="item ${a.state}" style="cursor:pointer" data-step="${idx}">
+    const hasSpans = a.spans && a.spans.length > 0;
+    const badgeClass = hasSpans ? "tag ok" : "tag";
+    const cursorStyle = hasSpans ? "cursor:pointer" : "cursor:default";
+    return `<div class="item ${a.state}" style="${cursorStyle}" data-agent-key="${escapeHtml(a.k)}">
       <div class="item-top"><span class="dot"></span>
       <span class="nm">${escapeHtml(label)}</span><span class="${badgeClass}">${escapeHtml(a.ms)}</span></div>
       <p class="rd">${escapeHtml(sub)}</p></div>`;
   }).join("");
 
-  rosterList.querySelectorAll("[data-step]").forEach((el) => {
+  rosterList.querySelectorAll("[data-agent-key]").forEach((el) => {
     el.addEventListener("click", () => {
-      pick(Number(el.getAttribute("data-step")));
-      setTrace(true);
+      const key = el.getAttribute("data-agent-key");
+      const loggedIdx = AGENTS.findIndex((ag) => ag.k === key);
+      if (loggedIdx >= 0) {
+        pick(loggedIdx);
+        setTrace(true);
+      }
     });
   });
 }
@@ -1130,8 +1216,11 @@ function renderGovernanceTraps(spans) {
         STATE.auditSweep = data.audit_sweep;
         renderAuditSweepState(data.audit_sweep);
       }
+      renderToolTrajectoryTags(data.tool_trajectory);
+      renderVeracityAudit(data.veracity_evaluation);
       await fetchAndRenderTrace(data.run_id);
       revealStepsInOrder();
+      subscribeToSynthesisStream(DEFAULT_CUSTOMER_ID, question, data.run_id);
     } catch (err) {
       console.error("replay failed", err);
       setRunMetaText("Replay failed — " + err.message);
@@ -1442,24 +1531,9 @@ function renderGovernanceTraps(spans) {
       // Backend key is tool_trajectory. The old read of data.tool_sequence
       // never matched, so the UI drew a hardcoded four-tool list on every
       // answer whether or not the desk had said anything about tools.
-      const steps = Array.isArray(data.tool_trajectory) ? data.tool_trajectory : [];
-      if ($("askToolTags")) {
-        $("askToolTags").innerHTML = steps.length
-          ? steps
-              .map(
-                (s, idx) =>
-                  `<span class="tag ${idx === steps.length - 1 ? "on" : "ok"}" title="status ${escapeHtml(
-                    pvText(s.status)
-                  )} · ${escapeHtml(pvSource(s.tool))}">${idx + 1}. ${escapeHtml(
-                    pvText(s.tool)
-                  )} · ${escapeHtml(pvText(s.status))}</span>`
-              )
-              .join("")
-          : `<span class="tag">${NOT_RECORDED}</span>`;
-      }
-
+      renderToolTrajectoryTags(data.tool_trajectory);
       renderVeracityAudit(data.veracity_evaluation);
-      subscribeToSynthesisStream(customerId, query);
+      subscribeToSynthesisStream(customerId, query, data.run_id);
     } catch (err) {
       if ($("askAnswerBody")) {
         $("askAnswerBody").innerHTML = `<span style="color:var(--bad);">Error communicating with desk: ${escapeHtml(
@@ -1472,6 +1546,25 @@ function renderGovernanceTraps(spans) {
         askBtn.textContent = "Send →";
       }
     }
+  }
+
+  function renderToolTrajectoryTags(trajectory) {
+    const steps = Array.isArray(trajectory) ? trajectory : [];
+    const el = $("askToolTags");
+    if (!el) return;
+    el.innerHTML = steps.length
+      ? steps
+          .map((s, idx) => {
+            const lat = pvText(s.latency);
+            const latSuffix = lat && lat !== NOT_RECORDED ? ` (${escapeHtml(lat)})` : "";
+            return `<span class="tag ${idx === steps.length - 1 ? "on" : "ok"}" title="status ${escapeHtml(
+              pvText(s.status)
+            )} · ${escapeHtml(pvSource(s.tool))}">${idx + 1}. ${escapeHtml(
+              pvText(s.tool)
+            )} · ${escapeHtml(pvText(s.status))}${latSuffix}</span>`;
+          })
+          .join("")
+      : `<span class="tag">${NOT_RECORDED}</span>`;
   }
 
   function formatAgentReply(rawText) {
@@ -1553,24 +1646,27 @@ function renderGovernanceTraps(spans) {
     if (!list) return;
     const li = document.createElement("li");
     li.className = kind || "";
-    li.innerHTML = text;
-    list.appendChild(li);
+    li.innerHTML = `<span class="t">SSE</span><span class="e">${text}</span>`;
+    if (list.firstChild) {
+      list.insertBefore(li, list.firstChild);
+    } else {
+      list.appendChild(li);
+    }
   }
 
-  function subscribeToSynthesisStream(customerId, prompt) {
+  function subscribeToSynthesisStream(customerId, prompt, runId) {
     if (typeof EventSource === "undefined") return;
     if (STATE.stream) {
       STATE.stream.close();
       STATE.stream = null;
     }
-    const list = $("eventStreamList");
-    if (list) list.innerHTML = "";
 
     const url =
       "/api/chat/stream?customer_id=" +
       encodeURIComponent(customerId) +
       "&prompt=" +
-      encodeURIComponent(prompt);
+      encodeURIComponent(prompt) +
+      (runId ? "&run_id=" + encodeURIComponent(runId) : "");
     const source = new EventSource(url);
     STATE.stream = source;
 
@@ -1609,14 +1705,18 @@ function renderGovernanceTraps(spans) {
         appendStreamLine("<b>a2ui</b> — synthesis card delivered");
         source.close();
         STATE.stream = null;
-        setStampText("stream complete");
+        if (runId) {
+          fetchAndRenderTrace(runId);
+        }
       }
     };
 
     source.onerror = () => {
-      appendStreamLine("<b>stream closed</b>", "bad");
       source.close();
       STATE.stream = null;
+      if (runId) {
+        fetchAndRenderTrace(runId);
+      }
     };
   }
 
@@ -1739,7 +1839,18 @@ function renderGovernanceTraps(spans) {
         return;
       }
       updateOversightUI(data);
-      setStampText("SUPERVISOR LOGGED");
+      if (data.snapshot) {
+        STATE.channelsSummary = STATE.channelsSummary || {};
+        STATE.channelsSummary.snapshot = data.snapshot;
+        renderChannelEventStream(data.snapshot);
+      }
+      if (data.tool_trajectory) {
+        renderToolTrajectoryTags(data.tool_trajectory);
+      }
+      if (data.run_id) {
+        await fetchAndRenderTrace(data.run_id);
+      }
+      setStampText("SUPERVISOR LOGGED · " + (data.run_id || ""));
     } catch (err) {
       console.error("Card oversight decision error:", err);
     } finally {
@@ -1778,6 +1889,12 @@ function renderGovernanceTraps(spans) {
       if (btn) {
         btn.textContent = `Consolidation requested · ${before} in scope · saved ${pct}`;
         btn.title = `${pvTag(report.token_reduction_pct)} · ${pvSource(report.token_reduction_pct)}`;
+      }
+      if (data.tool_trajectory) {
+        renderToolTrajectoryTags(data.tool_trajectory);
+      }
+      if (data.run_id) {
+        await fetchAndRenderTrace(data.run_id);
       }
       await loadLiveTestbed(DEFAULT_CUSTOMER_ID);
     } catch (err) {
@@ -2166,8 +2283,10 @@ function renderGovernanceTraps(spans) {
         renderAuditSweepState(data.audit_sweep);
       }
 
-      AGENTS = buildDeskAgentEntries(data, LAST_TRACED_SPANS, LAST_TRACED_RUN_ID);
+      ALL_DESK_AGENTS = buildDeskAgentEntries(data, LAST_TRACED_SPANS, LAST_TRACED_RUN_ID);
+      AGENTS = ALL_DESK_AGENTS.filter((a) => a.spans && a.spans.length > 0);
       window.AGENTS = AGENTS;
+      syncTraceBarVisibility();
       buildMenu();
       if (AGENTS.length) pick(0);
       renderRoster();
