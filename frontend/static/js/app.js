@@ -237,7 +237,176 @@ function groupSpansIntoSteps(spans, t0) {
   return steps;
 }
 
-function buildDeskAgentEntries(summary, tracedSteps) {
+function formatLiveSpanRow(span, t0) {
+  const rel = (ms) => "+" + ((ms - t0) / 1000).toFixed(2) + "s";
+  const f = span.fields || {};
+  const o = span.outcome || {};
+  const subject = f.table || f.column || f.sql || f.search || f.scope || "";
+  let kind = "tool";
+  let what = span.label + (subject ? " " + subject : "");
+  let isDeny = false;
+  let isConditional = false;
+  let isBqJob = false;
+  let isAdHocSql = false;
+  let isContract = false;
+
+  if (o.action) {
+    if (REFUSAL_ACTIONS.has(o.action)) {
+      kind = "deny";
+      isDeny = true;
+    } else if (o.action !== "ALLOW") {
+      isConditional = true;
+    }
+    what = subject + " → " + o.action + (o.evidence ? " · " + o.evidence : "");
+  } else if (/^golden_query\./.test(span.label)) {
+    isContract = true;
+    what =
+      span.label +
+      (f.tool ? " · " + f.tool : "") +
+      (o.rows != null ? " · " + o.rows + " rows" : "");
+  } else if (span.label === "bigquery.query") {
+    kind = "out";
+    isBqJob = true;
+    if (!/\.sql$/.test(String(f.sql || ""))) isAdHocSql = true;
+    what =
+      (f.sql || "query") +
+      " · " +
+      (o.rows != null ? o.rows + " rows" : "n/r rows") +
+      (o.job_id ? " · job " + o.job_id : "");
+  } else if (span.label === "channel.produce") {
+    kind = "out";
+    what =
+      "channel.produce [" +
+      (f.channel || "n/r") +
+      "] · " +
+      (o.sessions != null ? o.sessions + " sessions" : "n/r") +
+      " · " +
+      (o.memories != null ? o.memories + " memories" : "n/r") +
+      " (considered " +
+      (o.considered != null ? o.considered : "n/r") +
+      ")";
+  } else if (span.label === "channel.ingest") {
+    kind = "out";
+    what =
+      "channel.ingest [" +
+      (f.channel || "n/r") +
+      "] · session " +
+      (o.session_id || "n/r") +
+      (o.turns != null ? " · " + o.turns + " turns written" : "");
+  } else if (span.label === "fraud.card_control_or_escalate") {
+    kind = "out";
+    what =
+      "execute_fraud_card_control_or_escalate [" +
+      (f.action || "CARD_BLOCK") +
+      "] · suspicious=" +
+      (o.suspicious_rows != null ? o.suspicious_rows : "n/r") +
+      " · geo=" +
+      (o.geo_rows != null ? o.geo_rows : "n/r");
+  } else if (span.label === "memory.retrieve") {
+    kind = "out";
+    what =
+      "memory.retrieve [" +
+      (f.scope || "CUST00001") +
+      "] · query=\"" +
+      (f.query || "") +
+      "\" → " +
+      (o.memories != null ? o.memories + " memories" : "n/r");
+  } else if (span.label === "catalog.discover") {
+    what =
+      "catalog.discover " +
+      (f.search || "") +
+      " · " +
+      (o.entries != null ? o.entries : "n/r") +
+      " entries · " +
+      (o.tables != null ? o.tables : "n/r") +
+      " tables";
+  } else if (/^phase\./.test(span.label)) {
+    kind = "out";
+    what =
+      phaseName(span.label) +
+      (o.status ? " · status=" + o.status : "") +
+      (o.confidence != null ? " · conf=" + o.confidence : "") +
+      (o.sessions != null ? " · " + o.sessions + " sessions" : "") +
+      (o.resolved != null ? " · " + o.resolved + " glossary terms" : "") +
+      (o.operation ? " · op=" + String(o.operation).split("/").pop() : "");
+  }
+
+  if (span.depth > 1) {
+    what = "\u00a0\u00a0".repeat(span.depth - 1) + "└ " + what;
+  }
+  if (span.state === "error") {
+    kind = "deny";
+    isDeny = true;
+    what += " · " + (span.error || "failed");
+  }
+
+  return {
+    row: [rel(span.started_ms), kind, what, span.elapsed_ms.toFixed(0) + "ms", "nest"],
+    elapsed_ms: span.elapsed_ms || 0,
+    isDeny,
+    isConditional,
+    isBqJob,
+    isAdHocSql,
+    isContract,
+  };
+}
+
+function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
+  const f = span.fields || {};
+  const lbl = span.label || "";
+  const ag = f.agent || "";
+  const ch = (f.channel || "").toUpperCase();
+  const tool = f.tool || activeGoldenTool || "";
+
+  // Anything inside phase.3_veracity belongs to 06 claim_veracity_validator_agent
+  if (activePhase === "phase.3_veracity" || lbl === "phase.3_veracity") {
+    return ["claim_veracity_validator_agent"];
+  }
+  if (lbl === "audit.consolidated_sweep" || ag === "memory_bank_audit_agent") {
+    return ["memory_bank_audit_agent"];
+  }
+  if (lbl === "channel.produce") {
+    if (ag) return [ag, "consumer_credit_synthesizer_agent"];
+    if (ch.indexOf("FRAUD") >= 0) return ["fraud_monitoring_agent", "consumer_credit_synthesizer_agent"];
+    if (ch.indexOf("IVR") >= 0 || ch.indexOf("TELEPHONY") >= 0) return ["telephony_ivr_agent", "consumer_credit_synthesizer_agent"];
+    if (ch.indexOf("MOBILE") >= 0) return ["mobile_app_agent", "consumer_credit_synthesizer_agent"];
+    if (ch.indexOf("WEB") >= 0) return ["web_portal_agent", "consumer_credit_synthesizer_agent"];
+    if (ch.indexOf("BRANCH") >= 0) return ["branch_support_agent", "consumer_credit_synthesizer_agent"];
+  }
+  if (lbl === "channel.ingest") {
+    const targets = ["consumer_credit_synthesizer_agent"];
+    if (ch.indexOf("FRAUD") >= 0) targets.unshift("fraud_monitoring_agent");
+    else if (ch.indexOf("IVR") >= 0) targets.unshift("telephony_ivr_agent");
+    else if (ch.indexOf("MOBILE") >= 0) targets.unshift("mobile_app_agent");
+    else if (ch.indexOf("WEB") >= 0) targets.unshift("web_portal_agent");
+    else if (ch.indexOf("BRANCH") >= 0) targets.unshift("branch_support_agent");
+    return targets;
+  }
+  if (lbl === "fraud.card_control_or_escalate") {
+    return ["fraud_monitoring_agent", "consumer_credit_synthesizer_agent"];
+  }
+  if (tool.indexOf("golden_03") >= 0 || tool.indexOf("golden_04") >= 0) {
+    return ["fraud_monitoring_agent"];
+  }
+  if (tool.indexOf("golden_02") >= 0) {
+    return ["telephony_ivr_agent"];
+  }
+  if (tool.indexOf("golden_10") >= 0) {
+    return ["mobile_app_agent"];
+  }
+  if (tool.indexOf("golden_07") >= 0 || lbl === "phase.2_glossary" || lbl === "catalog.lookup_term") {
+    return ["web_portal_agent", "consumer_credit_synthesizer_agent"];
+  }
+  if (tool.indexOf("golden_01") >= 0) {
+    return ["branch_support_agent", "consumer_credit_synthesizer_agent"];
+  }
+  return ["consumer_credit_synthesizer_agent"];
+}
+
+let LAST_TRACED_SPANS = [];
+let LAST_TRACED_RUN_ID = "";
+
+function buildDeskAgentEntries(summary, rawSpans, runId) {
   const deskAgents = (summary && Array.isArray(summary.agents)) ? summary.agents : [];
   const channelMap = {};
   if (summary && summary.snapshot && Array.isArray(summary.snapshot.channels)) {
@@ -247,144 +416,159 @@ function buildDeskAgentEntries(summary, tracedSteps) {
     });
   }
 
-  const entries = deskAgents.map((ag, idx) => {
+  const hasLiveRun = Array.isArray(rawSpans) && rawSpans.length > 0;
+  const sortedSpans = hasLiveRun ? rawSpans.slice().sort((a, b) => a.started_ms - b.started_ms) : [];
+  const t0 = hasLiveRun ? sortedSpans[0].started_ms : 0;
+
+  const byAgent = {};
+  deskAgents.forEach((ag) => {
+    byAgent[ag.name] = {
+      rows: [],
+      elapsedMs: 0,
+      deny: 0,
+      conditional: 0,
+      jobs: 0,
+      sql: 0,
+      contracts: 0,
+    };
+  });
+
+  if (hasLiveRun) {
+    let activePhase = "";
+    let activeGoldenTool = "";
+    sortedSpans.forEach((span) => {
+      if (span.depth === 0 && /^phase\./.test(span.label || "")) {
+        activePhase = span.label;
+        activeGoldenTool = "";
+      } else if (span.depth === 1 && /^golden_query\./.test(span.label || "")) {
+        activeGoldenTool = (span.fields && span.fields.tool) || span.label;
+      } else if (span.depth === 1 && !/^golden_query\./.test(span.label || "")) {
+        activeGoldenTool = "";
+      }
+
+      const formatted = formatLiveSpanRow(span, t0);
+      const targets = routeSpanToAgentNames(span, activePhase, activeGoldenTool);
+      targets.forEach((agName) => {
+        const bucket = byAgent[agName];
+        if (!bucket) return;
+        bucket.rows.push(formatted.row);
+        if (span.depth <= 1) bucket.elapsedMs += formatted.elapsed_ms;
+        if (formatted.isDeny) bucket.deny++;
+        if (formatted.isConditional) bucket.conditional++;
+        if (formatted.isBqJob) bucket.jobs++;
+        if (formatted.isAdHocSql) bucket.sql++;
+        if (formatted.isContract) bucket.contracts++;
+      });
+    });
+  }
+
+  return deskAgents.map((ag, idx) => {
     const num = idx + 1 < 10 ? "0" + (idx + 1) : String(idx + 1);
     const ch = channelMap[ag.agent_id] || channelMap[ag.name];
     const isAudit = ag.name === "memory_bank_audit_agent";
-    const isHub = ag.name === "consumer_credit_synthesizer_agent";
-    const toolsList = Array.isArray(ag.tools) ? ag.tools : [];
+    const bucket = byAgent[ag.name] || { rows: [], elapsedMs: 0, deny: 0, conditional: 0, jobs: 0, sql: 0, contracts: 0 };
 
-    const spans = [];
-    let msLabel = "LIVE";
-    let subline = ag.role || "";
-
-    if (ch) {
-      msLabel = ch.channel_label + " · " + ch.session_count + " sess";
-      subline = `${ch.session_count} sessions · ${ch.event_count} events · ${ch.memory_count} memories · ${toolsList.length} tools`;
-      spans.push([
-        "channel",
-        "out",
-        `${ch.channel_label} producer · ${ch.session_count} sessions · ${ch.event_count} events · ${ch.memory_count} memories in scope`,
-        "LIVE",
-        "nest",
-      ]);
-      (ch.events || []).slice(0, 5).forEach((ev, eIdx) => {
-        const ts = String(ev.timestamp || "").replace(/^.*T/, "").slice(0, 8) || ("turn " + (eIdx + 1));
-        spans.push([
-          ts,
-          "tool",
-          `[${ev.author || ch.channel_label}] (${ev.session_id || ""}) ${ev.text || ""}`,
-          "event",
-          "nest",
-        ]);
-      });
-    } else if (isAudit) {
-      const st = (STATE.auditSweep && STATE.auditSweep.status) || "IDLE";
-      msLabel = "ASYNC · " + st;
-      subline = "95s consolidated sweep kept off synchronous turn path · trigger on demand";
-      spans.push([
-        "schedule",
-        "tool",
-        `run_consolidated_memory_audit_sweep · status=${st} (off synchronous turn path)`,
-        "~95s",
-        "nest",
-      ]);
-    } else if (isHub) {
-      const totSess = (summary && summary.snapshot && summary.snapshot.total_sessions) || 0;
-      msLabel = "HUB · 7 SPOKES";
-      subline = `Synthesizes ${totSess} sessions across 5 channels + Dataplex glossary`;
-      spans.push([
-        "hub",
-        "out",
-        `Lead synthesizer orchestrating 5 channel producers + veracity gate + audit sweeper (${totSess} sessions)`,
-        "LIVE",
-        "nest",
-      ]);
-    } else {
-      msLabel = "GATE · LIVE";
-      spans.push([
-        "gate",
-        "out",
-        `${ag.description || ag.role || ag.name}`,
-        "LIVE",
-        "nest",
-      ]);
+    if (!hasLiveRun) {
+      const chBadge = ch ? `${ch.channel_label} · IDLE` : (isAudit ? "ASYNC · IDLE" : "IDLE");
+      const idleSub = ch
+        ? `Idle (${ch.session_count} sessions in Memory Bank) — click Replay run → or + Inject live event to trace`
+        : (isAudit
+            ? "Async 95s sweep (kept off turn path) — click ▶ Run 95s audit sweep to trace"
+            : "Idle — click Replay run → or Send → to execute and stream live traces");
+      return {
+        k: ag.agent_id || ag.name,
+        i: num,
+        name: ag.name,
+        ms: chBadge,
+        subline: idleSub,
+        state: "queue",
+        refusals: 0,
+        tools: 0,
+        deny: 0,
+        sql: 0,
+        jobs: 0,
+        conditional: 0,
+        contracts: 0,
+        started: "n/r",
+        ended: "n/r",
+        spans: [],
+        foot: [
+          ["run", "none"],
+          ["spans", "0"],
+          ["refusals", "0"],
+          ["bq jobs", "0"],
+          ["ad-hoc sql", "0"],
+        ],
+      };
     }
 
-    toolsList.forEach((tName) => {
-      spans.push(["tool", "tool", `FunctionTool: ${tName}`, "bound", "nest"]);
-    });
+    const secsLabel = bucket.rows.length
+      ? (bucket.elapsedMs >= 1000 ? (bucket.elapsedMs / 1000).toFixed(1) + "s" : Math.max(1, Math.round(bucket.elapsedMs)) + "ms")
+      : (isAudit ? "ASYNC · 0ms" : "0ms");
+
+    const runSub = bucket.rows.length
+      ? `[run ${runId}] ${bucket.rows.length} live spans · ${bucket.jobs} bq · ${bucket.deny} refused · ${secsLabel}`
+      : (isAudit
+          ? `[run ${runId}] 0 spans (async 95s sweep kept off synchronous turn path)`
+          : `[run ${runId}] 0 spans triggered in this scenario`);
 
     return {
       k: ag.agent_id || ag.name,
       i: num,
       name: ag.name,
-      ms: msLabel,
-      subline: subline,
-      state: "done",
-      refusals: 0,
-      tools: toolsList.length,
-      deny: 0,
-      sql: 0,
-      jobs: 0,
-      conditional: 0,
-      contracts: 0,
-      started: "0.00s",
-      ended: "live",
-      spans: spans,
+      ms: secsLabel,
+      subline: runSub,
+      state: bucket.rows.length ? "done" : "queue",
+      refusals: bucket.deny,
+      tools: bucket.rows.length,
+      deny: bucket.deny,
+      sql: bucket.sql,
+      jobs: bucket.jobs,
+      conditional: bucket.conditional,
+      contracts: bucket.contracts,
+      started: "+0.00s",
+      ended: secsLabel,
+      spans: bucket.rows,
       foot: [
-        ["tools", String(toolsList.length)],
-        ["sessions", ch ? String(ch.session_count) : "n/r"],
-        ["events", ch ? String(ch.event_count) : "n/r"],
-        ["memories", ch ? String(ch.memory_count) : "n/r"],
-        ["refusals", "0"],
-        ["ad-hoc sql", "0"],
+        ["run", String(runId || "live")],
+        ["tools", String(bucket.rows.length)],
+        ["refusals", String(bucket.deny)],
+        ["owner-only", String(bucket.conditional)],
+        ["bq jobs", String(bucket.jobs)],
+        ["ad-hoc sql", String(bucket.sql)],
       ],
     };
   });
-
-  if (Array.isArray(tracedSteps) && tracedSteps.length) {
-    tracedSteps.forEach((s, idx) => {
-      s.i = "P" + idx;
-      s.subline = `${s.tools} spans · ${s.contracts} golden · ${s.deny} refused · ${s.jobs} bq`;
-      entries.push(s);
-    });
-  }
-  return entries;
 }
-
-let LAST_TRACED_STEPS = [];
 
 async function fetchAndRenderTrace(runId) {
   try {
-    const resp = await fetch("/api/trace/" + (runId || "latest"));
+    if (!runId) {
+      renderRoster();
+      return;
+    }
+    const resp = await fetch("/api/trace/" + runId);
     if (!resp.ok) {
-      AGENTS = buildDeskAgentEntries(STATE.channelsSummary, []);
-      window.AGENTS = AGENTS;
-      buildMenu();
-      if (AGENTS.length) pick(0);
       renderRoster();
       return;
     }
     const data = await resp.json();
     const spans = (data.spans || []).slice().sort((a, b) => a.started_ms - b.started_ms);
     if (!spans.length) {
-      AGENTS = buildDeskAgentEntries(STATE.channelsSummary, []);
-      window.AGENTS = AGENTS;
-      buildMenu();
-      if (AGENTS.length) pick(0);
       renderRoster();
       return;
     }
+
+    LAST_TRACED_SPANS = spans;
+    LAST_TRACED_RUN_ID = data.run_id || runId;
 
     const t0 = spans[0].started_ms;
     const last = spans.reduce((m, s) => Math.max(m, s.started_ms + s.elapsed_ms), t0);
     const wall = ((last - t0) / 1000).toFixed(1) + "s";
     const steps = groupSpansIntoSteps(spans, t0);
-    LAST_TRACED_STEPS = steps;
-    const runMeta = "Run " + (data.run_id || "n/r");
+    const runMeta = "Run " + LAST_TRACED_RUN_ID;
 
-    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, steps);
+    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, spans, LAST_TRACED_RUN_ID);
     window.AGENTS = AGENTS;
 
     const totals = steps.reduce(
@@ -392,15 +576,17 @@ async function fetchAndRenderTrace(runId) {
       { deny: 0, sql: 0, jobs: 0 }
     );
 
-    setAgentCountText("8 agents · " + steps.length + " phases");
-    setRunMetaText(runMeta + " · 8-agent desk · " + steps.length + " phases · " + wall);
+    setAgentCountText("8 agents · " + spans.length + " live spans");
+    setRunMetaText(runMeta + " · 8-agent desk · " + spans.length + " live spans · " + wall);
     setStampText(runMeta + " · " + wall + " · ad-hoc SQL " + totals.sql);
     setTruthEngineText(
-      "8-agent hub-and-spoke · 5 live channels · " + steps.length + " phases in " + wall + " · " +
+      runMeta + " · 8-agent hub-and-spoke · " + spans.length + " live spans in " + wall + " · " +
       totals.jobs + " BigQuery jobs · " + totals.deny + " refusals · ad-hoc SQL " + totals.sql
     );
     buildMenu();
-    pick(0);
+    const firstActive = AGENTS.findIndex((a) => a.spans && a.spans.length > 0);
+    pick(firstActive >= 0 ? firstActive : 0);
+    setTrace(true);
     renderRoster();
     renderGovernanceTraps(spans);
   } catch (err) {
@@ -413,7 +599,7 @@ function renderRoster() {
   if (!rosterList) return;
 
   if (!AGENTS.length && STATE.channelsSummary) {
-    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_STEPS);
+    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_SPANS, LAST_TRACED_RUN_ID);
     window.AGENTS = AGENTS;
     buildMenu();
     if (AGENTS.length) pick(0);
@@ -426,10 +612,11 @@ function renderRoster() {
 
   rosterList.innerHTML = AGENTS.map((a, idx) => {
     const label = (a.i ? a.i + " · " : "") + a.name;
-    const sub = a.subline || `${a.tools} spans · ${a.contracts} golden · ${a.deny} refused · ${a.jobs} bq`;
+    const sub = a.subline || "Idle";
+    const badgeClass = a.spans && a.spans.length ? "tag ok" : "tag";
     return `<div class="item ${a.state}" style="cursor:pointer" data-step="${idx}">
       <div class="item-top"><span class="dot"></span>
-      <span class="nm">${escapeHtml(label)}</span><span class="tag ok">${escapeHtml(a.ms)}</span></div>
+      <span class="nm">${escapeHtml(label)}</span><span class="${badgeClass}">${escapeHtml(a.ms)}</span></div>
       <p class="rd">${escapeHtml(sub)}</p></div>`;
   }).join("");
 
@@ -579,6 +766,7 @@ function renderGovernanceTraps(spans) {
   }
 
   function headline(a) {
+    if (!a || !Array.isArray(a.spans) || !a.spans.length) return null;
     const outs = a.spans.filter((s) => s[1] === "out");
     if (outs.length) return outs[outs.length - 1];
     const tools = a.spans.filter((s) => s[1] === "tool");
@@ -592,6 +780,21 @@ function renderGovernanceTraps(spans) {
     const kind = $("biKind");
     const text = $("biText");
     const metrics = $("biMetrics");
+    if (!h) {
+      if (kind) {
+        kind.className = "bk";
+        kind.textContent = "IDLE";
+      }
+      if (text) {
+        text.className = "bt";
+        text.textContent = a.subline || "No live run executed in this session yet — click Replay run →";
+        text.title = text.textContent;
+      }
+      if (metrics) {
+        metrics.innerHTML = "<span>0ms</span><span>spans <b>0</b></span><span>deny <b>0</b></span><span class='zero'>sql <b>0</b></span>";
+      }
+      return;
+    }
     if (kind && h) {
       kind.className = "bk " + h[1];
       kind.textContent = h[1];
@@ -612,7 +815,7 @@ function renderGovernanceTraps(spans) {
         "<span>" +
         a.ms +
         "</span>" +
-        "<span>tools <b>" +
+        "<span>spans <b>" +
         get("tools") +
         "</b></span>" +
         '<span class="' +
@@ -633,9 +836,14 @@ function renderGovernanceTraps(spans) {
     const whoTxt = $("whoTxt");
     const body = $("body");
     if (whoTxt) {
-      whoTxt.innerHTML = a.i + " · <b>" + a.name + "</b> · " + a.state + " · " + a.ms;
+      whoTxt.innerHTML = a.i + " · <b>" + a.name + "</b> · " + (a.spans && a.spans.length ? "traced" : "idle") + " · " + a.ms;
     }
     if (body) {
+      if (!a.spans || !a.spans.length) {
+        body.innerHTML =
+          '<p class="pending">No live trace recorded in this browser session yet — click <b>Replay run →</b>, <b>Send →</b>, or <b>+ Inject live event</b> to execute the agents and stream live spans here.</p>';
+        return;
+      }
       let html = a.pending && (a.state === "running" || a.state === "run")
         ? '<p class="pending">' + a.pending + "</p>"
         : "";
@@ -1779,6 +1987,36 @@ function renderGovernanceTraps(spans) {
       btnRestrict.addEventListener("click", () => submitCardDecision("KEEP_RESTRICTED"));
     }
 
+    // 8. Memory Bank Compaction (#btnRunCompaction)
+    const btnCompaction = $("btnRunCompaction");
+    if (btnCompaction) {
+      btnCompaction.addEventListener("click", runMemoryCompaction);
+    }
+
+    // 9. Live 5-channel ingestion (B), fraud card control (C), and async 95s audit sweep (4)
+    const chSel = $("channelIngestSelect");
+    if (chSel) chSel.addEventListener("change", populateChannelPresetPicker);
+    const presetSel = $("channelPresetSelect");
+    if (presetSel) presetSel.addEventListener("change", renderSelectedChannelPresetPreview);
+    const btnInject = $("btnInjectChannelEvent");
+    if (btnInject) btnInject.addEventListener("click", injectLiveChannelEvent);
+    const btnFraud = $("btnFraudCardControl");
+    if (btnFraud) btnFraud.addEventListener("click", triggerFraudCardControl);
+    const btnSweep = $("btnTriggerAuditSweep");
+    if (btnSweep) btnSweep.addEventListener("click", triggerAsyncAuditSweep);
+
+    // Initial background data hydration for canonical CUST00001
+    // Note: we intentionally do NOT call fetchAndRenderTrace('latest') on page
+    // load so every browser refresh starts with all 8 agents in clean IDLE state
+    // (0 spans) until the operator runs a scenario or injects a live event.
+    loadScenarios();
+    loadChannelsAndRosterSummary(DEFAULT_CUSTOMER_ID);
+    loadDeploymentIdentity(DEFAULT_CUSTOMER_ID);
+    loadEvalScorecard();
+    loadLiveTestbed(DEFAULT_CUSTOMER_ID);
+    loadCardOversight(DEFAULT_CUSTOMER_ID);
+  }
+
   function renderChannelEventStream(snapshot) {
     const streamList = $("eventStreamList");
     const badge = $("eventStreamColBadge");
@@ -1928,20 +2166,20 @@ function renderGovernanceTraps(spans) {
         renderAuditSweepState(data.audit_sweep);
       }
 
-      AGENTS = buildDeskAgentEntries(data, LAST_TRACED_STEPS);
+      AGENTS = buildDeskAgentEntries(data, LAST_TRACED_SPANS, LAST_TRACED_RUN_ID);
       window.AGENTS = AGENTS;
       buildMenu();
       if (AGENTS.length) pick(0);
       renderRoster();
 
-      if (!LAST_TRACED_STEPS.length && data.snapshot) {
+      if (!LAST_TRACED_SPANS.length && data.snapshot) {
         const totSess = data.snapshot.total_sessions || 0;
         const totEv = data.snapshot.total_events || 0;
-        setAgentCountText("8 agents · 5 channels");
-        setRunMetaText(`8-agent hub-and-spoke desk · ${totSess} live sessions (${totEv} events) across 5 channels`);
-        setStampText(`${totSess} sessions · 5 channels live`);
+        setAgentCountText("8 agents · IDLE");
+        setRunMetaText(`8-agent desk ready (idle) · ${totSess} live sessions (${totEv} events) across 5 channels — click Replay run →`);
+        setStampText(`IDLE · ${totSess} sessions across 5 channels`);
         setTruthEngineText(
-          `8-agent desk ready · FRAUD_OPS_OUTBOUND, IVR, MOBILE_APP, WEB_CHAT, BRANCH (${totSess} sessions in Memory Bank)`
+          `Idle — click Replay run → or Send → to trace live calls across the 8 agents & 5 channels (${totSess} sessions in Memory Bank)`
         );
       }
     } catch (err) {
@@ -1978,10 +2216,6 @@ function renderGovernanceTraps(spans) {
         STATE.channelsSummary = STATE.channelsSummary || {};
         STATE.channelsSummary.snapshot = data.snapshot;
         renderChannelEventStream(data.snapshot);
-        AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_STEPS);
-        window.AGENTS = AGENTS;
-        buildMenu();
-        renderRoster();
       }
       if (data.run_id) {
         await fetchAndRenderTrace(data.run_id);
@@ -2023,10 +2257,6 @@ function renderGovernanceTraps(spans) {
         STATE.channelsSummary = STATE.channelsSummary || {};
         STATE.channelsSummary.snapshot = data.snapshot;
         renderChannelEventStream(data.snapshot);
-        AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_STEPS);
-        window.AGENTS = AGENTS;
-        buildMenu();
-        renderRoster();
       }
       if (data.run_id) {
         await fetchAndRenderTrace(data.run_id);
@@ -2054,35 +2284,6 @@ function renderGovernanceTraps(spans) {
     } catch (err) {
       console.error("triggerAsyncAuditSweep failed", err);
     }
-  }
-
-    // 8. Memory Bank Compaction (#btnRunCompaction)
-    const btnCompaction = $("btnRunCompaction");
-    if (btnCompaction) {
-      btnCompaction.addEventListener("click", runMemoryCompaction);
-    }
-
-    // 9. Live 5-channel ingestion (B), fraud card control (C), and async 95s audit sweep (4)
-    const chSel = $("channelIngestSelect");
-    if (chSel) chSel.addEventListener("change", populateChannelPresetPicker);
-    const presetSel = $("channelPresetSelect");
-    if (presetSel) presetSel.addEventListener("change", renderSelectedChannelPresetPreview);
-    const btnInject = $("btnInjectChannelEvent");
-    if (btnInject) btnInject.addEventListener("click", injectLiveChannelEvent);
-    const btnFraud = $("btnFraudCardControl");
-    if (btnFraud) btnFraud.addEventListener("click", triggerFraudCardControl);
-    const btnSweep = $("btnTriggerAuditSweep");
-    if (btnSweep) btnSweep.addEventListener("click", triggerAsyncAuditSweep);
-
-    // Initial background data hydration for canonical CUST00001
-    loadScenarios();
-    loadChannelsAndRosterSummary(DEFAULT_CUSTOMER_ID);
-    loadDeploymentIdentity(DEFAULT_CUSTOMER_ID);
-    loadEvalScorecard();
-    loadLiveTestbed(DEFAULT_CUSTOMER_ID);
-    loadCardOversight(DEFAULT_CUSTOMER_ID);
-    // Only operator turns belong in the Pipeline; page load also fires probes.
-    fetchAndRenderTrace('latest?kind=chat');
   }
 
   if (document.readyState === "loading") {
