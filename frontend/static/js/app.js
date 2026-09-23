@@ -237,16 +237,142 @@ function groupSpansIntoSteps(spans, t0) {
   return steps;
 }
 
+function buildDeskAgentEntries(summary, tracedSteps) {
+  const deskAgents = (summary && Array.isArray(summary.agents)) ? summary.agents : [];
+  const channelMap = {};
+  if (summary && summary.snapshot && Array.isArray(summary.snapshot.channels)) {
+    summary.snapshot.channels.forEach((ch) => {
+      channelMap[ch.agent_id] = ch;
+      channelMap[ch.agent_name] = ch;
+    });
+  }
+
+  const entries = deskAgents.map((ag, idx) => {
+    const num = idx + 1 < 10 ? "0" + (idx + 1) : String(idx + 1);
+    const ch = channelMap[ag.agent_id] || channelMap[ag.name];
+    const isAudit = ag.name === "memory_bank_audit_agent";
+    const isHub = ag.name === "consumer_credit_synthesizer_agent";
+    const toolsList = Array.isArray(ag.tools) ? ag.tools : [];
+
+    const spans = [];
+    let msLabel = "LIVE";
+    let subline = ag.role || "";
+
+    if (ch) {
+      msLabel = ch.channel_label + " · " + ch.session_count + " sess";
+      subline = `${ch.session_count} sessions · ${ch.event_count} events · ${ch.memory_count} memories · ${toolsList.length} tools`;
+      spans.push([
+        "channel",
+        "out",
+        `${ch.channel_label} producer · ${ch.session_count} sessions · ${ch.event_count} events · ${ch.memory_count} memories in scope`,
+        "LIVE",
+        "nest",
+      ]);
+      (ch.events || []).slice(0, 5).forEach((ev, eIdx) => {
+        const ts = String(ev.timestamp || "").replace(/^.*T/, "").slice(0, 8) || ("turn " + (eIdx + 1));
+        spans.push([
+          ts,
+          "tool",
+          `[${ev.author || ch.channel_label}] (${ev.session_id || ""}) ${ev.text || ""}`,
+          "event",
+          "nest",
+        ]);
+      });
+    } else if (isAudit) {
+      const st = (STATE.auditSweep && STATE.auditSweep.status) || "IDLE";
+      msLabel = "ASYNC · " + st;
+      subline = "95s consolidated sweep kept off synchronous turn path · trigger on demand";
+      spans.push([
+        "schedule",
+        "tool",
+        `run_consolidated_memory_audit_sweep · status=${st} (off synchronous turn path)`,
+        "~95s",
+        "nest",
+      ]);
+    } else if (isHub) {
+      const totSess = (summary && summary.snapshot && summary.snapshot.total_sessions) || 0;
+      msLabel = "HUB · 7 SPOKES";
+      subline = `Synthesizes ${totSess} sessions across 5 channels + Dataplex glossary`;
+      spans.push([
+        "hub",
+        "out",
+        `Lead synthesizer orchestrating 5 channel producers + veracity gate + audit sweeper (${totSess} sessions)`,
+        "LIVE",
+        "nest",
+      ]);
+    } else {
+      msLabel = "GATE · LIVE";
+      spans.push([
+        "gate",
+        "out",
+        `${ag.description || ag.role || ag.name}`,
+        "LIVE",
+        "nest",
+      ]);
+    }
+
+    toolsList.forEach((tName) => {
+      spans.push(["tool", "tool", `FunctionTool: ${tName}`, "bound", "nest"]);
+    });
+
+    return {
+      k: ag.agent_id || ag.name,
+      i: num,
+      name: ag.name,
+      ms: msLabel,
+      subline: subline,
+      state: "done",
+      refusals: 0,
+      tools: toolsList.length,
+      deny: 0,
+      sql: 0,
+      jobs: 0,
+      conditional: 0,
+      contracts: 0,
+      started: "0.00s",
+      ended: "live",
+      spans: spans,
+      foot: [
+        ["tools", String(toolsList.length)],
+        ["sessions", ch ? String(ch.session_count) : "n/r"],
+        ["events", ch ? String(ch.event_count) : "n/r"],
+        ["memories", ch ? String(ch.memory_count) : "n/r"],
+        ["refusals", "0"],
+        ["ad-hoc sql", "0"],
+      ],
+    };
+  });
+
+  if (Array.isArray(tracedSteps) && tracedSteps.length) {
+    tracedSteps.forEach((s, idx) => {
+      s.i = "P" + idx;
+      s.subline = `${s.tools} spans · ${s.contracts} golden · ${s.deny} refused · ${s.jobs} bq`;
+      entries.push(s);
+    });
+  }
+  return entries;
+}
+
+let LAST_TRACED_STEPS = [];
+
 async function fetchAndRenderTrace(runId) {
   try {
     const resp = await fetch("/api/trace/" + (runId || "latest"));
     if (!resp.ok) {
+      AGENTS = buildDeskAgentEntries(STATE.channelsSummary, []);
+      window.AGENTS = AGENTS;
+      buildMenu();
+      if (AGENTS.length) pick(0);
       renderRoster();
       return;
     }
     const data = await resp.json();
     const spans = (data.spans || []).slice().sort((a, b) => a.started_ms - b.started_ms);
     if (!spans.length) {
+      AGENTS = buildDeskAgentEntries(STATE.channelsSummary, []);
+      window.AGENTS = AGENTS;
+      buildMenu();
+      if (AGENTS.length) pick(0);
       renderRoster();
       return;
     }
@@ -255,9 +381,10 @@ async function fetchAndRenderTrace(runId) {
     const last = spans.reduce((m, s) => Math.max(m, s.started_ms + s.elapsed_ms), t0);
     const wall = ((last - t0) / 1000).toFixed(1) + "s";
     const steps = groupSpansIntoSteps(spans, t0);
+    LAST_TRACED_STEPS = steps;
     const runMeta = "Run " + (data.run_id || "n/r");
 
-    AGENTS = steps.slice().reverse(); // the bar reads newest first
+    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, steps);
     window.AGENTS = AGENTS;
 
     const totals = steps.reduce(
@@ -272,8 +399,8 @@ async function fetchAndRenderTrace(runId) {
       "8-agent hub-and-spoke · 5 live channels · " + steps.length + " phases in " + wall + " · " +
       totals.jobs + " BigQuery jobs · " + totals.deny + " refusals · ad-hoc SQL " + totals.sql
     );
-    pick(0);
     buildMenu();
+    pick(0);
     renderRoster();
     renderGovernanceTraps(spans);
   } catch (err) {
@@ -285,59 +412,27 @@ function renderRoster() {
   const rosterList = $("agentRosterList");
   if (!rosterList) return;
 
-  const summary = STATE.channelsSummary;
-  const deskAgents = (summary && Array.isArray(summary.agents)) ? summary.agents : [];
-  const channelMap = {};
-  if (summary && summary.snapshot && Array.isArray(summary.snapshot.channels)) {
-    summary.snapshot.channels.forEach((ch) => {
-      channelMap[ch.agent_id] = ch;
-      channelMap[ch.agent_name] = ch;
-    });
+  if (!AGENTS.length && STATE.channelsSummary) {
+    AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_STEPS);
+    window.AGENTS = AGENTS;
+    buildMenu();
+    if (AGENTS.length) pick(0);
   }
 
-  let html = "";
-  if (AGENTS.length) {
-    html += AGENTS.map((a, idx) => {
-      return `<div class="item ${a.state}" style="cursor:pointer" data-step="${idx}">
-        <div class="item-top"><span class="dot"></span>
-        <span class="nm">${escapeHtml(a.name)}</span><span class="tag ok">${escapeHtml(a.ms)}</span></div>
-        <p class="rd">${a.tools} spans &middot; ${a.contracts} golden &middot; ${a.deny} refused &middot; ${a.jobs} bq</p></div>`;
-    }).join("");
-  }
-
-  if (deskAgents.length) {
-    html += deskAgents.map((ag) => {
-      const ch = channelMap[ag.agent_id] || channelMap[ag.name];
-      const isAudit = ag.name === "memory_bank_audit_agent";
-      const isHub = ag.name === "consumer_credit_synthesizer_agent";
-      let badge = isAudit ? "ASYNC JOB" : (isHub ? "HUB · 7 SPOKES" : "LIVE");
-      let tagClass = isAudit ? "" : "ok";
-      let subline = escapeHtml(ag.role || "");
-      if (ch) {
-        badge = escapeHtml(ch.channel_label) + " · " + ch.session_count + " sess";
-        subline = `${ch.session_count} sessions &middot; ${ch.event_count} events &middot; ${ch.memory_count} memories &middot; ${(ag.tools || []).length} tools`;
-      } else if (isAudit) {
-        const st = (STATE.auditSweep && STATE.auditSweep.status) || "IDLE";
-        badge = "ASYNC · " + st;
-        subline = "95s consolidated sweep kept off turn path &middot; trigger on demand";
-      } else if (isHub) {
-        const totSess = (summary && summary.snapshot && summary.snapshot.total_sessions) || 0;
-        subline = `Synthesizes ${totSess} sessions across 5 channels + Dataplex glossary`;
-      }
-      return `<div class="item done">
-        <div class="item-top"><span class="dot"></span>
-        <span class="nm">${escapeHtml(ag.agent_id.replace(/_/g, " "))}</span>
-        <span class="tag ${tagClass}">${badge}</span></div>
-        <p class="rd">${subline}</p></div>`;
-    }).join("");
-  }
-
-  if (!html) {
+  if (!AGENTS.length) {
     rosterList.innerHTML = "<div class='item'><p class='rd'>Loading 8-agent desk &amp; 5 live channels…</p></div>";
     return;
   }
 
-  rosterList.innerHTML = html;
+  rosterList.innerHTML = AGENTS.map((a, idx) => {
+    const label = (a.i ? a.i + " · " : "") + a.name;
+    const sub = a.subline || `${a.tools} spans · ${a.contracts} golden · ${a.deny} refused · ${a.jobs} bq`;
+    return `<div class="item ${a.state}" style="cursor:pointer" data-step="${idx}">
+      <div class="item-top"><span class="dot"></span>
+      <span class="nm">${escapeHtml(label)}</span><span class="tag ok">${escapeHtml(a.ms)}</span></div>
+      <p class="rd">${escapeHtml(sub)}</p></div>`;
+  }).join("");
+
   rosterList.querySelectorAll("[data-step]").forEach((el) => {
     el.addEventListener("click", () => {
       pick(Number(el.getAttribute("data-step")));
@@ -795,7 +890,10 @@ function renderGovernanceTraps(spans) {
       btn.disabled = true;
       btn.textContent = "Running pipeline...";
     }
-    if (livePulse) livePulse.classList.remove("done");
+    if (livePulse) {
+      livePulse.classList.remove("done");
+      livePulse.classList.add("running");
+    }
     setRunMetaText("Running the desk against live GCP...");
     setStampText("in flight");
 
@@ -826,12 +924,15 @@ function renderGovernanceTraps(spans) {
       }
       await fetchAndRenderTrace(data.run_id);
       revealStepsInOrder();
-      if (livePulse) livePulse.classList.add("done");
     } catch (err) {
       console.error("replay failed", err);
       setRunMetaText("Replay failed — " + err.message);
       setStampText("n/r");
     } finally {
+      if (livePulse) {
+        livePulse.classList.remove("running");
+        livePulse.classList.add("done");
+      }
       if (btn) {
         btn.disabled = false;
         btn.textContent = "Replay run \u2192";
@@ -1763,6 +1864,55 @@ function renderGovernanceTraps(spans) {
     }
   }
 
+  function renderSelectedChannelPresetPreview() {
+    const chSel = $("channelIngestSelect");
+    const presetSel = $("channelPresetSelect");
+    const previewEl = $("channelTurnsPreview");
+    if (!previewEl) return;
+
+    const channel = (chSel && chSel.value) || "FRAUD_OPS_OUTBOUND";
+    const presetId = (presetSel && presetSel.value) || "";
+    const presetsByChannel = (STATE.channelsSummary && STATE.channelsSummary.presets) || {};
+    const list = Array.isArray(presetsByChannel[channel]) ? presetsByChannel[channel] : [];
+    const chosen = list.find((p) => p.preset_id === presetId) || list[0];
+
+    if (!chosen || !Array.isArray(chosen.turns)) {
+      previewEl.innerHTML = "<span class='n'>No prebaked turns for this channel.</span>";
+      return;
+    }
+
+    previewEl.innerHTML = chosen.turns.map((t, i) => {
+      const isCust = String(t.author || "").toLowerCase() === "customer";
+      const badge = isCust ? "CUSTOMER" : escapeHtml(t.author || channel);
+      return `<div style="margin-bottom:${i < chosen.turns.length - 1 ? "4px" : "0"};">
+        <span class="tag ${isCust ? "on" : "ok"}" style="margin-right:5px;font-size:9px;">${badge}</span>
+        <span>${escapeHtml(t.text || "")}</span>
+      </div>`;
+    }).join("");
+  }
+
+  function populateChannelPresetPicker() {
+    const chSel = $("channelIngestSelect");
+    const presetSel = $("channelPresetSelect");
+    if (!chSel || !presetSel) return;
+
+    const channel = chSel.value || "FRAUD_OPS_OUTBOUND";
+    const presetsByChannel = (STATE.channelsSummary && STATE.channelsSummary.presets) || {};
+    const list = Array.isArray(presetsByChannel[channel]) ? presetsByChannel[channel] : [];
+
+    if (!list.length) {
+      presetSel.innerHTML = `<option value="">Default ${escapeHtml(channel)} session</option>`;
+      renderSelectedChannelPresetPreview();
+      return;
+    }
+
+    presetSel.innerHTML = list.map((p, idx) => {
+      const turnsCount = Array.isArray(p.turns) ? p.turns.length : 1;
+      return `<option value="${escapeHtml(p.preset_id)}"${idx === 0 ? " selected" : ""}>${escapeHtml(p.title)} (${turnsCount} turns)</option>`;
+    }).join("");
+    renderSelectedChannelPresetPreview();
+  }
+
   async function loadChannelsAndRosterSummary(customerId) {
     const cid = customerId || DEFAULT_CUSTOMER_ID;
     try {
@@ -1770,18 +1920,21 @@ function renderGovernanceTraps(spans) {
       if (!resp.ok) return;
       const data = await resp.json();
       STATE.channelsSummary = data;
+      populateChannelPresetPicker();
       if (data.snapshot) {
         renderChannelEventStream(data.snapshot);
       }
       if (data.audit_sweep) {
         renderAuditSweepState(data.audit_sweep);
       }
+
+      AGENTS = buildDeskAgentEntries(data, LAST_TRACED_STEPS);
+      window.AGENTS = AGENTS;
+      buildMenu();
+      if (AGENTS.length) pick(0);
       renderRoster();
 
-      // If no chat run has been executed yet in this server process, hydrate the
-      // livebar and header with the live 8-agent + 5-channel state instead of
-      // leaving "Waiting for trace...".
-      if (!AGENTS.length && data.snapshot) {
+      if (!LAST_TRACED_STEPS.length && data.snapshot) {
         const totSess = data.snapshot.total_sessions || 0;
         const totEv = data.snapshot.total_events || 0;
         setAgentCountText("8 agents · 5 channels");
@@ -1790,12 +1943,6 @@ function renderGovernanceTraps(spans) {
         setTruthEngineText(
           `8-agent desk ready · FRAUD_OPS_OUTBOUND, IVR, MOBILE_APP, WEB_CHAT, BRANCH (${totSess} sessions in Memory Bank)`
         );
-        const biKind = $("biKind");
-        const biText = $("biText");
-        const biMetrics = $("biMetrics");
-        if (biKind) biKind.textContent = "HUB";
-        if (biText) biText.textContent = `consumer_credit_synthesizer_agent + 7 spokes · ${totSess} channel sessions`;
-        if (biMetrics) biMetrics.textContent = "click Replay run → to trace a turn";
       }
     } catch (err) {
       console.error("loadChannelsAndRosterSummary failed", err);
@@ -1804,20 +1951,23 @@ function renderGovernanceTraps(spans) {
 
   async function injectLiveChannelEvent() {
     const sel = $("channelIngestSelect");
+    const presetSel = $("channelPresetSelect");
     const txt = $("channelIngestText");
     const statusEl = $("channelIngestStatus");
     const btn = $("btnInjectChannelEvent");
     const channel = (sel && sel.value) || "FRAUD_OPS_OUTBOUND";
-    const text = (txt && txt.value.trim()) || `Live ${channel} event recorded`;
+    const presetId = (presetSel && presetSel.value) || "";
+    const text = (txt && txt.value.trim()) || "";
 
     if (btn) btn.disabled = true;
-    if (statusEl) statusEl.textContent = `Writing live ${channel} session to Vertex AI Memory Bank…`;
+    if (statusEl) statusEl.textContent = `Writing multi-turn ${channel} session to Vertex AI Memory Bank…`;
     try {
       const resp = await fetch(`/api/channel/${encodeURIComponent(channel)}/event`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           customer_id: DEFAULT_CUSTOMER_ID,
+          preset_id: presetId,
           text: text,
           intent: "LIVE_OPERATOR_INJECTION",
         }),
@@ -1828,14 +1978,19 @@ function renderGovernanceTraps(spans) {
         STATE.channelsSummary = STATE.channelsSummary || {};
         STATE.channelsSummary.snapshot = data.snapshot;
         renderChannelEventStream(data.snapshot);
+        AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_STEPS);
+        window.AGENTS = AGENTS;
+        buildMenu();
         renderRoster();
       }
       if (data.run_id) {
         await fetchAndRenderTrace(data.run_id);
       }
       const sid = pvText(data.ingested && data.ingested.session_id);
+      const tCount = pvText(data.ingested && data.ingested.turn_count);
+      if (txt) txt.value = "";
       if (statusEl) {
-        statusEl.textContent = `Ingested ${channel} session ${sid} into Memory Bank · producer updated (${data.snapshot ? data.snapshot.total_sessions : "n/r"} total sessions).`;
+        statusEl.textContent = `Ingested ${channel} session ${sid} (${tCount} turns) into Memory Bank · producer now holds ${data.snapshot ? data.snapshot.total_sessions : "n/r"} total sessions.`;
       }
     } catch (err) {
       if (statusEl) statusEl.textContent = `Channel ingest failed: ${err.message}`;
@@ -1868,6 +2023,9 @@ function renderGovernanceTraps(spans) {
         STATE.channelsSummary = STATE.channelsSummary || {};
         STATE.channelsSummary.snapshot = data.snapshot;
         renderChannelEventStream(data.snapshot);
+        AGENTS = buildDeskAgentEntries(STATE.channelsSummary, LAST_TRACED_STEPS);
+        window.AGENTS = AGENTS;
+        buildMenu();
         renderRoster();
       }
       if (data.run_id) {
@@ -1905,6 +2063,10 @@ function renderGovernanceTraps(spans) {
     }
 
     // 9. Live 5-channel ingestion (B), fraud card control (C), and async 95s audit sweep (4)
+    const chSel = $("channelIngestSelect");
+    if (chSel) chSel.addEventListener("change", populateChannelPresetPicker);
+    const presetSel = $("channelPresetSelect");
+    if (presetSel) presetSel.addEventListener("change", renderSelectedChannelPresetPreview);
     const btnInject = $("btnInjectChannelEvent");
     if (btnInject) btnInject.addEventListener("click", injectLiveChannelEvent);
     const btnFraud = $("btnFraudCardControl");

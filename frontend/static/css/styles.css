@@ -151,18 +151,21 @@ code {
   gap: 12px;
 }
 
-.pulse {
-  width: 7px;
-  height: 7px;
-  background: var(--pink);
-  flex: none;
-  animation: blink 1s steps(2) infinite;
-}
-
+.pulse,
+.livebar .pulse,
 .livebar .pulse.done,
 .pulse.done {
+  width: 7px;
+  height: 7px;
   background: var(--good);
+  flex: none;
   animation: none;
+}
+
+.livebar .pulse.running,
+.pulse.running {
+  background: var(--pink);
+  animation: blink 1s steps(2) infinite;
 }
 
 @keyframes blink {

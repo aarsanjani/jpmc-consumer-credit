@@ -1236,6 +1236,194 @@ CANONICAL_SEEDED_CHANNEL_LABELS: Dict[str, str] = {
 }
 
 
+CHANNEL_MULTI_TURN_PRESETS: Dict[str, List[Dict[str, Any]]] = {
+    "FRAUD_OPS_OUTBOUND": [
+        {
+            "preset_id": "fraud_lisbon_velocity_lock",
+            "title": "Lisbon POS + NYC login velocity alert → card lock & customer SMS",
+            "intent": "VELOCITY_ALERT_CARD_LOCK",
+            "turns": [
+                {
+                    "author": "fraud_monitoring_agent",
+                    "text": "FRAUD_OPS_OUTBOUND alert: concurrent Lisbon taxi POS (€715.61) on CARD00002 while online banking session active. Outbound SMS challenge sent.",
+                },
+                {
+                    "author": "customer",
+                    "text": "NO — my wallet with debit CARD00004 and credit CARD00002 was stolen in Lisbon near Rossio Square.",
+                },
+                {
+                    "author": "fraud_monitoring_agent",
+                    "text": "Customer confirmed compromise. Staged temporary block on CARD00002 & CARD00004 and escalated dual-rail claim to consumer_credit_synthesizer_agent.",
+                },
+            ],
+        },
+        {
+            "preset_id": "fraud_courier_reroute_hold",
+            "title": "Early-return courier intercept (Lisbon hotel → NYC JFK)",
+            "intent": "COURIER_REROUTE_VERIFICATION",
+            "turns": [
+                {
+                    "author": "fraud_monitoring_agent",
+                    "text": "FRAUD_OPS_OUTBOUND flag: replacement card shipping address changed from Lisbon hotel to New York 48h after travel notice start.",
+                },
+                {
+                    "author": "customer",
+                    "text": "I cut my Lisbon trip short after the wallet theft and flew back to JFK on 10 Sep. Please ship the replacement card to my New York home address.",
+                },
+                {
+                    "author": "fraud_monitoring_agent",
+                    "text": "Verified 10 Sep early-return telemetry. Released courier hold and updated active delivery destination to NYC.",
+                },
+            ],
+        },
+    ],
+    "IVR": [
+        {
+            "preset_id": "ivr_dropped_2fa_lisbon",
+            "title": "Inbound call from Lisbon hotel — dropped before SMS 2FA",
+            "intent": "INBOUND_DISPUTE_DROPPED_2FA",
+            "turns": [
+                {
+                    "author": "telephony_ivr_agent",
+                    "text": "Inbound IVR call connected from Lisbon hotel landline. Prompted customer for 6-digit SMS one-time passcode.",
+                },
+                {
+                    "author": "customer",
+                    "text": "My phone SIM was stolen along with my wallet in Lisbon — I cannot receive SMS codes right now.",
+                },
+                {
+                    "author": "telephony_ivr_agent",
+                    "text": "Session ended before OTP verification (DROPPED_BEFORE_2FA). Flagged scope for mobile app FaceID fallback.",
+                },
+            ],
+        },
+        {
+            "preset_id": "ivr_reg_e_provisional_inquiry",
+            "title": "Inbound inquiry on Reg E (23 Sep) vs Reg Z provisional credit",
+            "intent": "PROVISIONAL_CREDIT_STATUS_INQUIRY",
+            "turns": [
+                {
+                    "author": "customer",
+                    "text": "Why does my debit card dispute DSP00033 show provisional credit by 23 Sep, but my credit card dispute DSP00034 shows no provisional credit date?",
+                },
+                {
+                    "author": "telephony_ivr_agent",
+                    "text": "Quoted dispute ledger: DSP00033 is governed by Reg E (10 business days), whereas DSP00034 on CARD00002 is governed by Reg Z (payment withheld during investigation).",
+                },
+                {
+                    "author": "customer",
+                    "text": "Got it — please make sure you text me before closing either dispute.",
+                },
+            ],
+        },
+    ],
+    "MOBILE_APP": [
+        {
+            "preset_id": "mobile_apple_pay_reprovision",
+            "title": "FaceID verified Apple Pay token provisioning after CARD00002 freeze",
+            "intent": "APPLE_PAY_TOKEN_REPROVISION",
+            "turns": [
+                {
+                    "author": "customer",
+                    "text": "Authenticated via FaceID on bound iPhone. Requesting digital wallet token replacement for frozen CARD00002.",
+                },
+                {
+                    "author": "mobile_app_agent",
+                    "text": "Confirmed active device binding via Golden Query 10. Revoked compromised physical card token and provisioned replacement VCN wallet token.",
+                },
+            ],
+        },
+        {
+            "preset_id": "mobile_early_return_checkin",
+            "title": "Mobile app JFK geolocation check-in (10 Sep early return)",
+            "intent": "TRAVEL_EARLY_RETURN_CHECKIN",
+            "turns": [
+                {
+                    "author": "customer",
+                    "text": "Updating my travel status in the mobile app: landed back in New York (JFK) on 10 Sep, superseded Lisbon travel notice.",
+                },
+                {
+                    "author": "mobile_app_agent",
+                    "text": "Recorded mobile app geolocation at JFK terminal and marked Lisbon travel window superseded as of 2026-09-10.",
+                },
+            ],
+        },
+    ],
+    "WEB_CHAT": [
+        {
+            "preset_id": "web_dual_dispute_submission",
+            "title": "Online portal filing of DSP00033 (debit) & DSP00034 (credit)",
+            "intent": "ONLINE_DUAL_DISPUTE_FILING",
+            "turns": [
+                {
+                    "author": "customer",
+                    "text": "Submitting stolen-wallet disputes online for unauthorized Lisbon charges on debit CARD00004 and credit CARD00002.",
+                },
+                {
+                    "author": "web_portal_agent",
+                    "text": "Registered open disputes in ledger and linked both claims to the 09 Sep Lisbon theft incident.",
+                },
+                {
+                    "author": "customer",
+                    "text": "Standing instruction: always notify me by SMS and get my confirmation before closing any dispute.",
+                },
+            ],
+        },
+        {
+            "preset_id": "web_standing_instruction_update",
+            "title": "Standing instruction: require SMS confirmation before closing disputes",
+            "intent": "STANDING_INSTRUCTION_UPDATE",
+            "turns": [
+                {
+                    "author": "customer",
+                    "text": "Never close a dispute on my account without texting me first to confirm the final outcome.",
+                },
+                {
+                    "author": "web_portal_agent",
+                    "text": "Saved standing customer preference to Vertex AI Memory Bank for pre-close enforcement.",
+                },
+            ],
+        },
+    ],
+    "BRANCH": [
+        {
+            "preset_id": "branch_passport_id_check",
+            "title": "In-branch physical passport verification & hold clearance (NYC)",
+            "intent": "IN_PERSON_PASSPORT_VERIFICATION",
+            "turns": [
+                {
+                    "author": "branch_support_agent",
+                    "text": "Customer Priya Vantalis (CUST00001) presented physical passport at NYC branch following early return from Lisbon.",
+                },
+                {
+                    "author": "customer",
+                    "text": "Confirming my identity in person so my replacement cards and provisional credit are not held up by the dropped Lisbon IVR call.",
+                },
+                {
+                    "author": "branch_support_agent",
+                    "text": "Verified identity against Customer 360 snapshot (Golden Query 01) and cleared dropped-2FA security flag.",
+                },
+            ],
+        },
+        {
+            "preset_id": "branch_emergency_cash_advance",
+            "title": "In-branch emergency debit replacement & fee waiver",
+            "intent": "EMERGENCY_CARD_REPLACEMENT",
+            "turns": [
+                {
+                    "author": "customer",
+                    "text": "Requesting immediate branch replacement for debit CARD00004 and expedited courier fee waiver.",
+                },
+                {
+                    "author": "branch_support_agent",
+                    "text": "Issued temporary branch debit credential for ACCT000003 and logged AFFLUENT segment fee waiver.",
+                },
+            ],
+        },
+    ],
+}
+
+
 def ingest_live_channel_event(
     channel: str,
     customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
@@ -1243,18 +1431,53 @@ def ingest_live_channel_event(
     intent: str = "LIVE_CHANNEL_EVENT",
     card_id: str = DEFAULT_CARD_ID,
     author: str = "",
+    preset_id: str = "",
+    turns: Optional[List[Dict[str, str]]] = None,
     client: Optional[MemoryBankClient] = None,
 ) -> Dict[str, Any]:
-    """Writes a live event into Vertex AI Memory Bank under the channel's token.
+    """Writes a live (single- or multi-turn) session into Vertex AI Memory Bank.
 
     Because `_produce_channel_payload` reads from the same engine and matches on
     `CHANNEL_SESSION_TOKENS`, the corresponding channel producer spoke picks up
-    this session on the very next read.
+    this session and all of its customer <-> agent turns on the very next read.
     """
     bank = _memory_bank(client)
     raw_upper = (channel or "").strip().upper()
     canonical_label = CANONICAL_SEEDED_CHANNEL_LABELS.get(raw_upper, raw_upper or "WEB_CHAT")
-    event_author = author or ("channel_producer:%s" % canonical_label.lower())
+    default_author = author or ("channel_producer:%s" % canonical_label.lower())
+
+    resolved_turns: List[Dict[str, str]] = []
+    preset_list = CHANNEL_MULTI_TURN_PRESETS.get(canonical_label, [])
+    matched_preset = None
+    if preset_id:
+        for p in preset_list:
+            if p.get("preset_id") == preset_id:
+                matched_preset = p
+                break
+    if matched_preset is None and not turns and not text and preset_list:
+        matched_preset = preset_list[0]
+
+    if isinstance(turns, list) and turns:
+        for t in turns:
+            if isinstance(t, dict) and t.get("text"):
+                resolved_turns.append({
+                    "author": str(t.get("author") or default_author),
+                    "text": str(t.get("text")),
+                })
+    elif matched_preset is not None:
+        intent = str(matched_preset.get("intent") or intent)
+        for t in matched_preset.get("turns", []):
+            resolved_turns.append({
+                "author": str(t.get("author") or default_author),
+                "text": str(t.get("text") or ""),
+            })
+        if text:
+            resolved_turns.append({"author": "customer", "text": text})
+    else:
+        resolved_turns.append({
+            "author": default_author,
+            "text": text or ("%s live event recorded on %s" % (canonical_label, card_id)),
+        })
 
     with obs.turn(
         "channel.ingest",
@@ -1262,6 +1485,7 @@ def ingest_live_channel_event(
         channel=canonical_label,
         customer_id=customer_id,
         intent=intent,
+        turns=len(resolved_turns),
     ) as span:
         session_name = bank.create_session(
             user_id=customer_id,
@@ -1273,22 +1497,32 @@ def ingest_live_channel_event(
                 "intent": intent,
             },
         )
-        event = bank.append_event(
-            session_name=session_name,
-            author=event_author,
-            text=text or ("%s live event recorded on %s" % (canonical_label, card_id)),
-        )
+        last_event: Dict[str, Any] = {}
+        appended_turns: List[Dict[str, Any]] = []
+        for turn_item in resolved_turns:
+            last_event = bank.append_event(
+                session_name=session_name,
+                author=turn_item["author"],
+                text=turn_item["text"],
+            )
+            appended_turns.append({
+                "author": turn_item["author"],
+                "text": turn_item["text"],
+                "timestamp": mb_field(last_event, "timestamp"),
+            })
         invalidate_sessions_cache()
         session_id = str(session_name).split("/")[-1] if session_name else NOT_RECORDED
-        span.detail(session_id=session_id, channel=canonical_label)
+        span.detail(session_id=session_id, channel=canonical_label, turns=len(appended_turns))
         return {
             "channel_label": live(canonical_label, "sessions.create"),
             "customer_id": computed(customer_id, "scope argument sent to sessions.create"),
             "session_id": live(session_id, "sessions.create"),
             "session_name": live(session_name, "sessions.create"),
             "intent": computed(intent, "intent argument sent to sessions.create"),
-            "text": computed(text, "event text appended via sessions.appendEvent"),
-            "timestamp": _tagged_value(mb_field(event, "timestamp"), "sessions.appendEvent"),
+            "turn_count": computed(len(appended_turns), "count of sessions.appendEvent calls"),
+            "turns": computed(appended_turns, "sessions.appendEvent turns"),
+            "text": computed(appended_turns[-1]["text"] if appended_turns else text, "sessions.appendEvent"),
+            "timestamp": _tagged_value(mb_field(last_event, "timestamp"), "sessions.appendEvent"),
         }
 
 

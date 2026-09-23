@@ -1121,6 +1121,7 @@ def get_channels_summary():
             else {"channels": [], "events": [], "total_sessions": 0, "total_events": 0}
         )
         roster = [a.model_dump(mode="json") for a in _adk.list_all_agents()] if _adk else []
+        presets = getattr(_adk, "CHANNEL_MULTI_TURN_PRESETS", {}) if _adk else {}
         with _AUDIT_SWEEP_LOCK:
             sweep = dict(_AUDIT_SWEEP_STATE)
         return jsonify({
@@ -1128,6 +1129,7 @@ def get_channels_summary():
             "customer_id": customer_id,
             "snapshot": snapshot,
             "agents": roster,
+            "presets": presets,
             "audit_sweep": sweep,
         })
 
@@ -1139,6 +1141,8 @@ def post_live_channel_event(channel: str):
         body = payload()
         customer_id = body_customer(body)
         text = str(body.get("text") or body.get("message") or "").strip()
+        preset_id = str(body.get("preset_id") or "").strip()
+        turns = body.get("turns") if isinstance(body.get("turns"), list) else None
         intent = str(body.get("intent") or "LIVE_CHANNEL_EVENT").strip()
         card_id = str(body.get("card_id") or DEFAULT_CREDIT_CARD_ID).strip()
         ingested = _adk.ingest_live_channel_event(
@@ -1147,6 +1151,8 @@ def post_live_channel_event(channel: str):
             text=text,
             intent=intent,
             card_id=card_id,
+            preset_id=preset_id,
+            turns=turns,
         )
         snapshot = _adk.produce_all_channels_snapshot(customer_id=customer_id)
         return jsonify({

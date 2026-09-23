@@ -17,8 +17,8 @@
 
     <div class="pickwrap" id="pickwrap">
       <button class="tok" id="tok" type="button" aria-haspopup="listbox" aria-expanded="false">
-        <span class="ix" id="tokIx">08</span>
-        <span class="an" id="tokName">consumer_credit_synthesizer_agent</span>
+        <span class="ix" id="tokIx">01</span>
+        <span class="an" id="tokName">fraud_monitoring_agent</span>
         <span class="cv">▾</span>
       </button>
       <div class="menu" id="menu" role="listbox" hidden>
@@ -179,11 +179,17 @@
             <option value="WEB_CHAT">04 · WEB_CHAT (portal)</option>
             <option value="BRANCH">05 · BRANCH (teller)</option>
           </select>
+          <select class="chip chip-select" id="channelPresetSelect" aria-label="Available channel events" style="font-size:10px;padding:2px 20px 2px 7px;flex:1 1 180px;max-width:100%;">
+            <option value="">Loading channel events…</option>
+          </select>
+        </div>
+        <div id="channelTurnsPreview" style="font-family:var(--mono);font-size:10px;line-height:1.45;padding:5px 7px;margin-bottom:6px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);"></div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <input type="text" id="channelIngestText" placeholder="Optional: append an extra customer turn to this session…" aria-label="Optional custom turn" style="flex:1 1 160px;font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);">
           <button type="button" class="chip" id="btnInjectChannelEvent" style="font-size:10px;padding:2px 8px;">+ Inject live event</button>
           <button type="button" class="chip" id="btnFraudCardControl" style="font-size:10px;padding:2px 8px;">⚡ Fraud block / escalate</button>
         </div>
-        <input type="text" id="channelIngestText" value="Concurrent Lisbon POS &amp; online login anomaly detected; staging CARD00002 block &amp; escalating to synthesizer." aria-label="Channel event text" style="width:100%;font-family:var(--mono);font-size:10.5px;padding:4px 6px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);">
-        <p class="rd" id="channelIngestStatus" style="margin-top:4px;font-size:10px;">Live Vertex AI Memory Bank sessions across 5 channel producers.</p>
+        <p class="rd" id="channelIngestStatus" style="margin-top:4px;font-size:10px;">Select a channel &amp; prebaked multi-turn event, then click + Inject live event.</p>
       </div>
       <ul class="tl" id="eventStreamList"></ul>
     </div>
