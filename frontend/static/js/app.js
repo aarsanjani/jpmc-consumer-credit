@@ -33,6 +33,8 @@ class MemoryBankUiEngine {
         this.topHealthStatus = document.getElementById('top-health-status');
         this.healthStatusDot = document.getElementById('health-status-dot');
         this.topAuditStatus = document.getElementById('top-audit-status');
+        this.topEvalHeadline = document.getElementById('top-eval-headline');
+        this.traceBootLine = document.getElementById('trace-boot-line');
         this.customerSelector = document.getElementById('customer-selector');
 
         this.viewAgentsBtn = document.getElementById('view-agents-btn');
@@ -71,7 +73,10 @@ class MemoryBankUiEngine {
         this.viewComparisonBtn = document.getElementById('view-comparison-btn');
         this.viewAuditBtn = document.getElementById('view-audit-btn');
         this.viewAdminBtn = document.getElementById('view-admin-btn');
+        this.viewShellBtn = document.getElementById('view-shell-btn');
         this.viewJsonBtn = document.getElementById('view-json-btn');
+        this.serverLogLines = [];
+        this.lastLogSeq = 0;
 
         this.terminalScopeUri = document.getElementById('terminal-scope-uri');
         this.memorySearchInput = document.getElementById('memory-search-input');
@@ -88,6 +93,10 @@ class MemoryBankUiEngine {
         this.chatInput = document.getElementById('chat-input');
         this.chatViewport = document.getElementById('chat-viewport');
         this.a2uiContainer = document.getElementById('a2ui-presentation-container');
+        this.memoryProvenance = document.getElementById('memory-provenance');
+        this.mpBody = document.getElementById('mp-body');
+        this.mpBadge = document.getElementById('mp-badge');
+        this.mpSub = document.getElementById('mp-sub');
         this.promptChips = document.querySelectorAll('.quick-chip-btn');
 
         // Modal
@@ -275,6 +284,13 @@ class MemoryBankUiEngine {
                 this.renderAdminOversightView();
             });
         }
+        if (this.viewShellBtn) {
+            this.viewShellBtn.addEventListener('click', () => {
+                this.currentViewMode = 'shell';
+                this.setActiveToggle(this.viewShellBtn);
+                this.renderLiveShellView();
+            });
+        }
         if (this.viewJsonBtn) {
             this.viewJsonBtn.addEventListener('click', () => {
                 this.currentViewMode = 'json';
@@ -292,6 +308,7 @@ class MemoryBankUiEngine {
             this.viewComparisonBtn,
             this.viewAuditBtn,
             this.viewAdminBtn,
+            this.viewShellBtn,
             this.viewJsonBtn
         ].forEach(btn => {
             if (btn) btn.classList.remove('active');
@@ -319,6 +336,7 @@ class MemoryBankUiEngine {
 
     async init() {
         this.appendTrace('SYSTEM_BOOT', 'Probing live Vertex AI Reasoning Engine, Dataplex Universal Catalog, and BigQuery warehouse...', 'thought');
+        this.startServerLogStream();
         await Promise.all([
             this.loadSessionAndHealth(),
             this.loadTopics(),
@@ -329,41 +347,239 @@ class MemoryBankUiEngine {
         await this.loadCustomerState();
     }
 
+    startServerLogStream() {
+        const poll = async () => {
+            try {
+                const res = await fetch(`/api/logs/tail?since=${this.lastLogSeq}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                const newLines = data.lines || [];
+                if (newLines.length > 0) {
+                    this.lastLogSeq = data.latest_seq || this.lastLogSeq;
+                    newLines.forEach(item => {
+                        this.serverLogLines.push(item);
+                        if (this.serverLogLines.length > 400) this.serverLogLines.shift();
+
+                        let badge = 'STDOUT';
+                        let kind = 'thought';
+                        if (item.line.includes('>>> INCOMING')) {
+                            badge = 'HTTP_IN';
+                            kind = 'thought';
+                        } else if (item.line.includes('<<< COMPLETED')) {
+                            badge = 'HTTP_OUT';
+                            kind = 'synthesis';
+                        } else if (item.logger.includes('memory_bank')) {
+                            badge = 'VERTEX_MB';
+                            kind = 'memory';
+                        } else if (item.logger.includes('knowledge_catalog')) {
+                            badge = 'DATAPLEX';
+                            kind = 'thought';
+                        } else if (item.logger.includes('ground_truth')) {
+                            badge = 'BIGQUERY';
+                            kind = 'synthesis';
+                        }
+                        this.appendTrace(badge, item.line, kind);
+                    });
+                    if (this.currentViewMode === 'shell') {
+                        this.renderLiveShellView();
+                    }
+                }
+            } catch (_) {
+                // Ignore transient poll errors
+            }
+        };
+        poll();
+        setInterval(poll, 1200);
+    }
+
+    renderLiveShellView() {
+        this.memoryCountBadge.textContent = `${this.serverLogLines.length} Shell Lines (Port 5065)`;
+        const linesHtml = this.serverLogLines.map(item => {
+            let color = '#cbd5e1';
+            if (item.line.includes('>>> INCOMING')) color = '#38bdf8';
+            else if (item.line.includes('<<< COMPLETED')) color = '#34d399';
+            else if (item.logger.includes('memory_bank')) color = '#c084fc';
+            else if (item.logger.includes('knowledge_catalog')) color = '#fde047';
+            else if (item.level === 'WARNING' || item.level === 'ERROR') color = '#f87171';
+            return `<div style="padding:2px 0; border-bottom:1px solid rgba(255,255,255,0.03); color:${color}; white-space:pre-wrap; word-break:break-all;"><span style="color:#64748b;">[${item.seq}]</span> ${this.escapeHtml(item.line)}</div>`;
+        }).join('');
+
+        this.memoryTerminal.innerHTML = `
+            <div style="padding:10px; font-family:'JetBrains Mono',monospace; font-size:0.71rem; background:#090d16; min-height:360px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; padding-bottom:8px; margin-bottom:8px; border-bottom:1px solid rgba(56,189,248,0.3);">
+                    <strong style="color:#38bdf8;">🖥️ LIVE PYTHON BACKEND SHELL (` + "`backend/app.py` • Port 5065 • Real-Time `stdout/stderr`" + `)</strong>
+                    <span class="badge-status success">LIVE TAIL ACTIVE</span>
+                </div>
+                <div id="live-shell-scroll-box" style="max-height:420px; overflow-y:auto;">
+                    ${linesHtml || '<div style="color:#64748b;">Waiting for requests...</div>'}
+                </div>
+            </div>
+        `;
+        const scrollBox = document.getElementById('live-shell-scroll-box');
+        if (scrollBox) scrollBox.scrollTop = scrollBox.scrollHeight;
+    }
+
     async loadSessionAndHealth() {
+        await this.loadSession();
+        await this.loadHealth();
+    }
+
+    async loadSession() {
         try {
-            const [sessRes, healthRes] = await Promise.all([
-                fetch('/api/session'),
-                fetch('/api/health')
-            ]);
-            this.sessionData = await sessRes.json();
-            this.healthData = await healthRes.json();
+            const res = await fetch('/api/session');
+            this.sessionData = await res.json();
 
             const cfg = this.sessionData.configuration || {};
             if (this.topEngineBadge) {
-                this.topEngineBadge.textContent = `Engine ${cfg.agent_engine_id || 'Live'} • Dataset ${cfg.bigquery_dataset || 'jpmc_ccb_fraud'} • Glossary ${cfg.dataplex_glossary_id || 'ccb-fraud-disputes'}`;
+                // Every segment is whatever the API returned. A blank field is
+                // shown as n/r, never backfilled with the value it used to have.
+                this.topEngineBadge.textContent =
+                    `Engine ${cfg.agent_engine_id || 'n/r'} \u2022 Dataset ${cfg.bigquery_dataset || 'n/r'} \u2022 Glossary ${cfg.dataplex_glossary_id || 'n/r'}`;
             }
 
-            if (this.healthData && this.healthData.status === 'OK') {
-                const checks = this.healthData.checks || {};
-                const mb = checks.memory_bank || {};
-                const kc = checks.knowledge_catalog || {};
-                this.topHealthStatus.textContent = `${this.healthData.checks_passing} OK (${mb.topics_configured || 7} Topics • ${kc.term_count || 45} Terms)`;
-                this.healthStatusDot.className = 'status-dot green pulse';
-            } else {
-                this.topHealthStatus.textContent = 'Degraded';
-                this.healthStatusDot.className = 'status-dot red pulse';
+            // Customer dropdown: ids come from the warehouse. The display name
+            // is not in this payload, so the option is the bare id until
+            // /api/customer/overview supplies profile.full_name.
+            const ids = this.sessionData.available_customer_ids || [];
+            if (this.customerSelector) {
+                if (ids.length === 0) {
+                    this.customerSelector.innerHTML = '<option value="">no customer ids returned</option>';
+                } else {
+                    if (!ids.includes(this.customerId)) this.customerId = ids[0];
+                    this.customerSelector.innerHTML = ids.map(cid =>
+                        `<option value="${this.escapeHtml(cid)}" ${cid === this.customerId ? 'selected' : ''}>${this.escapeHtml(cid)}</option>`
+                    ).join('');
+                }
             }
-
-            // Populate Customer Dropdown
-            const ids = this.sessionData.available_customer_ids || ['CUST00001'];
-            if (this.customerSelector && ids.length > 0) {
-                this.customerSelector.innerHTML = ids.map(cid => {
-                    const label = cid === 'CUST00001' ? `${cid} — Priya Vantalis (Lisbon Case)` : cid;
-                    return `<option value="${cid}" ${cid === this.customerId ? 'selected' : ''}>${label}</option>`;
-                }).join('');
+            if (this.terminalScopeUri) {
+                this.terminalScopeUri.textContent = `memory_bank://scope/customer_id=${this.customerId}`;
             }
         } catch (err) {
-            console.error('Failed loading session/health:', err);
+            console.error('Failed loading session:', err);
+            if (this.topEngineBadge) this.topEngineBadge.textContent = 'Session unavailable \u2014 /api/session did not answer';
+            if (this.customerSelector) this.customerSelector.innerHTML = '<option value="">session unavailable</option>';
+        }
+    }
+
+    /**
+     * Normalise the two health shapes into one array of
+     * {name, status, detail, remedy, latency_ms}.
+     *   new: checks is an array from backend/diagnostics.py
+     *   old: checks is an object keyed by dependency with an uppercase status
+     * Anything else returns [] so the caller reports "unreadable" rather than
+     * inventing a passing check.
+     */
+    normalizeHealthChecks(raw) {
+        if (Array.isArray(raw)) {
+            return raw.map(c => ({
+                name: c.name || 'unnamed',
+                status: String(c.status || 'unknown').toLowerCase(),
+                detail: c.detail || '',
+                remedy: c.remedy || '',
+                latency_ms: c.latency_ms
+            }));
+        }
+        if (raw && typeof raw === 'object') {
+            return Object.keys(raw).map(k => {
+                const c = raw[k] || {};
+                const up = String(c.status || 'unknown').toUpperCase();
+                return {
+                    name: k,
+                    status: up === 'OK' ? 'ok' : (up === 'UNAVAILABLE' || up === 'DOWN' ? 'fail' : up.toLowerCase()),
+                    detail: c.error || c.detail || '',
+                    remedy: c.remedy || '',
+                    latency_ms: c.latency_ms
+                };
+            });
+        }
+        return [];
+    }
+
+    setHealthPill(text, dotClass, tooltip) {
+        if (this.topHealthStatus) {
+            this.topHealthStatus.textContent = text;
+            this.topHealthStatus.title = tooltip || text;
+        }
+        if (this.healthStatusDot) {
+            this.healthStatusDot.className = `status-dot ${dotClass}`;
+        }
+    }
+
+    setBootTrace(badge, message, type) {
+        // The boot line in the markup asserts nothing. This is the only thing
+        // that gives it a verdict, and it only runs after /api/health answered.
+        const line = this.traceBootLine || document.getElementById('trace-boot-line');
+        if (!line) return;
+        line.className = `trace-item ${type || 'thought'}`;
+        line.innerHTML = `<span class="trace-badge">${this.escapeHtml(badge)}</span>` +
+                         `<span class="trace-msg">${this.escapeHtml(message)}</span>`;
+    }
+
+    async loadHealth() {
+        try {
+            const res = await fetch('/api/health');
+            let data = null;
+            try {
+                data = await res.json();
+            } catch (parseErr) {
+                data = null;
+            }
+            this.healthData = data;
+
+            if (!data) {
+                this.setHealthPill('Health check unreadable', 'red pulse',
+                    `GET /api/health returned HTTP ${res.status} with a body that is not JSON.`);
+                this.setBootTrace('HEALTH_UNREADABLE',
+                    `/api/health returned HTTP ${res.status} and a non-JSON body. No dependency state is known.`, 'error');
+                return;
+            }
+
+            const checks = this.normalizeHealthChecks(data.checks || data.checks_by_name);
+            const overall = String(data.overall || data.status || '').toLowerCase();
+            const passing = checks.filter(c => c.status === 'ok').length;
+            const unhealthy = checks.filter(c => c.status !== 'ok' && c.status !== 'skipped');
+            const tooltip = checks.length
+                ? checks.map(c => `${c.name}: ${c.status.toUpperCase()}${c.detail ? ' \u2014 ' + c.detail : ''}${c.remedy ? ' | fix: ' + c.remedy : ''}`).join('\n')
+                : 'No per-check detail in the /api/health response.';
+
+            if (checks.length === 0) {
+                // A 200 with no checks is not a pass. Say so.
+                this.setHealthPill('No checks reported', 'grey', tooltip);
+                this.setBootTrace('HEALTH_EMPTY',
+                    '/api/health answered but reported no dependency checks, so nothing has actually been verified.', 'error');
+                return;
+            }
+
+            if (unhealthy.length === 0 && (overall === 'ok' || overall === '')) {
+                this.setHealthPill(`${passing}/${checks.length} checks OK`, 'green pulse', tooltip);
+                this.setBootTrace('HEALTH_OK',
+                    `Probed ${checks.length} dependencies: ${checks.map(c => c.name).join(', ')}. All answered OK.`, 'memory');
+            } else {
+                const failing = unhealthy.filter(c => c.status === 'fail');
+                const isDown = overall === 'fail' || overall === 'down' || res.status === 503;
+                const label = isDown ? 'DOWN' : 'DEGRADED';
+                const names = unhealthy.map(c => c.name).join(', ');
+                this.setHealthPill(`${label}: ${names} (${passing}/${checks.length} OK)`,
+                    isDown ? 'red pulse' : 'amber pulse', tooltip);
+                this.setBootTrace(`HEALTH_${label}`,
+                    `${passing} of ${checks.length} dependencies answered OK. Unhealthy: ` +
+                    unhealthy.map(c => `${c.name} (${c.status.toUpperCase()}) \u2014 ${c.detail || 'no detail given'}`).join('; '),
+                    'error');
+                unhealthy.forEach(c => {
+                    this.appendTrace(`DEPENDENCY_${c.status.toUpperCase()}`,
+                        `${c.name}: ${c.detail || 'no detail given'}${c.remedy ? ' \u2014 remedy: ' + c.remedy : ''}`, 'error');
+                });
+                if (failing.length && this.topAuditStatus) {
+                    // Nothing downstream of a dead dependency can be trusted.
+                    this.topAuditStatus.textContent = 'Blocked (dependency down)';
+                }
+            }
+        } catch (err) {
+            console.error('Failed loading health:', err);
+            this.healthData = null;
+            this.setHealthPill('Health check failed', 'red pulse', String(err && err.message ? err.message : err));
+            this.setBootTrace('HEALTH_FAILED',
+                `/api/health could not be reached (${err && err.message ? err.message : err}). Dependency state is unknown.`, 'error');
         }
     }
 
@@ -396,7 +612,59 @@ class MemoryBankUiEngine {
             this.cachedEvalSummary = await res.json();
         } catch (err) {
             console.error('Failed loading eval summary:', err);
+            this.cachedEvalSummary = null;
         }
+        this.updateEvalHeadlinePill();
+    }
+
+    /**
+     * The header benchmarks pill. Reads the same headline the Precision &
+     * Recall tab reads. If the sweep has not been run, or the field is absent,
+     * the pill says so instead of carrying yesterday's number.
+     */
+    updateEvalHeadlinePill() {
+        if (!this.topEvalHeadline) return;
+        const headline = this.evalHeadline();
+        const recall = this.metricValue(headline.macro_recall);
+        const k = headline.k;
+        if (recall === null) {
+            this.topEvalHeadline.textContent = 'Precision & Recall (not measured)';
+            this.topEvalHeadline.title = 'No macro_recall in /api/eval/summary. Run the retrieval sweep.';
+            return;
+        }
+        this.topEvalHeadline.textContent = `Recall@${k !== null && k !== undefined ? k : '?'} ${(recall * 100).toFixed(1)}%`;
+        this.topEvalHeadline.title = 'From /api/eval/summary -> benchmark.results.retrieval.headline.macro_recall';
+    }
+
+    /** benchmark.results.retrieval.headline, or {} if the sweep is absent. */
+    evalHeadline() {
+        const bench = (this.cachedEvalSummary
+            && this.cachedEvalSummary.benchmark
+            && this.cachedEvalSummary.benchmark.results) || {};
+        return (bench.retrieval && bench.retrieval.headline) || {};
+    }
+
+    /** Unwrap {value, n_defined, n_undefined} or a bare number. null if absent. */
+    metricValue(metric) {
+        if (metric === null || metric === undefined) return null;
+        if (typeof metric === 'number') return Number.isFinite(metric) ? metric : null;
+        if (typeof metric === 'object' && metric.value !== null && metric.value !== undefined) {
+            const n = Number(metric.value);
+            return Number.isFinite(n) ? n : null;
+        }
+        return null;
+    }
+
+    /** A percentage, or an explicit em-dash. Never a plausible-looking guess. */
+    pct(metric, digits = 1) {
+        const v = this.metricValue(metric);
+        return v === null ? '\u2014' : `${(v * 100).toFixed(digits)}%`;
+    }
+
+    /** A fixed-point number, or an explicit em-dash. */
+    num(metric, digits = 3) {
+        const v = this.metricValue(metric);
+        return v === null ? '\u2014' : Number(v).toFixed(digits);
     }
 
     async loadAgentsRoster() {
@@ -405,7 +673,9 @@ class MemoryBankUiEngine {
             const data = await res.json();
             this.cachedAgents = data.agents || [];
             if (this.topAgentsCount) {
-                this.topAgentsCount.textContent = `${this.cachedAgents.length} Active ADK Agents`;
+                this.topAgentsCount.textContent = this.cachedAgents.length
+                    ? `${this.cachedAgents.length} ADK agents`
+                    : 'no agents returned';
             }
             if (this.agentsRosterContainer) {
                 this.agentsRosterContainer.innerHTML = this.cachedAgents.map((ag, idx) => `
@@ -427,6 +697,11 @@ class MemoryBankUiEngine {
             }
         } catch (err) {
             console.error('Failed loading agents roster:', err);
+            if (this.topAgentsCount) this.topAgentsCount.textContent = 'roster unavailable';
+            if (this.agentsRosterContainer) {
+                this.agentsRosterContainer.innerHTML =
+                    '<div style="padding:14px; color:#f87171; font-size:0.78rem;">/api/agents/list did not answer, so the roster is unknown.</div>';
+            }
         }
     }
 

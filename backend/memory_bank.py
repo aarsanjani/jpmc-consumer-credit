@@ -315,6 +315,8 @@ class MemoryBankClient:
         self._session = session or requests.Session()
         self._credentials = credentials
         self._engine_cache: Optional[dict] = None
+        import threading
+        self._auth_lock = threading.Lock()
 
     # -- plumbing ----------------------------------------------------------
 
@@ -325,12 +327,13 @@ class MemoryBankClient:
     def _base(self) -> str:
         return f"{self.cfg.aiplatform_endpoint}/{API_VERSION}"
 
-    def _token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(scopes=list(SCOPES))
-        if not self._credentials.valid:
-            self._credentials.refresh(google.auth.transport.requests.Request())
-        return self._credentials.token
+    def _token(self, force_refresh: bool = False) -> str:
+        with self._auth_lock:
+            if self._credentials is None:
+                self._credentials, _ = google.auth.default(scopes=list(SCOPES))
+            if force_refresh or not self._credentials.valid or not self._credentials.token:
+                self._credentials.refresh(google.auth.transport.requests.Request())
+            return self._credentials.token
 
     def _request(
         self,
@@ -355,6 +358,16 @@ class MemoryBankClient:
                 params=params,
                 timeout=self.timeout_s,
             )
+            if resp.status_code == 401:
+                headers["Authorization"] = f"Bearer {self._token(force_refresh=True)}"
+                resp = self._session.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=body,
+                    params=params,
+                    timeout=self.timeout_s,
+                )
         except requests.RequestException as exc:
             raise MemoryBankError(f"{method} {url} failed: {exc}", url=url) from exc
 

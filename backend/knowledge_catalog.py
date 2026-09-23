@@ -246,12 +246,16 @@ class CatalogGovernor:
             f"/datasets/{self.cfg.bigquery_dataset}/tables/{table}"
         )
 
-    def _token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(scopes=list(SCOPES))
-        if not self._credentials.valid:
-            self._credentials.refresh(google.auth.transport.requests.Request())
-        return self._credentials.token
+    def _token(self, force_refresh: bool = False) -> str:
+        import threading
+        if not hasattr(self, "_auth_lock"):
+            self._auth_lock = threading.Lock()
+        with self._auth_lock:
+            if self._credentials is None:
+                self._credentials, _ = google.auth.default(scopes=list(SCOPES))
+            if force_refresh or not self._credentials.valid or not self._credentials.token:
+                self._credentials.refresh(google.auth.transport.requests.Request())
+            return self._credentials.token
 
     def _request(
         self,
@@ -263,6 +267,7 @@ class CatalogGovernor:
     ) -> dict:
         url = path if path.startswith("http") else f"{self._base()}/{path.lstrip('/')}"
         self.calls.append(f"{method} {url.split('/v1/')[-1][:110]}")
+        log.debug("-> %s %s", method, url)
         headers = {
             "Authorization": f"Bearer {self._token()}",
             "Content-Type": "application/json",
@@ -271,6 +276,11 @@ class CatalogGovernor:
             resp = self._session.request(
                 method, url, headers=headers, json=body, params=params, timeout=self.timeout_s
             )
+            if resp.status_code == 401:
+                headers["Authorization"] = f"Bearer {self._token(force_refresh=True)}"
+                resp = self._session.request(
+                    method, url, headers=headers, json=body, params=params, timeout=self.timeout_s
+                )
         except requests.RequestException as exc:
             raise CatalogError(f"{method} {url} failed: {exc}", url=url) from exc
 

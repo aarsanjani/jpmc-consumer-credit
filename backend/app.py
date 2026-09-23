@@ -45,11 +45,53 @@ from backend.memory_eval.write_policy import (
     run_topic_comparison,
 )
 
+from collections import deque
+import threading
+
+_LOG_SEQ = 0
+_LOG_LOCK = threading.Lock()
+_TERMINAL_LOG_BUFFER: deque[dict[str, Any]] = deque(maxlen=400)
+
+
+class _TerminalRingBufferHandler(logging.Handler):
+    """Captures every backend terminal log line so the UI shell panel and stdout show identical real-time activity."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        global _LOG_SEQ
+        msg = self.format(record)
+        if "/api/logs/tail" in msg:
+            return
+        with _LOG_LOCK:
+            _LOG_SEQ += 1
+            _TERMINAL_LOG_BUFFER.append(
+                {
+                    "seq": _LOG_SEQ,
+                    "time": time.strftime("%H:%M:%S"),
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "line": msg,
+                }
+            )
+
+
+class _QuietTailFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/logs/tail" not in record.getMessage()
+
+
 logging.basicConfig(
     level=os.environ.get("CCB_LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)-7s %(name)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+for _lg_name in ("backend.memory_bank", "backend.knowledge_catalog", "backend.ground_truth", "backend.agent", "backend.adk_agents", "app"):
+    logging.getLogger(_lg_name).setLevel(logging.DEBUG)
+logging.getLogger("werkzeug").addFilter(_QuietTailFilter())
+
+_ring_handler = _TerminalRingBufferHandler()
+_ring_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
+logging.getLogger().addHandler(_ring_handler)
+
 log = logging.getLogger("app")
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,6 +102,30 @@ app = Flask(
     static_folder=os.path.join(BASE_DIR, "frontend", "static"),
 )
 CORS(app)
+
+
+@app.before_request
+def _trace_request_start() -> None:
+    if request.path == "/api/logs/tail" or request.path.startswith("/static/"):
+        return
+    request._start_ts = time.perf_counter()  # type: ignore[attr-defined]
+    qs = f"?{request.query_string.decode()}" if request.query_string else ""
+    body_preview = ""
+    if request.method in ("POST", "PUT", "PATCH"):
+        payload = request.get_json(silent=True)
+        if payload:
+            body_preview = f" payload={json.dumps(payload)[:180]}"
+    log.info(">>> INCOMING %s %s%s%s", request.method, request.path, qs, body_preview)
+
+
+@app.after_request
+def _trace_request_end(response: Response) -> Response:
+    if request.path == "/api/logs/tail" or request.path.startswith("/static/"):
+        return response
+    start_ts = getattr(request, "_start_ts", None)
+    elapsed = f"{(time.perf_counter() - start_ts) * 1000:.1f}ms" if start_ts else "n/a"
+    log.info("<<< COMPLETED %s %s -> HTTP %s (%s)", request.method, request.path, response.status_code, elapsed)
+    return response
 
 # Resolved at import. If the environment is wrong we want to know now, at
 # startup, not on the first request that happens to touch a missing variable.
@@ -496,18 +562,65 @@ def eval_reconcile():
 @app.get("/api/eval/summary")
 @guarded
 def eval_summary():
-    """Return the verified live benchmark runs across all stages plus live reconciliation."""
+    """Live reconciliation, plus the last *stored* benchmark run, clearly separated.
+
+    This route used to be the worst offender in the codebase. It read
+    `latest_eval_results.json` off disk, string-substituted the live project
+    number, project id and engine id into it, and returned it under the key
+    `benchmark` next to genuinely live `reconcile` data -- with a docstring
+    calling the whole thing "verified live benchmark runs".
+
+    Nothing about the benchmark half was live. Stamping the real engine id onto
+    a stored file makes it *look* freshly produced, which is worse than leaving
+    the placeholders in: a reader checking provenance sees their own engine and
+    concludes the run just happened. The two halves of the response were
+    indistinguishable.
+
+    They are now labelled. The fixture is returned under `stored_benchmark`
+    with its filename and mtime, and the live half under `live_reconcile`.
+    Callers that want a real benchmark must POST /api/eval/retrieval, which
+    actually runs one.
+    """
+    import datetime as _dt
     from pathlib import Path
 
-    customer_id = request.args.get("customer_id", "CUST00001")
+    customer_id = required_arg("customer_id", request.args)
+
     summary_path = Path(PROBES_PATH).resolve().parent / "latest_eval_results.json"
-    stages_data = {}
+    stored: dict = {
+        "source": "ABSENT",
+        "note": f"No stored benchmark file at {summary_path.name}.",
+        "results": {},
+    }
     if summary_path.exists():
         raw = summary_path.read_text()
+        # The file ships with placeholders so it is portable between projects.
+        # Substituting them is fine; pretending the result is live is not, so
+        # the substitution is disclosed rather than silent.
+        substituted = [
+            token
+            for token in ("<project_number>", "<project_id>", "<engine_id>")
+            if token in raw
+        ]
         raw = raw.replace("<project_number>", str(SETTINGS.project_number or ""))
         raw = raw.replace("<project_id>", str(SETTINGS.project_id or ""))
         raw = raw.replace("<engine_id>", str(SETTINGS.agent_engine_id or ""))
-        stages_data = json.loads(raw)
+        stored = {
+            "source": "STORED_FIXTURE",
+            "file": summary_path.name,
+            "file_mtime": _dt.datetime.fromtimestamp(
+                summary_path.stat().st_mtime, tz=_dt.timezone.utc
+            ).isoformat(),
+            "identifiers_substituted": substituted,
+            "note": (
+                "Read from disk, not executed now. Identifiers listed in "
+                "identifiers_substituted were templated in from live config for "
+                "portability, so resource names in these results will match your "
+                "environment even though the run itself is historical. To produce "
+                "a real measurement, POST /api/eval/retrieval."
+            ),
+            "results": json.loads(raw),
+        }
 
     memories = _memory.list_memories({"customer_id": customer_id})
     amounts = reconcile.reconcile_amounts(memories, _reader, customer_id)
@@ -516,8 +629,13 @@ def eval_summary():
         {
             "customer_id": customer_id,
             "engine": SETTINGS.agent_engine_resource,
-            "benchmark": stages_data,
-            "reconcile": {
+            "stored_benchmark": stored,
+            "live_reconcile": {
+                "source": "LIVE",
+                "note": (
+                    "Computed during this request against Memory Bank and "
+                    "BigQuery."
+                ),
                 "passed": amounts.passed and travel.passed,
                 "amounts": amounts.to_dict(),
                 "travel": travel.to_dict(),
@@ -646,8 +764,27 @@ def audit_customer(customer_id: str):
     return jsonify(report.to_dict())
 
 
+# --- diagnostics (added by diagnostics worker) ---
+# Dependency health registry. Owns GET /api/health and GET /api/health/<check>.
+# See backend/diagnostics.py and docs/DIAGNOSTICS.md.
+from backend.diagnostics import register as register_diagnostics  # noqa: E402
+
+register_diagnostics(app)
+# --- end diagnostics ---
+
+
+@app.get("/api/logs/tail")
+def logs_tail():
+    """Return live backend terminal stdout/stderr log lines since `since` sequence number."""
+    since = int(request.args.get("since", 0))
+    with _LOG_LOCK:
+        lines = [item for item in _TERMINAL_LOG_BUFFER if item["seq"] > since]
+        latest_seq = _LOG_SEQ
+    return jsonify({"latest_seq": latest_seq, "lines": lines})
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5055))
+    port = int(os.environ.get("PORT", 5065))
     log.info("configuration: %s", SETTINGS.redacted())
     log.info("engine: %s", SETTINGS.agent_engine_resource)
     app.run(host="0.0.0.0", port=port, debug=False)

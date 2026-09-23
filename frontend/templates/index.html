@@ -22,11 +22,11 @@
         <div class="system-telemetry-bar">
             <button id="view-agents-btn" class="telemetry-pill-btn" title="View live ADK Multi-Agent System topology &amp; bound tools">
                 <span class="status-dot purple pulse"></span>
-                <span>Agents Mesh: <strong id="top-agents-count">5 Active ADK Agents</strong></span>
+                <span>Agents Mesh: <strong id="top-agents-count">Loading…</strong></span>
             </button>
             <button id="top-eval-btn" class="telemetry-pill-btn" title="Open Empirical Retrieval Precision/Recall &amp; Write Efficacy Benchmarks">
                 <span class="status-dot green pulse"></span>
-                <span>Benchmarks: <strong>Precision &amp; Recall (95.9%)</strong></span>
+                <span>Benchmarks: <strong id="top-eval-headline">Precision &amp; Recall</strong></span>
             </button>
             <button id="top-comparison-btn" class="telemetry-pill-btn" title="Compare Google Native ADK Agent vs Direct Non-ADK Agent">
                 <span class="status-dot blue pulse"></span>
@@ -44,7 +44,7 @@
                 <span class="status-dot gold"></span>
                 <span style="margin-right: 4px;">Customer:</span>
                 <select id="customer-selector" style="background: rgba(15,23,42,0.9); color: #f8fafc; border: 1px solid rgba(56,189,248,0.4); border-radius: 5px; padding: 2px 6px; font-size: 0.74rem; font-weight: 700; cursor: pointer;">
-                    <option value="CUST00001">CUST00001 — Priya Vantalis</option>
+                    <option value="CUST00001">CUST00001</option>
                 </select>
             </div>
         </div>
@@ -74,43 +74,31 @@
                 <div class="system-event-card border-red" id="card-fraud">
                     <div class="event-card-header">
                         <span class="system-tag red">Card &amp; Wallet Security (BigQuery + MB)</span>
-                        <span class="event-time" id="feed-card-time">Lisbon Theft • Sep 09</span>
+                        <span class="event-time" id="feed-card-time">Loading…</span>
                     </div>
-                    <h3 class="event-title" id="feed-card-title">Stolen Wallet in Lisbon &amp; Card Replacement Chain</h3>
-                    <p class="event-desc" id="feed-card-desc">BigQuery shows physical cards <strong>CARD00002 (*0513 Credit)</strong> and <strong>CARD00004 (*6420 Debit)</strong> are <code>FROZEN (SUSPECTED_FRAUD_TRAVEL)</code>. Virtual card <strong>CARD00005 (*2758)</strong> is <code>ACTIVE</code>; replacement <strong>CARD00003 (*9013)</strong> is <code>PENDING_ACTIVATION</code>.</p>
-                    <div class="event-meta" id="feed-card-meta">
-                        <span class="meta-chip">Active Virtual: *2758</span>
-                        <span class="meta-chip">Frozen: *0513, *6420</span>
-                        <span class="veracity-badge true">✓ BigQuery Verified</span>
-                    </div>
+                    <h3 class="event-title" id="feed-card-title">Card Portfolio &amp; Wallet Tokens</h3>
+                    <p class="event-desc" id="feed-card-desc">Waiting for <code>cards</code> and <code>wallet_tokens</code> from BigQuery…</p>
+                    <div class="event-meta" id="feed-card-meta"></div>
                 </div>
 
                 <div class="system-event-card border-amber" id="card-ivr">
                     <div class="event-card-header">
                         <span class="system-tag amber">Travel Registry vs. Memory Distractor</span>
-                        <span class="event-time" id="feed-travel-time">Notice TRV0001 • IVR</span>
+                        <span class="event-time" id="feed-travel-time">Loading…</span>
                     </div>
-                    <h3 class="event-title" id="feed-travel-title">Lisbon Travel Notice vs. Unverified London Claim</h3>
-                    <p class="event-desc" id="feed-travel-desc">BigQuery <code>travel_notices</code> records <strong>Lisbon, PT</strong> (Aug 28 – Sep 18; early return to NY on <strong>Sep 10</strong>). One Memory Bank entry claims <strong>London</strong> travel—flagged automatically by the reconciler as a ground-truth contradiction.</p>
-                    <div class="event-meta" id="feed-travel-meta">
-                        <span class="meta-chip">BQ Truth: Lisbon, PT</span>
-                        <span class="meta-chip">Return: 2026-09-10</span>
-                        <span class="veracity-badge false">⚠️ London Claim Contradicted</span>
-                    </div>
+                    <h3 class="event-title" id="feed-travel-title">Travel Registry vs. Memory Bank</h3>
+                    <p class="event-desc" id="feed-travel-desc">Waiting for <code>travel_notices</code> from BigQuery…</p>
+                    <div class="event-meta" id="feed-travel-meta"></div>
                 </div>
 
                 <div class="system-event-card border-blue" id="card-mobile">
                     <div class="event-card-header">
                         <span class="system-tag blue">Open Disputes: Reg E (Debit) vs. Reg Z (Credit)</span>
-                        <span class="event-time" id="feed-dispute-time">6 Active Disputes • $2,635.88</span>
+                        <span class="event-time" id="feed-dispute-time">Loading…</span>
                     </div>
-                    <h3 class="event-title" id="feed-dispute-title">Dual-Regulation Dispute Ledger (`disputes` Table)</h3>
-                    <p class="event-desc" id="feed-dispute-desc"><strong>DSP00033 ($26.30, CARD00004 Debit, Reg E)</strong>: Provisional credit issued Sep 12. <strong>DSP00034 ($1,065.76, CARD00002 Credit, Reg Z)</strong>: Open investigation due Nov 03; no provisional credit required under Reg Z.</p>
-                    <div class="event-meta" id="feed-dispute-meta">
-                        <span class="meta-chip">Reg E: PC Issued ($26.30)</span>
-                        <span class="meta-chip">Reg Z: $1,065.76 / $796.42</span>
-                        <span class="veracity-badge true">✓ Dataplex Governed</span>
-                    </div>
+                    <h3 class="event-title" id="feed-dispute-title">Open Dispute Ledger (`disputes` Table)</h3>
+                    <p class="event-desc" id="feed-dispute-desc">Waiting for <code>disputes</code> from BigQuery…</p>
+                    <div class="event-meta" id="feed-dispute-meta"></div>
                 </div>
             </div>
 
@@ -150,14 +138,14 @@
                 <div class="visual-credit-card" id="visual-card">
                     <div class="card-top-row" style="display:flex; justify-content:space-between; align-items:center;">
                         <span class="card-chip">💳 JPMorgan Chase Reserve</span>
-                        <span class="badge-status danger" id="card-badge">2 FROZEN • 1 VIRTUAL ACTIVE</span>
+                        <span class="badge-status neutral" id="card-badge">Loading…</span>
                     </div>
                     <div class="card-number" id="card-number-display" style="font-family:'JetBrains Mono', monospace; font-size:0.85rem; margin: 0.45rem 0; color:#f8fafc;">
-                        *0513 (FROZEN) • *6420 (FROZEN) • *2758 (ACTIVE)
+                        Loading card portfolio…
                     </div>
                     <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.7rem; color:#cbd5e1;">
-                        <span id="card-holder-display">PRIYA VANTALIS (CUST00001)</span>
-                        <span id="apple-pay-status" style="color:#34d399; font-weight:600;">✓ Google Pay Active • Apple Pay Revoked</span>
+                        <span id="card-holder-display">—</span>
+                        <span id="apple-pay-status" style="color:#94a3b8; font-weight:600;">Wallet tokens: loading…</span>
                     </div>
                 </div>
 
@@ -165,10 +153,10 @@
                 <div style="margin-top:0.6rem; padding:0.65rem; background:rgba(15,23,42,0.85); border:1px solid rgba(56,189,248,0.3); border-radius:8px;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
                         <span style="font-size:0.72rem; font-weight:700; color:#38bdf8;">🔒 Dataplex Governance &amp; Card Oversight</span>
-                        <span id="admin-confidence-badge" class="badge-status success" style="font-size:0.65rem;">PAN_FULL: REFUSED</span>
+                        <span id="admin-confidence-badge" class="badge-status neutral" style="font-size:0.65rem;" title="Result of a live GET /api/catalog/authorize on cards.pan_full">cards.pan_full: not checked yet</span>
                     </div>
                     <div id="admin-verification-summary" style="font-size:0.7rem; color:#cbd5e1; margin-bottom:0.5rem; line-height:1.35;">
-                        <strong>Standing Instruction:</strong> "Always notify me before any dispute on my account is closed. Text me first, do not just send an email."
+                        <strong>Standing Instruction:</strong> <em>loading from BigQuery…</em>
                     </div>
                     <div style="display:flex; gap:0.4rem;">
                         <button id="sim-verify-pass-btn" class="btn-secondary btn-sm" style="flex:1; font-size:0.68rem; padding:0.35rem;" title="Inspect Card &amp; Dispute Resolution Oversight">👮‍♂️ Card &amp; Reg E/Z Oversight</button>
@@ -185,7 +173,7 @@
                     <span class="section-icon">🧠</span>
                     <div>
                         <h2>Vertex AI Scale Memory Bank &amp; Governance</h2>
-                        <p class="section-sub" id="center-engine-subtitle">Live Agent Engine Memory Vault • 7 Custom Fraud Topics</p>
+                        <p class="section-sub" id="center-engine-subtitle">Live Agent Engine Memory Vault • topics loading…</p>
                     </div>
                 </div>
                 <div class="view-toggle-group">
@@ -195,6 +183,7 @@
                     <button class="toggle-btn" id="view-comparison-btn" title="Side-by-side execution: Google ADK Agent vs Direct Non-ADK Agent">⚖️ Custom vs ADK</button>
                     <button class="toggle-btn" id="view-audit-btn" title="Reconcile Memory Bank claims against BigQuery System of Record">🔍 Audit &amp; Reconcile</button>
                     <button class="toggle-btn" id="view-admin-btn" title="Card Replacement Chain &amp; Regulation E / Regulation Z Matrix">👮‍♂️ Oversight</button>
+                    <button class="toggle-btn" id="view-shell-btn" title="Live Backend Terminal stdout/stderr stream for every API call">🖥️ Live Shell</button>
                     <button class="toggle-btn" id="view-json-btn" title="Raw JSON payload inspector">JSON</button>
                 </div>
             </div>
@@ -220,17 +209,17 @@
                 </div>
             </div>
 
-            <!-- Live Agent Trace Telemetry Panel -->
+            <!-- Live Agent Trace & Server Terminal Telemetry Panel -->
             <div class="agent-trace-box">
                 <div class="trace-header">
                     <span class="live-beacon"></span>
-                    <h3>Real-Time Agentic Reasoner &amp; Governance Telemetry</h3>
-                    <span class="trace-sub-pill" id="trace-mode-pill">Vertex AI • Dataplex • BigQuery</span>
+                    <h3>Live Backend Shell &amp; Agentic Telemetry (`stdout/stderr` • Port 5065)</h3>
+                    <span class="trace-sub-pill" id="trace-mode-pill">Streaming `/api/logs/tail`</span>
                 </div>
-                <div class="trace-logs" id="agent-trace-logs">
-                    <div class="trace-item thought">
-                        <span class="trace-badge">READY</span>
-                        <span class="trace-msg">Fraud Desk Orchestrator connected to live Vertex AI Memory Bank, Dataplex Catalog, and BigQuery.</span>
+                <div class="trace-logs" id="agent-trace-logs" style="font-family: 'JetBrains Mono', monospace; font-size: 0.7rem;">
+                    <div class="trace-item thought" id="trace-boot-line">
+                        <span class="trace-badge">STARTING</span>
+                        <span class="trace-msg">No dependency has been probed yet. Connection state is unknown until <code>/api/health</code> answers.</span>
                     </div>
                 </div>
             </div>
@@ -272,8 +261,23 @@
             <div class="chat-viewport" id="chat-viewport">
                 <div class="chat-message system">
                     <div class="msg-bubble" id="welcome-chat-bubble">
-                        👋 <strong>Fraud Desk Active (`CUST00001 — Priya Vantalis`)</strong>. Select any demo prompt above or ask a question to retrieve live Vertex AI Memory Bank recollections, verify Dataplex Catalog governance aspects, and reconcile against BigQuery ground truth.
+                        👋 <strong>Fraud Desk</strong>. Select any demo prompt above or ask a question to retrieve live Vertex AI Memory Bank recollections, verify Dataplex Catalog governance aspects, and reconcile against BigQuery ground truth.
                     </div>
+                </div>
+            </div>
+
+            <!-- Memories that informed the answer (from /api/chat evidence.memories) -->
+            <div id="memory-provenance" class="memory-provenance">
+                <div class="mp-header">
+                    <span class="mp-icon">🧠</span>
+                    <div class="mp-heading">
+                        <h3>Memories that informed this answer</h3>
+                        <p class="mp-sub" id="mp-sub">Ask a question to see which stored memories were retrieved and fed to the agent.</p>
+                    </div>
+                    <span class="mp-badge" id="mp-badge">idle</span>
+                </div>
+                <div class="mp-body" id="mp-body">
+                    <div class="mp-empty">Nothing retrieved yet.</div>
                 </div>
             </div>
 
