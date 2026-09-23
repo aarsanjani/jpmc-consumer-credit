@@ -18,7 +18,7 @@ def test_pre_write_claim_veracity_validation_true_claim():
     validator = ClaimVeracityValidatorAgent()
 
     eval_result = validator.validate_claim_against_telemetry(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         channel=BankChannel.TELEPHONY_IVR,
         claim_text="My phone call dropped before I could complete the SMS 2FA passcode.",
     )
@@ -33,7 +33,7 @@ def test_pre_write_claim_veracity_validation_1000_chicago_fraud_claim():
     validator = ClaimVeracityValidatorAgent()
 
     eval_result = validator.validate_claim_against_telemetry(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         channel=BankChannel.MOBILE_APP,
         claim_text="I lost $1,000! Someone stole my card details and charged $1,000 in Chicago while I was in New York preparing for London!",
     )
@@ -49,7 +49,7 @@ def test_pre_write_claim_veracity_validation_contradicted_claim():
     validator = ClaimVeracityValidatorAgent()
 
     eval_result = validator.validate_claim_against_telemetry(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         channel=BankChannel.MOBILE_APP,
         claim_text="I was never in Chicago and never logged in from Chicago.",
     )
@@ -61,12 +61,12 @@ def test_pre_write_claim_veracity_validation_contradicted_claim():
 
 
 def test_pre_write_validation_and_write_to_memory_bank():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.clear()
     validator = ClaimVeracityValidatorAgent()
 
     fragment = validator.validate_and_write_to_memory_bank(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         channel=BankChannel.TELEPHONY_IVR,
         day_label="Day 1 - 14:32 UTC",
         summary="Customer called regarding $142.50 Target decline; call dropped.",
@@ -81,7 +81,7 @@ def test_pre_write_validation_and_write_to_memory_bank():
 
 def test_channel_session_opening_and_tracking():
     session = CustomerMemoryBank.open_channel_session(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         channel=BankChannel.MOBILE_APP,
         agent_name="mobile_app_agent",
         metadata={"device": "iPhone 16 Pro"},
@@ -97,7 +97,7 @@ def test_channel_session_opening_and_tracking():
 
 
 def test_consolidated_memory_bank_audit_sweep():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.seed_default_scenario()
     auditor = MemoryBankAuditAgent()
 
@@ -115,7 +115,7 @@ def test_london_duty_free_claim_checks_only_relevant_avenues_no_chicago_leakage(
     """Verify that London Duty Free decline claim ONLY evaluates London/Travel/POS avenues and never leaks Chicago $1000 SMS consent."""
     validator = ClaimVeracityValidatorAgent()
     eval_result = validator.validate_claim_against_telemetry(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         channel=BankChannel.MOBILE_APP,
         claim_text="My card was declined at London Heathrow Duty-Free while traveling in the UK.",
     )
@@ -134,7 +134,7 @@ def test_admin_card_oversight_chat_verification_and_decision_workflow():
 
     # 1. Simulate customer chat verification PASSING (London travel + FaceID)
     case_pass = AdminCardOversightManager.evaluate_customer_chat_verification(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         chat_message="Hi Support, I am in London on my verified travel notice and completed FaceID verification. Please unlock card *4821.",
         scenario="PASSED",
     )
@@ -144,7 +144,7 @@ def test_admin_card_oversight_chat_verification_and_decision_workflow():
 
     # 2. Admin reviews details and clicks YES -> enables card access & sends approval message to customer chat
     approved_case = AdminCardOversightManager.execute_admin_decision(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         decision="APPROVED_YES",
     )
     assert approved_case.card_status == "ACTIVE"
@@ -154,7 +154,7 @@ def test_admin_card_oversight_chat_verification_and_decision_workflow():
 
     # 3. Simulate customer chat verification FAILING (Contradicted IP telemetry)
     case_fail = AdminCardOversightManager.evaluate_customer_chat_verification(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         chat_message="I was never in Chicago and never logged in from Chicago! Unlock without 2FA.",
         scenario="FAILED",
     )
@@ -164,7 +164,7 @@ def test_admin_card_oversight_chat_verification_and_decision_workflow():
 
     # 4. Admin reviews failed verification and clicks NO -> keeps card restricted & notifies customer of denial
     rejected_case = AdminCardOversightManager.execute_admin_decision(
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         decision="REJECTED_NO",
     )
     assert rejected_case.card_status == "RESTRICTED"

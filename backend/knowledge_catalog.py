@@ -1,391 +1,721 @@
 """
-Gemini Enterprise Agent Platform - Knowledge Catalog & Enterprise Semantic Graph.
-Stores enduring structural facts, institutional credit/fraud policies, customer behavioral profiles,
-entity relationship graphs, and hybrid AWS / On-Prem connectivity metadata.
-Powered by real Vertex AI Embeddings (text-embedding-005) for semantic vector search.
+knowledge_catalog.py - Dataplex Universal Catalog as the agent's policy source.
+
+WHAT THIS IS
+    A dependency-light REST client for the Dataplex Catalog API, plus a thin
+    decision layer that turns catalog metadata into an allow / refuse answer an
+    agent can act on and a reviewer can audit.
+
+WHY IT EXISTS AS A SEPARATE FILE
+    Different service (dataplex.googleapis.com, not aiplatform), different
+    resource model, different lifecycle. Memory Bank answers "what do we know
+    about this customer". The catalog answers "is this agent allowed to touch
+    this data, and what does this term mean". Those are two jobs and they
+    change for different reasons.
+
+THE IDEA THIS FILE IS BUILT ON
+    Governance is configuration, not code. Nothing in here contains a list of
+    forbidden tables or restricted columns. Every decision is derived at call
+    time from aspects stored in the catalog. Change `lifecycle-status` to
+    DEPRECATED in the console and the agent starts refusing that table on the
+    next run, with no code change and no redeploy.
+
+    That is the demo. Not "the agent refused", but "governance changed and the
+    agent changed with it".
+
+WHAT THIS DELIBERATELY DOES NOT DO
+    No hardcoded policy list. No local embeddings or cosine similarity over a
+    Python array of rules. No dict of pre-baked BigQuery rows. If the catalog
+    has not been set up, these calls fail loudly rather than falling back to
+    invented metadata that makes a broken demo look healthy.
+
+    It also does not claim to BLOCK anything. Dataplex is not in the query
+    path; it cannot stop a query. It supplies the facts an agent needs to stop
+    itself, and this file records whether it did. Hard enforcement is IAM,
+    column-level security and the tool surface - see authorize() for where the
+    two meet.
+
+THE ASPECT CONTRACT THIS READS
+    The kit's aspect types deliberately separate the human label from the
+    machine instruction:
+
+        level:          RESTRICTED        <- what a person reads
+        agent_behavior: REFUSE            <- what the agent executes
+
+    This file only ever acts on `agent_behavior`. A label alone stops nothing.
+
+API SURFACE USED (all REST, no SDK)
+    GET  /v1/{location}:lookupEntry?entry=...&view=ALL   read a BigQuery entry
+    POST /v1/{location}:searchEntries                    find entries
+    GET  /v1/{glossary}/terms/{term}                     one business term
+    GET  /v1/{glossary}/terms                            all terms
+    GET  /v1/{entryGroup}/entryLinks                     term <-> column links
+
+    All paths mirror exactly what scripts/setup_catalog.py writes.
+
+Reference:
+    https://cloud.google.com/dataplex/docs/reference/rest
 """
 
-import math
+from __future__ import annotations
+
+import argparse
+import json
 import os
-import logging
-from typing import Dict, Any, List, Optional
-import certifi
-from dotenv import load_dotenv
-from google import genai
-from backend.models import PolicyRule, EntityNode, EntityEdge
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field as dataclass_field
+from typing import Any, Dict, List, Optional, Sequence
 
-load_dotenv()
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+# Printed when the catalog did not return a value. Never a default, never a
+# guess, never a zero. Same rule as memory_bank.py.
+NOT_RECORDED = "n/r"
 
-
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot_product / (norm_a * norm_b)
+DATAPLEX_HOST = "dataplex.googleapis.com"
+DEFAULT_LOCATION = "us-central1"
+DEFAULT_ENTRY_GROUP = "@bigquery"
+DEFAULT_TIMEOUT = 30
 
 
-class AWSOnPremHybridConnector:
-    """
-    Models cross-cloud and hybrid data federation from AWS and On-Premise data sources
-    into Vertex AI Memory Bank and Knowledge Catalog without requiring full Agent Builder lock-in.
-    """
+class CatalogError(RuntimeError):
+    """An API call failed. Status and body, unedited."""
 
-    @staticmethod
-    def get_connector_topology() -> Dict[str, Any]:
-        return {
-            "architecture_mode": "DECOUPLED_HYBRID_FEDERATION",
-            "auth_mechanism": "Google Cloud Workload Identity Federation (Keyless AWS IAM <-> GCP STS)",
-            "network_transport": "Cross-Cloud Interconnect + Private Service Connect (PSC)",
-            "data_sources": [
-                {
-                    "source_id": "aws-rds-card-ledger",
-                    "environment": "AWS (us-east-1)",
-                    "service": "Amazon Aurora PostgreSQL (Core Card Authorization Ledger)",
-                    "sync_mode": "CDC Streaming via Kafka / PubSub Bridge",
-                    "p50_latency_ms": 11.4,
-                    "p99_latency_ms": 24.8,
-                    "encryption": "CMEK + TLS 1.3 mTLS",
-                    "status": "ONLINE_SYNCED",
-                },
-                {
-                    "source_id": "aws-s3-interaction-lake",
-                    "environment": "AWS (us-east-1)",
-                    "service": "Amazon S3 (Multi-Year Customer Interaction & Transcript Archive)",
-                    "sync_mode": "BigQuery Omni Zero-Copy + Asynchronous Memory Compaction",
-                    "p50_latency_ms": 18.2,
-                    "p99_latency_ms": 42.0,
-                    "encryption": "AWS KMS <-> GCP Cloud KMS Federation",
-                    "status": "ONLINE_SYNCED",
-                },
-                {
-                    "source_id": "onprem-ibm-zseries",
-                    "environment": "JPMC On-Premise Core Mainframe (New York Metro)",
-                    "service": "IBM zSeries CICS / DB2 (Account Statements & Settlement Balances)",
-                    "sync_mode": "Dedicated Interconnect Direct Peering (REST/gRPC Gateway)",
-                    "p50_latency_ms": 8.7,
-                    "p99_latency_ms": 16.5,
-                    "encryption": "IPsec + Quantum-Safe TLS",
-                    "status": "ONLINE_SYNCED",
-                },
-            ],
-            "performance_penalty_analysis": {
-                "synchronous_cross_cloud_penalty_ms": 11.4,
-                "preload_memory_cache_hit_latency_ms": 2.1,
-                "mitigation_strategy": (
-                    "Asynchronous event ingestion (generate_memories()) decouples AWS/On-Prem write latency "
-                    "from user turn latency. PreloadMemoryTool caches hot semantic vectors at session start."
-                ),
-            },
-        }
+    def __init__(self, status: int, url: str, body: str):
+        self.status = status
+        self.url = url
+        self.body = body
+        super().__init__("HTTP %s from %s\n%s" % (status, url, body))
 
 
-class KnowledgeCatalog:
-    """
-    Enterprise Knowledge Catalog storing enduring structural ground truths, regulatory policies,
-    customer behavioral baselines, and semantic entity graphs.
-    Uses Vertex AI text-embedding-005 vector similarity for policy discovery.
-    Can be queried standalone via REST/SDK by any agent framework (ADK, LangGraph, CrewAI, Custom).
+def field(obj: Optional[Dict[str, Any]], *path: str, default: Any = NOT_RECORDED) -> Any:
+    """Reads a nested field or returns "n/r". The only place a missing value
+    becomes printable, and it never invents one."""
+    node: Any = obj
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return default
+        node = node[key]
+    if node is None or node == "" or node == []:
+        return default
+    return node
+
+
+# ---------------------------------------------------------------------------
+# The REST client
+# ---------------------------------------------------------------------------
+
+
+class DataplexCatalogClient:
+    """Dataplex Universal Catalog, spoken to directly over HTTPS.
+
+    Auth is a bearer token: the access_token argument, then the
+    CATALOG_TOKEN environment variable, then google.auth default credentials.
+    Identical to the Memory Bank client, because it is the same OAuth scope
+    against a different service.
     """
 
-    _embedding_cache: Dict[str, List[float]] = {}
-    _client: Optional[genai.Client] = None
+    def __init__(
+        self,
+        project: str,
+        location: str = DEFAULT_LOCATION,
+        dataset: Optional[str] = None,
+        glossary_id: Optional[str] = None,
+        entry_group: str = DEFAULT_ENTRY_GROUP,
+        access_token: Optional[str] = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        verbose: bool = True,
+    ):
+        if not project:
+            raise ValueError("project is required.")
+        self.project = project
+        self.location = location
+        self.dataset = dataset
+        self.glossary_id = glossary_id
+        self.entry_group = entry_group
+        self.timeout = timeout
+        self.verbose = verbose
+        self._token = access_token
+        self.calls: List[str] = []
 
-    _policies: Dict[str, PolicyRule] = {
-        "POL-REG-E-001": PolicyRule(
-            policy_id="POL-REG-E-001",
-            title="Regulation E & JPMC Zero Liability Protection Policy",
-            category="FRAUD_AND_DISPUTES",
-            regulatory_framework="12 CFR Part 1005 (Regulation E) / JPMC Consumer Card Agreement",
-            description=(
-                "Protects consumers from financial liability for unauthorized electronic fund transfers and credit card "
-                "charges reported promptly. However, transactions where authenticated step-up consent (e.g., SMS OTP or "
-                "biometric Y/N confirmation) was explicitly provided by the primary accountholder device require "
-                "a First-Party Consent Audit before provisional credit is issued."
-            ),
-            decision_criteria=[
-                "Verify whether card was physically present (EMV Chip/Contactless) or Card-Not-Present.",
-                "Audit whether Step-Up Two-Factor Verification (SMS Y/N or Biometric Push) was triggered and approved.",
-                "Cross-reference customer device GPS/IP location against merchant terminal location at transaction timestamp.",
-            ],
-            automated_action="Run 5-Avenue Ground-Truth Claim Veracity Audit before auto-disputing or issuing provisional credit.",
-        ),
-        "POL-STEP-UP-2FA-002": PolicyRule(
-            policy_id="POL-STEP-UP-2FA-002",
-            title="Multi-Step Out-of-Pattern Transaction Verification Protocol (Decline -> Y/N Consent -> Retry)",
-            category="STEP_UP_AUTHENTICATION",
-            regulatory_framework="FFIEC Authentication in an Internet Banking Environment / JPMC RiskOps Standard",
-            description=(
-                "When a card transaction exhibits high behavioral deviation or out-of-region spend without an active "
-                "Travel Notice, the authorization engine automatically DECLINES the first attempt and dispatches an "
-                "instant SMS/Push Step-Up challenge asking the customer to reply 'Y' (Yes, I authorized this) or 'N' (No, block card). "
-                "If 'Y' is received from the customer's verified mobile phone number within 15 minutes, a temporary "
-                "single-merchant override window opens allowing the customer to retry and complete the purchase."
-            ),
-            decision_criteria=[
-                "Initial high-risk transaction must be declined with code STEP_UP_REQUIRED.",
-                "SMS/Push prompt dispatched to registered phone number on file.",
-                "If customer replies 'Y', subsequent retry for the identical merchant and amount within 15 minutes is APPROVED.",
-                "If customer later claims fraud on a 'Y'-consented retry, flag as PARTIALLY_VERIFIED_CONSENT_DISPUTE and audit SIM-swap / device telemetry.",
-            ],
-            automated_action="Correlate initial decline, SMS 'Y/N' timestamp, carrier/device telemetry, and retry approval.",
-        ),
-        "POL-GEO-VEL-003": PolicyRule(
-            policy_id="POL-GEO-VEL-003",
-            title="Geo-Velocity Containment & Travel Notice Exception Policy",
-            category="VELOCITY_RISK_MANAGEMENT",
-            regulatory_framework="JPMC Enterprise Fraud Velocity Ruleset v4.2",
-            description=(
-                "Concurrent authentication or transaction events across geographically distant metropolitan areas "
-                "(distance > 300 miles within < 60 minutes) trigger an automated SECURITY_LOCKED containment state "
-                "unless a verified Travel Notice or Mobile App Location Permission match exists in the Memory Bank."
-            ),
-            decision_criteria=[
-                "Calculate spatial distance and time delta between consecutive IP logins or POS swipes.",
-                "Check Memory Bank and Knowledge Catalog for active Travel Notices covering the destination region.",
-                "If unverified dual-location activity occurs (e.g., NY and Chicago within 9 minutes), lock card immediately.",
-            ],
-            automated_action="Place SECURITY_LOCKED on card instrument and require biometric 1-click identity re-verification.",
-        ),
-        "POL-VCN-ISSUANCE-004": PolicyRule(
-            policy_id="POL-VCN-ISSUANCE-004",
-            title="Instant Virtual Card Number (VCN) Provisioning & Emergency Travel Replacement",
-            category="CARD_CONTINUITY",
-            regulatory_framework="Visa/Mastercard Token Service (VTS) Digital Issuance Standard",
-            description=(
-                "When a traveling customer's physical card is compromised or locked due to fraud, the Issuance Sub-Agent "
-                "can provision an instant Digital Virtual Card Number (VCN) directly into Apple Pay / Google Pay after "
-                "biometric verification, while Logistics dispatches next-day physical plastic to their verified hotel address."
-            ),
-            decision_criteria=[
-                "Confirm customer identity via Mobile App Biometrics (FaceID/TouchID) or verified session.",
-                "Verify active travel itinerary or overseas location.",
-            ],
-            automated_action="Issue instant VCN token to digital wallet and schedule DHL/FedEx emergency courier delivery.",
-        ),
-    }
+    # -- names, mirroring scripts/setup_catalog.py -------------------------
 
-    _customer_risk_profiles: Dict[str, Dict[str, Any]] = {
-        "cust_jpmc_88329": {
-            "customer_id": "cust_jpmc_88329",
-            "full_name": "Alex Morgan",
-            "primary_residence": "New York, NY (Manhattan)",
-            "tenure_years": 6.5,
-            "credit_tier": "PRIME_PLUS (FICO 795)",
-            "historical_spending_baseline": {
-                "average_transaction_usd": 95.00,
-                "p95_transaction_usd": 420.00,
-                "max_single_tx_last_12m_usd": 1450.00,
-                "typical_merchant_categories": [
-                    "Airlines & Travel",
-                    "Fine Dining & Restaurants",
-                    "Department Stores (Target, Whole Foods)",
-                    "Digital Subscriptions",
-                ],
-                "atypical_high_risk_categories": [
-                    "Standalone High-Ticket Electronics > $800 in Unregistered Out-of-State Cities",
-                    "Cryptocurrency Exchanges",
-                    "Wire Transfers",
-                ],
-            },
-            "registered_devices": [
-                {
-                    "device_id": "dev-ios-991",
-                    "model": "iPhone 16 Pro",
-                    "os": "iOS 14.8.2",
-                    "biometric_status": "FACE_ID_ENROLLED",
-                    "phone_number": "+1-212-555-0198",
-                    "trusted": True,
-                },
-                {
-                    "device_id": "dev-mac-442",
-                    "model": "MacBookPro M3",
-                    "os": "macOS Sequoia",
-                    "browser": "Safari",
-                    "trusted": True,
-                },
-            ],
-            "prior_fraud_claims_last_3y": 0,
-            "behavioral_trust_score": 0.94,
-        },
-        "cust_jpmc_77412": {
-            "customer_id": "cust_jpmc_77412",
-            "full_name": "Jordan Taylor",
-            "primary_residence": "Dallas, TX",
-            "tenure_years": 3.2,
-            "credit_tier": "PRIME (FICO 740)",
-            "historical_spending_baseline": {
-                "average_transaction_usd": 110.00,
-                "p95_transaction_usd": 600.00,
-                "typical_merchant_categories": ["Domestic Airlines", "Gas & Automotive", "Groceries"],
-            },
-            "prior_fraud_claims_last_3y": 1,
-            "behavioral_trust_score": 0.88,
-        },
-    }
+    @property
+    def location_path(self) -> str:
+        return "projects/%s/locations/%s" % (self.project, self.location)
 
-    @classmethod
-    def _get_genai_client(cls) -> genai.Client:
-        if cls._client is None:
-            os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-            cls._client = genai.Client(
-                vertexai=True,
-                project=project_id,
-                location=location,
-            )
-        return cls._client
+    @property
+    def glossary_path(self) -> str:
+        if not self.glossary_id:
+            raise ValueError("glossary_id was not set on this client.")
+        return "%s/glossaries/%s" % (self.location_path, self.glossary_id)
 
-    @classmethod
-    def _get_embedding(cls, text: str) -> Optional[List[float]]:
-        if text in cls._embedding_cache:
-            return cls._embedding_cache[text]
+    def bigquery_entry_name(self, table: str, dataset: Optional[str] = None) -> str:
+        """The catalog entry name for a BigQuery table.
+
+        Exactly the shape setup_catalog.py writes, so what we read back is what
+        the kit created.
+        """
+        dataset = dataset or self.dataset
+        if not dataset:
+            raise ValueError("dataset is required to address a BigQuery table.")
+        return (
+            "%s/entryGroups/@bigquery/entries/bigquery.googleapis.com/"
+            "projects/%s/datasets/%s/tables/%s"
+            % (self.location_path, self.project, dataset, table)
+        )
+
+    # -- plumbing ----------------------------------------------------------
+
+    def token(self) -> str:
+        if self._token:
+            return self._token
+        env = os.environ.get("CATALOG_TOKEN") or os.environ.get("MEMORY_BANK_TOKEN")
+        if env:
+            self._token = env
+            return env
         try:
-            client = cls._get_genai_client()
-            res = client.models.embed_content(
-                model="text-embedding-005",
-                contents=text,
+            import google.auth
+            from google.auth.transport.requests import Request
+
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
-            if res.embeddings and res.embeddings[0].values:
-                vec = list(res.embeddings[0].values)
-                cls._embedding_cache[text] = vec
-                return vec
-        except Exception as e:
-            logging.debug("Vertex AI embedding lookup fallback triggered: %s", e)
+            creds.refresh(Request())
+            self._token = creds.token
+            return self._token
+        except Exception as exc:  # noqa: BLE001
+            raise CatalogError(
+                401, "(token)",
+                "No credential available. Pass access_token=, set CATALOG_TOKEN, "
+                "or install google-auth and run "
+                "`gcloud auth application-default login`. Cause: %s" % exc,
+            )
+
+    def _request(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(url=url, data=payload, method=method)
+        request.add_header("Authorization", "Bearer %s" % self.token())
+        request.add_header("Content-Type", "application/json")
+
+        self.calls.append("%s %s" % (method, url.split("/v1/")[-1][:110]))
+        if self.verbose:
+            print("  %-5s %s" % (method, url.replace("https://" + DATAPLEX_HOST, "")[:120]))
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                text = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise CatalogError(exc.code, url, exc.read().decode("utf-8", "replace"))
+        except urllib.error.URLError as exc:
+            raise CatalogError(0, url, "Network error: %s" % exc.reason)
+
+        return json.loads(text) if text.strip() else {}
+
+    # -- reads -------------------------------------------------------------
+
+    def lookup_entry(self, entry_name: str, view: str = "ALL") -> Dict[str, Any]:
+        """Reads one catalog entry with its aspects.
+
+        BigQuery entries live in the system-owned @bigquery entry group, so
+        they are read through :lookupEntry rather than a direct GET.
+        """
+        url = "https://%s/v1/%s:lookupEntry?%s" % (
+            DATAPLEX_HOST,
+            self.location_path,
+            urllib.parse.urlencode({"entry": entry_name, "view": view}),
+        )
+        return self._request("GET", url)
+
+    def get_entry(self, entry_name: str, view: str = "ALL") -> Dict[str, Any]:
+        """Direct read, for entries in a group we own rather than @bigquery."""
+        url = "https://%s/v1/%s?view=%s" % (DATAPLEX_HOST, entry_name, view)
+        return self._request("GET", url)
+
+    def search_entries(self, query: str, page_size: int = 20) -> List[Dict[str, Any]]:
+        """Catalog search. This is the call that surfaces the deprecated trap:
+        searching "authorizations" returns both tables, and only the aspects
+        tell you which one is current."""
+        url = "https://%s/v1/projects/%s/locations/global:searchEntries" % (
+            DATAPLEX_HOST, self.project,
+        )
+        body = {"query": query, "pageSize": page_size}
+        return self._request("POST", url, body).get("results", [])
+
+    def get_term(self, term_id: str) -> Dict[str, Any]:
+        url = "https://%s/v1/%s/terms/%s" % (DATAPLEX_HOST, self.glossary_path, term_id)
+        return self._request("GET", url)
+
+    def list_terms(self, page_size: int = 100) -> List[Dict[str, Any]]:
+        url = "https://%s/v1/%s/terms?pageSize=%d" % (
+            DATAPLEX_HOST, self.glossary_path, page_size,
+        )
+        return self._request("GET", url).get("terms", [])
+
+    def list_entry_links(self, entry_group: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Term-to-column links. This is what connects the business word
+        'provisional credit' to the actual column that holds it."""
+        group = entry_group or self.entry_group
+        url = "https://%s/v1/%s/entryGroups/%s/entryLinks" % (
+            DATAPLEX_HOST, self.location_path, group,
+        )
+        return self._request("GET", url).get("entryLinks", [])
+
+    # -- aspect access -----------------------------------------------------
+
+    def aspects_for(self, entry: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """The aspects map off an entry, keyed as the API returns it:
+        '{project}.{location}.{aspect-type}' for a table-level aspect, with an
+        '@Schema.{column}' suffix for a column-level one."""
+        return entry.get("aspects", {}) or {}
+
+    def aspect_data(self, entry: Dict[str, Any], aspect_type: str,
+                    column: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Finds one aspect's `data` payload, table-level or column-level.
+
+        Matches on the aspect type suffix rather than rebuilding the full key,
+        because the project and location prefix varies by deployment and we do
+        not want this to break when the kit is installed elsewhere.
+        """
+        wanted_suffix = aspect_type if column is None else "%s@Schema.%s" % (aspect_type, column)
+        for key, value in self.aspects_for(entry).items():
+            if key.endswith(wanted_suffix):
+                return value.get("data", {})
         return None
 
-    @classmethod
-    def get_all_policies(cls) -> List[PolicyRule]:
-        return list(cls._policies.values())
 
-    @classmethod
-    def get_policy(cls, policy_id: str) -> Optional[PolicyRule]:
-        return cls._policies.get(policy_id)
+# ---------------------------------------------------------------------------
+# Decisions
+# ---------------------------------------------------------------------------
 
-    @classmethod
-    def query_policies(cls, query: str, top_k: int = 3) -> List[PolicyRule]:
+
+@dataclass
+class Decision:
+    """One governance decision, with the evidence that produced it.
+
+    `evidence` is the point. A refusal an agent cannot justify is indis-
+    tinguishable from a refusal it invented, so every decision names the
+    aspect and field it came from.
+    """
+
+    allowed: bool
+    action: str                      # ALLOW | REFUSE | MASK | UNKNOWN
+    subject: str                     # the table or table.column asked about
+    reason: str = NOT_RECORDED
+    evidence: str = NOT_RECORDED     # which aspect and field decided it
+    replacement: Optional[str] = None
+    regulation: str = NOT_RECORDED
+
+    def as_trace_line(self) -> str:
+        kind = "out" if self.allowed else "deny"
+        return "%-5s %-44s %s" % (kind, self.subject, self.reason)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "action": self.action,
+            "subject": self.subject,
+            "reason": self.reason,
+            "evidence": self.evidence,
+            "replacement": self.replacement,
+            "regulation": self.regulation,
+        }
+
+
+class CatalogGovernor:
+    """The policy decision point the agent consults before touching data.
+
+    The agent asks; this class answers from live catalog metadata; the agent
+    obeys and the decision is logged. Nothing here has an opinion of its own -
+    remove the aspects from the catalog and every answer becomes UNKNOWN,
+    which is the honest result and not a silent ALLOW.
+    """
+
+    LIFECYCLE_ASPECT = "lifecycle-status"
+    SENSITIVITY_ASPECT = "sensitivity-class"
+
+    def __init__(self, client: DataplexCatalogClient, strict: bool = True):
+        self.client = client
+        # strict: an entry with no governing aspect is refused rather than
+        # allowed. Fail closed. Flip it only to show what the other choice costs.
+        self.strict = strict
+        self.decisions: List[Decision] = []
+
+    def _record(self, decision: Decision) -> Decision:
+        self.decisions.append(decision)
+        return decision
+
+    # -- table level -------------------------------------------------------
+
+    def check_table(self, table: str, dataset: Optional[str] = None) -> Decision:
+        """Is this table fit to use? Answered by its lifecycle-status aspect."""
+        entry_name = self.client.bigquery_entry_name(table, dataset)
+        try:
+            entry = self.client.lookup_entry(entry_name)
+        except CatalogError as error:
+            return self._record(Decision(
+                allowed=False, action="REFUSE", subject=table,
+                reason="Not in the catalog, so it is not governed data (HTTP %s)." % error.status,
+                evidence="lookupEntry failed",
+            ))
+
+        data = self.client.aspect_data(entry, self.LIFECYCLE_ASPECT)
+        if data is None:
+            return self._record(Decision(
+                allowed=not self.strict,
+                action="REFUSE" if self.strict else "ALLOW",
+                subject=table,
+                reason="No lifecycle-status aspect. Ungoverned data is refused in strict mode."
+                       if self.strict else "No lifecycle-status aspect; strict mode is off.",
+                evidence="aspect %s absent" % self.LIFECYCLE_ASPECT,
+            ))
+
+        status = field(data, "status")
+        replacement = field(data, "authoritative_replacement", default=None)
+        if status in ("DEPRECATED", "RETIRED", "QUARANTINED"):
+            return self._record(Decision(
+                allowed=False, action="REFUSE", subject=table,
+                reason="lifecycle %s%s" % (
+                    status, " - use %s instead" % replacement if replacement else ""),
+                evidence="%s.status = %s" % (self.LIFECYCLE_ASPECT, status),
+                replacement=replacement,
+            ))
+
+        return self._record(Decision(
+            allowed=True, action="ALLOW", subject=table,
+            reason="lifecycle %s" % status,
+            evidence="%s.status = %s" % (self.LIFECYCLE_ASPECT, status),
+        ))
+
+    # -- column level ------------------------------------------------------
+
+    def check_column(self, table: str, column: str,
+                     dataset: Optional[str] = None) -> Decision:
+        """May the agent read this column, and may it print the value?
+
+        Acts on `agent_behavior`, never on `level`. The label is for people.
         """
-        Semantic Vector Search across Knowledge Catalog policies using Vertex AI text-embedding-005.
-        Computes cosine similarity between query embedding vector and policy document vectors.
+        subject = "%s.%s" % (table, column)
+        entry_name = self.client.bigquery_entry_name(table, dataset)
+        try:
+            entry = self.client.lookup_entry(entry_name)
+        except CatalogError as error:
+            return self._record(Decision(
+                allowed=False, action="REFUSE", subject=subject,
+                reason="Entry not readable (HTTP %s)." % error.status,
+                evidence="lookupEntry failed",
+            ))
+
+        data = self.client.aspect_data(entry, self.SENSITIVITY_ASPECT, column=column)
+        evidence_scope = "%s@Schema.%s" % (self.SENSITIVITY_ASPECT, column)
+        if data is None:
+            table_data = self.client.aspect_data(entry, self.SENSITIVITY_ASPECT, column=None)
+            if table_data is not None:
+                data = table_data
+                evidence_scope = "%s (table default)" % self.SENSITIVITY_ASPECT
+            else:
+                return self._record(Decision(
+                    allowed=not self.strict,
+                    action="UNKNOWN" if not self.strict else "REFUSE",
+                    subject=subject,
+                    reason="No sensitivity-class aspect on this column.",
+                    evidence="aspect %s@Schema.%s absent" % (self.SENSITIVITY_ASPECT, column),
+                ))
+
+        behavior = field(data, "agent_behavior")
+        level = field(data, "level")
+        allowed = behavior not in ("REFUSE", "MASK")
+        return self._record(Decision(
+            allowed=allowed,
+            action=behavior if behavior != NOT_RECORDED else "UNKNOWN",
+            subject=subject,
+            reason=field(data, "rationale", default="governed by %s (%s)" % (evidence_scope, level)),
+            evidence="%s.agent_behavior = %s (level %s)" % (
+                evidence_scope, behavior, level),
+            replacement=field(data, "safe_alternative_column", default=None),
+            regulation=field(data, "regulation_reference"),
+        ))
+
+    # -- composite ---------------------------------------------------------
+
+    def authorize(self, table: str, columns: Sequence[str] = (),
+                  dataset: Optional[str] = None) -> Dict[str, Any]:
+        """The call an agent makes before it queries anything.
+
+        Returns a verdict plus every decision that fed it, so the trace can
+        show the reasoning rather than just the outcome.
         """
-        query_vec = cls._get_embedding(query)
-        if query_vec is not None:
-            scored_policies: List[tuple[float, PolicyRule]] = []
-            for pol in cls._policies.values():
-                doc_text = (
-                    f"{pol.policy_id} {pol.title} {pol.category} {pol.regulatory_framework} "
-                    f"{pol.description} {' '.join(pol.decision_criteria)} {pol.automated_action}"
-                )
-                pol_vec = cls._get_embedding(doc_text)
-                if pol_vec is not None:
-                    sim = _cosine_similarity(query_vec, pol_vec)
-                    scored_policies.append((sim, pol))
-            if scored_policies:
-                scored_policies.sort(key=lambda item: item[0], reverse=True)
-                return [item[1] for item in scored_policies[:top_k]]
-
-        query_lower = query.lower()
-        matched: List[PolicyRule] = []
-        for pol in cls._policies.values():
-            searchable = f"{pol.title} {pol.category} {pol.description} {' '.join(pol.decision_criteria)}".lower()
-            if any(term in searchable for term in query_lower.split() if len(term) > 2):
-                matched.append(pol)
-        return matched[:top_k] if matched else list(cls._policies.values())[:top_k]
-
-    @classmethod
-    def get_customer_risk_profile(cls, customer_id: str) -> Dict[str, Any]:
-        return cls._customer_risk_profiles.get(customer_id, {
-            "customer_id": customer_id,
-            "primary_residence": "Unknown",
-            "historical_spending_baseline": {
-                "average_transaction_usd": 100.00,
-                "typical_merchant_categories": ["General Retail"],
-            },
-            "behavioral_trust_score": 0.80,
-        })
-
-    @classmethod
-    def get_entity_subgraph(cls, customer_id: str = "cust_jpmc_88329") -> Dict[str, Any]:
-        """
-        Constructs the enterprise semantic knowledge graph mapping relationships between
-        Customer, Accounts, Card Instruments, Digital Wallet Tokens, Travel Notices, Transactions, and Policies.
-        """
-        nodes = [
-            EntityNode(
-                node_id=customer_id,
-                entity_type="CUSTOMER",
-                label="Alex Morgan",
-                attributes={"tier": "Chase Private Client / Sapphire", "home_city": "New York, NY"},
-            ),
-            EntityNode(
-                node_id="acct-sapphire-88329",
-                entity_type="CREDIT_ACCOUNT",
-                label="Sapphire Preferred Credit Line",
-                attributes={"credit_limit_usd": 25000.00, "current_balance_usd": 4280.50, "status": "ACTIVE"},
-            ),
-            EntityNode(
-                node_id="card-4821",
-                entity_type="CARD_INSTRUMENT",
-                label="Visa Infinite *4821",
-                attributes={"status": "SECURITY_LOCKED", "lock_reason": "Geo-Velocity NY/Chicago"},
-            ),
-            EntityNode(
-                node_id="tok-apple-pay-16pro",
-                entity_type="DIGITAL_WALLET_TOKEN",
-                label="Apple Pay Token (iPhone 16 Pro)",
-                attributes={"status": "PROVISIONING_BLOCKED", "error": "CARD_STATUS_LOCKED_RESTRICTED"},
-            ),
-            EntityNode(
-                node_id="trv-lon-2026",
-                entity_type="TRAVEL_NOTICE",
-                label="Travel Notice: London, UK (Sep 8 - Sep 15)",
-                attributes={"destination": "London, United Kingdom", "verified_by": "Mobile App Biometrics"},
-            ),
-            EntityNode(
-                node_id="tx-chi-1000",
-                entity_type="DISPUTED_TRANSACTION",
-                label="$1,000.00 @ Chicago Luxury Electronics",
-                attributes={
-                    "initial_attempt": "DECLINED (Step-Up Triggered)",
-                    "sms_consent_reply": "Y (Approved by +1-212-555-0198)",
-                    "retry_attempt": "APPROVED ($1,000.00 Posted)",
-                },
-            ),
-            EntityNode(
-                node_id="POL-STEP-UP-2FA-002",
-                entity_type="INSTITUTIONAL_POLICY",
-                label="Multi-Step Y/N Consent Protocol",
-                attributes={"framework": "FFIEC / JPMC RiskOps Standard"},
-            ),
-            EntityNode(
-                node_id="POL-REG-E-001",
-                entity_type="INSTITUTIONAL_POLICY",
-                label="Reg E Zero Liability Policy",
-                attributes={"framework": "12 CFR Part 1005"},
-            ),
-        ]
-
-        edges = [
-            EntityEdge(source_id=customer_id, target_id="acct-sapphire-88329", relationship="OWNS_ACCOUNT"),
-            EntityEdge(source_id="acct-sapphire-88329", target_id="card-4821", relationship="ISSUES_INSTRUMENT"),
-            EntityEdge(source_id="card-4821", target_id="tok-apple-pay-16pro", relationship="PROVISIONS_TOKEN"),
-            EntityEdge(source_id=customer_id, target_id="trv-lon-2026", relationship="REGISTERED_TRAVEL"),
-            EntityEdge(source_id="card-4821", target_id="tx-chi-1000", relationship="CHARGED_ON_INSTRUMENT"),
-            EntityEdge(source_id="tx-chi-1000", target_id="POL-STEP-UP-2FA-002", relationship="GOVERNED_BY_PROTOCOL"),
-            EntityEdge(source_id="tx-chi-1000", target_id="POL-REG-E-001", relationship="AUDITED_UNDER_POLICY"),
-        ]
+        table_decision = self.check_table(table, dataset)
+        column_decisions = [self.check_column(table, c, dataset) for c in columns]
+        blocked = [d for d in column_decisions if not d.allowed]
 
         return {
-            "customer_id": customer_id,
-            "graph_version": "ent-kg-v2.5-vector-indexed",
-            "embedding_model": "text-embedding-005 (768-dim Vertex AI)",
-            "node_count": len(nodes),
-            "edge_count": len(edges),
-            "nodes": [n.model_dump() for n in nodes],
-            "edges": [e.model_dump() for e in edges],
-            "hybrid_connector": AWSOnPremHybridConnector.get_connector_topology(),
+            "table": table,
+            "allowed": table_decision.allowed and not blocked,
+            "table_decision": table_decision.to_dict(),
+            "column_decisions": [d.to_dict() for d in column_decisions],
+            "blocked_columns": [d.subject for d in blocked],
+            "note": (
+                "The catalog does not block this query; it supplies the basis "
+                "for the agent to decline. Hard enforcement is IAM, column-level "
+                "security and the tool surface."
+            ),
         }
+
+    # -- meaning, not permission -------------------------------------------
+
+    def lookup_term(self, term_id: str) -> Dict[str, Any]:
+        """What does this business word mean, and who owns the definition?
+
+        This is the other half of the catalog's job. `check_*` decides what the
+        agent may touch; this decides what the answer means.
+        """
+        try:
+            term = self.client.get_term(term_id)
+        except CatalogError as error:
+            return {"term": term_id, "found": False,
+                    "error": "HTTP %s" % error.status, "definition": NOT_RECORDED}
+        return {
+            "term": term_id,
+            "found": True,
+            "display_name": field(term, "displayName"),
+            "definition": field(term, "description"),
+            "name": field(term, "name"),
+        }
+
+
+# ---------------------------------------------------------------------------
+# The demo
+# ---------------------------------------------------------------------------
+
+
+def run_governance_demo(governor: CatalogGovernor, dataset: Optional[str] = None) -> Dict[str, Any]:
+    """The two traps, answered from live catalog metadata.
+
+    Nothing below names a forbidden table or a restricted column as a literal.
+    The verdicts come from aspects read at call time, which is the difference
+    between a demo of governance and a demo of an if-statement.
+    """
+    client = governor.client
+    results: Dict[str, Any] = {"steps": []}
+
+    print("\n" + "=" * 74)
+    print("CATALOG GOVERNANCE - every verdict below is read, not hardcoded")
+    print("=" * 74)
+
+    # 1. Search is where the trap is set.
+    print("\n[1] Searching the catalog for \"authorizations\".")
+    try:
+        hits = client.search_entries("authorizations")
+        for hit in hits[:6]:
+            name = field(hit, "dataplexEntry", "name", default=field(hit, "name"))
+            print("      %s" % str(name).split("/")[-1])
+        print("      %d result(s). Nothing in the names says which is current." % len(hits))
+        results["steps"].append({"step": "search", "count": len(hits)})
+    except CatalogError as error:
+        print("      search unavailable: HTTP %s" % error.status)
+        results["steps"].append({"step": "search", "error": error.status})
+
+    # 2. The deprecated table.
+    print("\n[2] Asking the catalog about each one.")
+    for table in ("authorizations", "authorizations_deprecated_v1"):
+        decision = governor.check_table(table, dataset)
+        print("      %s" % decision.as_trace_line())
+        print("            evidence: %s" % decision.evidence)
+        if decision.replacement:
+            print("            use instead: %s" % decision.replacement)
+        results["steps"].append({"step": "check_table", **decision.to_dict()})
+
+    # 3. The restricted columns.
+    print("\n[3] Asking about the two columns the agent must never print.")
+    for table, column in (("customers", "ssn_last4"), ("cards", "pan_full"),
+                          ("customers", "segment")):
+        decision = governor.check_column(table, column, dataset)
+        print("      %s" % decision.as_trace_line())
+        print("            evidence: %s" % decision.evidence)
+        if decision.regulation != NOT_RECORDED:
+            print("            regulation: %s" % decision.regulation)
+        results["steps"].append({"step": "check_column", **decision.to_dict()})
+
+    # 4. The composite call an agent actually makes.
+    print("\n[4] What the agent asks before running a query.")
+    verdict = governor.authorize("customers", ["customer_id", "ssn_last4"], dataset)
+    print("      allowed: %s | blocked: %s" % (verdict["allowed"], verdict["blocked_columns"]))
+    print("      %s" % verdict["note"])
+    results["steps"].append({"step": "authorize", **verdict})
+
+    print("""
+WHAT TO SAY WHILE THIS RUNS
+  No table name and no column name in this file is marked forbidden. Every
+  verdict came from an aspect read a second ago.
+
+  So change lifecycle-status on `authorizations` to DEPRECATED in the console
+  and re-run: the agent refuses the table it was using a minute earlier. No
+  code change, no redeploy, no prompt edit. Governance moved and the agent
+  moved with it.
+
+  That is the whole argument for a catalog. Everything else is a data
+  dictionary with better marketing.
+""")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Factory Helper + Backward Compatibility Bridge
+# ---------------------------------------------------------------------------
+
+
+def create_default_catalog_governor(strict: bool = True, verbose: bool = False) -> CatalogGovernor:
+    """Creates a live DataplexCatalogClient + CatalogGovernor from environment variables."""
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "abhinayboda-genai-bb")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", DEFAULT_LOCATION)
+    dataset = os.environ.get("BQ_DATASET", "jpmc_ccb_fraud")
+    glossary_id = os.environ.get("DATAPLEX_GLOSSARY_ID", "ccb-fraud-disputes")
+    client = DataplexCatalogClient(
+        project=project,
+        location=location,
+        dataset=dataset,
+        glossary_id=glossary_id,
+        verbose=verbose,
+    )
+    return CatalogGovernor(client=client, strict=strict)
+
+
+try:
+    from backend.knowledge_catalog_old import (  # noqa: E402, F401
+        KnowledgeCatalog,
+        AWSOnPremHybridConnector,
+    )
+except Exception:  # pragma: no cover
+    pass
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Dataplex Universal Catalog as the agent's policy source.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples
+  python knowledge_catalog.py --project P --dataset jpmc_ccb_fraud govern
+  python knowledge_catalog.py --project P --dataset jpmc_ccb_fraud \\
+      table --name authorizations_deprecated_v1
+  python knowledge_catalog.py --project P --dataset jpmc_ccb_fraud \\
+      column --table customers --name ssn_last4
+  python knowledge_catalog.py --project P --glossary ccb-fraud-disputes \\
+      term --id provisional-credit
+  python knowledge_catalog.py --project P search --query authorizations
+""",
+    )
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--location", default=DEFAULT_LOCATION)
+    parser.add_argument("--dataset", default=os.environ.get("BQ_DATASET"))
+    parser.add_argument("--glossary", default=os.environ.get("DATAPLEX_GLOSSARY_ID"))
+    parser.add_argument("--access-token", default=None)
+    parser.add_argument("--lenient", action="store_true",
+                        help="Allow entries that carry no governing aspect. Off by default: "
+                             "ungoverned data should fail closed.")
+    parser.add_argument("--quiet", action="store_true")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("govern", help="Run the full governance demo.")
+
+    p_table = sub.add_parser("table", help="Check one table.")
+    p_table.add_argument("--name", required=True)
+
+    p_col = sub.add_parser("column", help="Check one column.")
+    p_col.add_argument("--table", required=True)
+    p_col.add_argument("--name", required=True)
+
+    p_term = sub.add_parser("term", help="Look up a glossary term.")
+    p_term.add_argument("--id", required=True)
+
+    p_terms = sub.add_parser("terms", help="List glossary terms.")
+
+    p_search = sub.add_parser("search", help="Search the catalog.")
+    p_search.add_argument("--query", required=True)
+
+    p_entry = sub.add_parser("entry", help="Dump one entry's aspects, raw.")
+    p_entry.add_argument("--table", required=True)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    client = DataplexCatalogClient(
+        project=args.project,
+        location=args.location,
+        dataset=args.dataset,
+        glossary_id=args.glossary,
+        access_token=args.access_token,
+        verbose=not args.quiet,
+    )
+    governor = CatalogGovernor(client, strict=not args.lenient)
+
+    try:
+        if args.command == "govern":
+            run_governance_demo(governor, args.dataset)
+
+        elif args.command == "table":
+            decision = governor.check_table(args.name)
+            print("\n%s" % decision.as_trace_line())
+            print("  evidence:    %s" % decision.evidence)
+            print("  regulation:  %s" % decision.regulation)
+            print("  replacement: %s" % (decision.replacement or NOT_RECORDED))
+
+        elif args.command == "column":
+            decision = governor.check_column(args.table, args.name)
+            print("\n%s" % decision.as_trace_line())
+            print("  action:     %s" % decision.action)
+            print("  evidence:   %s" % decision.evidence)
+            print("  regulation: %s" % decision.regulation)
+
+        elif args.command == "term":
+            info = governor.lookup_term(args.id)
+            print("\n%s" % info.get("display_name", NOT_RECORDED))
+            print("  %s" % info.get("definition", NOT_RECORDED))
+
+        elif args.command == "terms":
+            terms = client.list_terms()
+            print("\n%d term(s)" % len(terms))
+            for term in terms:
+                print("  %-34s %s" % (
+                    str(field(term, "name")).split("/")[-1], field(term, "displayName")))
+
+        elif args.command == "search":
+            hits = client.search_entries(args.query)
+            print("\n%d result(s)" % len(hits))
+            for hit in hits:
+                print("  %s" % field(hit, "dataplexEntry", "name", default=field(hit, "name")))
+
+        elif args.command == "entry":
+            entry = client.lookup_entry(client.bigquery_entry_name(args.table))
+            aspects = client.aspects_for(entry)
+            print("\n%d aspect(s) on %s" % (len(aspects), args.table))
+            for key, value in aspects.items():
+                print("\n  %s" % key)
+                for field_name, field_value in (value.get("data") or {}).items():
+                    print("      %-26s %s" % (field_name, field_value))
+
+    except CatalogError as error:
+        print("\nCatalog call failed.\n%s" % error, file=sys.stderr)
+        print("\nIf this is a 404, the catalog has not been set up in this project. "
+              "Run scripts/setup_catalog.py first. This file will not invent "
+              "metadata to cover for that.", file=sys.stderr)
+        return 1
+    except ValueError as error:
+        print("\n%s" % error, file=sys.stderr)
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

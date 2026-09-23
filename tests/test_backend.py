@@ -23,7 +23,7 @@ def test_session_endpoint(client):
 
     assert res.status_code == 200
     assert "session_id" in data
-    assert data["customer_id"] == "cust_jpmc_88329"
+    assert data["customer_id"] == "CUST00001"
     assert data["knowledge_catalog_status"] == "ONLINE"
 
 
@@ -47,12 +47,12 @@ def test_agents_list_endpoint(client):
 
 def test_channel_session_open_and_list_endpoints(client):
     res = client.post("/api/session/channel/open", json={
-        "customer_id": "cust_jpmc_88329",
+        "customer_id": "CUST00001",
         "channel": "MOBILE_APP",
         "agent_name": "mobile_app_agent",
         "metadata": {"device": "iPhone 16 Pro"},
     })
-    list_res = client.get("/api/session/channel/list?customer_id=cust_jpmc_88329")
+    list_res = client.get("/api/session/channel/list?customer_id=CUST00001")
 
     data = res.get_json()
     list_data = list_res.get_json()
@@ -66,7 +66,7 @@ def test_channel_session_open_and_list_endpoints(client):
 
 def test_claims_validate_and_write_endpoint(client):
     res = client.post("/api/claims/validate-and-write", json={
-        "customer_id": "cust_jpmc_88329",
+        "customer_id": "CUST00001",
         "channel": "MOBILE_APP",
         "claim_text": "I lost $1,000! Someone stole my card details and charged $1,000 in Chicago while I was in New York preparing for London!",
         "summary": "Customer claims $1,000 unauthorized charge in Chicago",
@@ -83,7 +83,7 @@ def test_claims_validate_and_write_endpoint(client):
 
 
 def test_knowledge_catalog_overview_endpoint(client):
-    res = client.get("/api/knowledge-catalog/overview?customer_id=cust_jpmc_88329")
+    res = client.get("/api/knowledge-catalog/overview?customer_id=CUST00001")
 
     data = res.get_json()
 
@@ -95,7 +95,7 @@ def test_knowledge_catalog_overview_endpoint(client):
 
 
 def test_memory_compact_endpoint(client):
-    res = client.post("/api/memory/compact", json={"customer_id": "cust_jpmc_88329"})
+    res = client.post("/api/memory/compact", json={"customer_id": "CUST00001"})
 
     data = res.get_json()
 
@@ -106,7 +106,7 @@ def test_memory_compact_endpoint(client):
 
 def test_standalone_external_agent_endpoint(client):
     res = client.post("/api/standalone/external-agent", json={
-        "customer_id": "cust_jpmc_88329",
+        "customer_id": "CUST00001",
         "query": "Disputing $1,000 Chicago charge",
         "framework": "LangGraph",
     })
@@ -120,7 +120,7 @@ def test_standalone_external_agent_endpoint(client):
 
 def test_agent_comparison_endpoint(client):
     res = client.post("/api/comparison/run", json={
-        "customer_id": "cust_jpmc_88329",
+        "customer_id": "CUST00001",
         "prompt": "Why was my card declined in London?",
     })
 
@@ -134,7 +134,7 @@ def test_agent_comparison_endpoint(client):
 
 
 def test_account_statement_endpoint(client):
-    res = client.get("/api/account/statement/cust_jpmc_88329")
+    res = client.get("/api/account/statement/CUST00001")
 
     data = res.get_json()
 
@@ -145,7 +145,7 @@ def test_account_statement_endpoint(client):
 
 def test_audit_sweep_endpoints(client):
     res = client.post("/api/audit/sweep")
-    cust_res = client.get("/api/audit/customer/cust_jpmc_88329")
+    cust_res = client.get("/api/audit/customer/CUST00001")
 
     data = res.get_json()
     cust_data = cust_res.get_json()
@@ -154,11 +154,11 @@ def test_audit_sweep_endpoints(client):
     assert data["status"] == "SUCCESS"
     assert data["report"]["customers_audited"] >= 1
     assert cust_res.status_code == 200
-    assert cust_data["customer_id"] == "cust_jpmc_88329"
+    assert cust_data["customer_id"] == "CUST00001"
 
 
 def test_telemetry_endpoint(client):
-    res = client.get("/api/telemetry/cust_jpmc_88329")
+    res = client.get("/api/telemetry/CUST00001")
 
     data = res.get_json()
 
@@ -167,15 +167,15 @@ def test_telemetry_endpoint(client):
 
 
 def test_memory_get_and_seed(client):
-    seed_res = client.post("/api/memory/seed", json={"customer_id": "cust_jpmc_88329"})
-    get_res = client.get("/api/memory/get?customer_id=cust_jpmc_88329")
+    seed_res = client.post("/api/memory/seed", json={"customer_id": "CUST00001"})
+    get_res = client.get("/api/memory/get?customer_id=CUST00001")
 
     data = get_res.get_json()
 
     assert seed_res.status_code == 200
     assert get_res.status_code == 200
     assert len(data["fragments"]) == 3
-    assert data["customer_id"] == "cust_jpmc_88329"
+    assert data["customer_id"] == "CUST00001"
 
 
 def test_stream_endpoint_schema_and_telemetry(client):
@@ -187,7 +187,7 @@ def test_stream_endpoint_schema_and_telemetry(client):
         payload = {
             "prompt": "why is nothing working?",
             "session_id": "test-session-123",
-            "customer_id": "cust_jpmc_88329",
+            "customer_id": "CUST00001",
         }
 
         res = client.post("/api/chat/stream", json=payload)
@@ -212,35 +212,35 @@ def test_stream_endpoint_schema_and_telemetry(client):
 def test_admin_card_oversight_api_endpoints():
     with app.test_client() as client:
         # 1. Get initial review case
-        res_get = client.get("/api/admin/card-review?customer_id=cust_jpmc_88329")
+        res_get = client.get("/api/admin/card-review?customer_id=CUST00001")
         assert res_get.status_code == 200
         data_get = res_get.get_json()
         assert data_get["status"] == "SUCCESS"
         assert "admin_review_case" in data_get
 
         # 2. Simulate customer chat verification PASSING
-        res_pass = client.post("/api/admin/chat-verify", json={"customer_id": "cust_jpmc_88329", "scenario": "PASSED"})
+        res_pass = client.post("/api/admin/chat-verify", json={"customer_id": "CUST00001", "scenario": "PASSED"})
         assert res_pass.status_code == 200
         data_pass = res_pass.get_json()
         assert data_pass["admin_review_case"]["verification_status"] == "VERIFIED_PASSED"
         assert data_pass["admin_review_case"]["confidence_score"] >= 0.90
 
         # 3. Admin clicks YES -> enables card
-        res_yes = client.post("/api/admin/card-decision", json={"customer_id": "cust_jpmc_88329", "decision": "APPROVED_YES"})
+        res_yes = client.post("/api/admin/card-decision", json={"customer_id": "CUST00001", "decision": "APPROVED_YES"})
         assert res_yes.status_code == 200
         data_yes = res_yes.get_json()
         assert data_yes["admin_review_case"]["card_status"] == "ACTIVE"
         assert "APPROVED" in data_yes["customer_notification_message"]
 
         # 4. Simulate customer chat verification FAILING
-        res_fail = client.post("/api/admin/chat-verify", json={"customer_id": "cust_jpmc_88329", "scenario": "FAILED"})
+        res_fail = client.post("/api/admin/chat-verify", json={"customer_id": "CUST00001", "scenario": "FAILED"})
         assert res_fail.status_code == 200
         data_fail = res_fail.get_json()
         assert data_fail["admin_review_case"]["verification_status"] == "VERIFICATION_FAILED"
         assert data_fail["admin_review_case"]["confidence_score"] < 0.50
 
         # 5. Admin clicks NO -> keeps restricted & notifies customer
-        res_no = client.post("/api/admin/card-decision", json={"customer_id": "cust_jpmc_88329", "decision": "REJECTED_NO"})
+        res_no = client.post("/api/admin/card-decision", json={"customer_id": "CUST00001", "decision": "REJECTED_NO"})
         assert res_no.status_code == 200
         data_no = res_no.get_json()
         assert data_no["admin_review_case"]["card_status"] == "RESTRICTED"

@@ -58,18 +58,15 @@ class MemoryBankSynthesizerAgent:
     def _call_genai_synthesis(self, prompt: str, memory_context: str, kg_context: str) -> str:
         """Invoke Gemini Enterprise model to synthesize Memory Bank & Knowledge Catalog notes."""
         system_instruction = (
-            "You are the senior Consumer Credit Synthesizer Agent for JPMorgan Chase.\n"
-            "You have direct real-time access to the customer's shared enterprise Memory Bank and Knowledge Catalog, "
-            "containing timestamped observations from decoupled banking subsystems (Fraud Velocity Engine, Contact Center IVR, Mobile App) "
-            "and ground-truth policies (Reg E Zero Liability, Multi-Step SMS Y/N Consent Protocol).\n\n"
+            "You are the senior Consumer Credit & Fraud Desk Synthesizer Agent for JPMorgan Chase.\n"
+            "You have direct real-time access to customer CUST00001's shared enterprise Memory Bank (Reasoning Engine 4277754991222980608) "
+            "and Dataplex Knowledge Catalog (ccb-fraud-disputes) / BigQuery dataset (jpmc_ccb_fraud).\n\n"
             "CRITICAL MANDATORY RULES:\n"
-            "1. ZERO QUESTIONS: Never ask the customer 'Can you tell me what happened?' or 'What seems to be the problem?'.\n"
-            "2. DIRECT CAUSAL CHAIN: Explain the complete interconnected story from start to finish based on the Memory Bank & Knowledge Catalog:\n"
-            "   - Day 1 (09:15 UTC): Fraud Velocity System placed a security lock on credit card (*4821) after detecting simultaneous logins from New York (MacBook) and Chicago, accompanied by a $1,000.00 Chicago Luxury Electronics charge (where an SMS 'Y' step-up consent reply was intercepted via SIM-swap/eSIM clone in Chicago while you were in NY).\n"
-            "   - Day 1 (14:32 UTC): Your phone call inquiring about a declined $142.50 Target purchase disconnected before the SMS passcode verification completed, leaving the card locked.\n"
-            "   - Day 2 (11:20 UTC): While traveling in London, UK (under your verified Travel Notice trv-lon-2026), your Heathrow Duty Free ($310) swipe and Apple Pay setup were rejected with error CARD_STATUS_LOCKED_RESTRICTED because the root lock remained active.\n"
-            "3. EMPATHETIC & DEFINITIVE: Reassure the customer that their account is protected under JPMC Zero Liability Policy (POL-REG-E-001) for the $1,000 Chicago charge.\n"
-            "4. IMMEDIATE PROACTIVE RESOLUTION: Provide the immediate 1-click biometric FaceID resolution to lift the lock, issue an instant Virtual Card Number (VCN) to Apple Pay in London, and credit $1,000.00."
+            "1. ZERO QUESTIONS: Never re-ask questions already consolidated across the 9 prior sessions and 5 channels.\n"
+            "2. DUAL RULEBOOK PRECISION:\n"
+            "   - Debit Card CARD00004 (DSP00033 · €620.00 in Lisbon) is governed by Regulation E (12 CFR 1005.11): provisional credit is required within 10 business days (due 23 Sep 2026, skipping weekends 12-13 & 19-20 Sep), with a 90-calendar-day foreign-initiated investigation window.\n"
+            "   - Credit Card CARD00002 (DSP00034 · €1,480.00 in Lisbon) is governed by Regulation Z (12 CFR 1026.13): provisional credit does NOT exist under Reg Z. Instead, the customer has the statutory right to withhold payment on the disputed amount while resolved within 2 billing cycles (max 90 days), and may not be reported delinquent.\n"
+            "3. CONTRADICTION RESOLUTION: Honor MEM00015 (customer returned early to NYC on 10 Sep 2026, superseding 18 Sep return on TRV00001) and MEM00017 (updated mobile *0146 superseding *0143), and reroute replacement courier SHP00001 to NYC home address."
         )
 
         user_content = (
@@ -92,11 +89,9 @@ class MemoryBankSynthesizerAgent:
         except Exception as exc:
             logging.warning(f"Live Gemini API invocation encountered fallback condition: {exc}")
             return (
-                "I see exactly what happened across your accounts over the last two days from our Memory Bank and Knowledge Catalog, and I'll explain the complete situation right away:\n\n"
-                "1. **The Root Cause (Fraud Security Lock & $1,000 Chicago Step-Up Audit - Day 1, 09:15 UTC)**: Our Fraud Velocity Engine detected concurrent logins from New York (your trusted MacBook) and Chicago within 9 minutes, alongside a **$1,000.00 charge at Chicago Luxury Electronics**. Although our step-up system declined the first attempt and received an SMS `'Y'` reply from a Chicago tower, our multi-avenue audit confirms that consent was intercepted via an unauthorized eSIM/SIM-swap while you were in New York preparing for your trip. To protect your account, card **4821** was placed on `SECURITY_LOCKED` status.\n\n"
-                "2. **The Incomplete Phone Call (Day 1, 14:32 UTC)**: When your in-store purchase of $142.50 at Target was declined, you called our automated phone support. However, the call disconnected before the SMS identity verification passcode could be confirmed, keeping the protective lock active.\n\n"
-                "3. **The London Travel & Apple Pay Failure (Day 2, 11:20 UTC)**: We see your verified Travel Notice (`trv-lon-2026`) for **London, United Kingdom**. When you attempted a $310.00 purchase at Heathrow Duty Free and tried to add card *4821 to Apple Pay on your iPhone 16 Pro, both were rejected with error `CARD_STATUS_LOCKED_RESTRICTED` due to the unresolved Day 1 lock.\n\n"
-                "**Immediate 1-Click Resolution**: Under **Policy POL-REG-E-001 (Zero Liability)**, we have flagged the $1,000.00 Chicago charge for an immediate provisional credit refund. Tap **'Verify Identity & Unlock Card *4821'** below to authenticate via FaceID on your iPhone 16 Pro—this will instantly unlock your account for your London trip and provision a Digital Virtual Card Number (VCN) directly into your Apple Pay wallet."
+                "1. **Debit Card (`CARD00004 · DSP00033` — Regulation E, 12 CFR 1005.11)**: Your €620.00 checking dispute is governed by Regulation E. Provisional credit is **required within 10 business days** of notification (09 Sep 2026). Skipping weekends (12–13 Sep and 19–20 Sep), your provisional credit deadline is **23 Sep 2026**, and the foreign-initiated investigation window is **90 calendar days** (08 Dec 2026).\n\n"
+                "2. **Credit Card (`CARD00002 · DSP00034` — Regulation Z, 12 CFR 1026.13)**: Under Regulation Z, **provisional credit does not exist** for open-end credit cards. Instead, you have the statutory right to **withhold payment** on the disputed €1,480.00 and related finance charges while we resolve the claim within 2 billing cycles (max 90 days), and we may not report the amount delinquent.\n\n"
+                "3. **Early Return & Courier Reroute (`MEM00015` Supersedes `MEM00003`)**: Memory Bank confirms you cut your Portugal trip short and landed at JFK on **10 Sep 2026** (superseding the planned 18 Sep return on `TRV00001`), and updated your mobile number to `*0146` (`MEM00017`). Both cards were frozen, 3 digital wallet tokens were revoked, a virtual card was issued, and physical replacement courier `SHP00001` has been rerouted from Hotel Avenida Palace in Lisbon to your NYC home address."
             )
 
     def synthesize_customer_issue(
@@ -112,9 +107,9 @@ class MemoryBankSynthesizerAgent:
         kg_context = json.dumps(
             {
                 "live_statement_balance_usd": statement.get("statement_summary", {}).get("current_posted_balance_usd"),
-                "verified_travel_notice": "London, UK (trv-lon-2026)",
+                "verified_travel_notice": "Lisbon, PT (TRV00001 superseded by MEM00015 early return 10 Sep)",
                 "customer_risk_profile": risk_profile.get("historical_spending_baseline"),
-                "governing_policies": ["POL-REG-E-001 (Zero Liability)", "POL-STEP-UP-2FA-002 (Step-Up Y/N Audit)"],
+                "governing_policies": ["12 CFR 1005.11 (Reg E Debit)", "12 CFR 1026.13 (Reg Z Credit)"],
             },
             indent=2,
         )
@@ -123,27 +118,27 @@ class MemoryBankSynthesizerAgent:
         causal_steps = [
             CausalStep(
                 step_number=1,
-                system="Fraud Monitoring & Step-Up Engine",
-                day_time="Day 1 - 09:15 UTC",
-                event="Concurrent NY/Chicago logins + $1,000 Chicago Electronics charge (SIM-swap SMS 'Y' interception).",
-                impact="Card (*4821) placed on SECURITY_LOCKED restriction; $1,000 flagged for Reg E credit.",
+                system="Contact Center IVR (SES00004)",
+                day_time="08 Sep - 21:15 UTC",
+                event="Wallet reported stolen in Alfama, Lisbon holding Debit CARD00004 and Credit CARD00002.",
+                impact="Both cards frozen; 3 wallet tokens revoked; virtual card issued.",
                 status="TRIGGER_EVENT",
             ),
             CausalStep(
                 step_number=2,
-                system="Inbound Voice IVR",
-                day_time="Day 1 - 14:32 UTC",
-                event="Call regarding $142.50 Target decline dropped before 2FA completed.",
-                impact="Security lock remained unverified and active.",
-                status="UNRESOLVED_INTERMEDIARY",
+                system="Policy & Compliance (Dataplex ccb-fraud-disputes)",
+                day_time="09 Sep - 09:06 UTC",
+                event="Opened DSP00033 (Debit · Reg E) and DSP00034 (Credit · Reg Z).",
+                impact="Debit provisional credit due 23 Sep (10 bus. days); Credit protected via right to withhold payment.",
+                status="DUAL_RULEBOOK_APPLIED",
             ),
             CausalStep(
                 step_number=3,
-                system="Mobile Banking App (London, UK)",
-                day_time="Day 2 - 11:20 UTC",
-                event="Heathrow Duty Free swipe & Apple Pay card provisioning rejected (CARD_STATUS_LOCKED_RESTRICTED).",
-                impact="Digital wallet setup blocked despite verified UK Travel Notice due to root card lock.",
-                status="DOWNSTREAM_FAILURE",
+                system="Mobile App & Memory Bank (SES00009)",
+                day_time="10 Sep - 07:20 UTC",
+                event="Customer returned early to JFK (MEM00015 supersedes MEM00003) and updated mobile to *0146 (MEM00017).",
+                impact="Replacement courier SHP00001 rerouted from Lisbon hotel to NYC home address.",
+                status="CONSOLIDATED_RESOLUTION",
             ),
         ]
 
@@ -151,41 +146,41 @@ class MemoryBankSynthesizerAgent:
             "type": "MemorySynthesisCard",
             "title": "Cross-System Memory Bank & Knowledge Catalog Synthesis",
             "customer_id": customer_id,
-            "root_cause": "Dual-City Geo-Velocity Anomaly & $1,000 Chicago SIM-Swap Interception",
-            "affected_instrument": "Chase Sapphire Preferred (*4821)",
+            "root_cause": "Lisbon Stolen Wallet · Dual-Regulation Dispute Split (Reg E vs Reg Z)",
+            "affected_instrument": "Debit CARD00004 (DSP00033) & Credit CARD00002 (DSP00034)",
             "timeline": [
                 {
-                    "day": "Day 1",
-                    "time": "09:15 UTC",
-                    "system": "Fraud Velocity & Step-Up Engine",
-                    "title": "Card Restricted ($1,000 Chicago SIM-Swap Alert)",
-                    "detail": "NY MacBook login vs Chicago $1,000 POS charge (SMS 'Y' intercepted). Auto-locked card *4821.",
-                    "status_badge": "LOCKED • REG E COVERED",
+                    "day": "08 Sep",
+                    "time": "21:15 UTC",
+                    "system": "Contact Center IVR",
+                    "title": "Stolen Wallet Reported in Lisbon",
+                    "detail": "Both CARD00004 (Debit) and CARD00002 (Credit) frozen; 3 tokens revoked.",
+                    "status_badge": "FROZEN · TOKENS REVOKED",
                     "badge_color": "danger",
                 },
                 {
-                    "day": "Day 1",
-                    "time": "14:32 UTC",
-                    "system": "Inbound Support IVR",
-                    "title": "Target $142.50 Decline & Dropped Call",
-                    "detail": "Inbound call disconnected before SMS 2FA completed.",
-                    "status_badge": "INCOMPLETE_AUTH",
-                    "badge_color": "warning",
+                    "day": "09 Sep",
+                    "time": "09:06 UTC",
+                    "system": "Dataplex Policy & Compliance",
+                    "title": "Two Disputes Opened (Reg E + Reg Z)",
+                    "detail": "DSP00033 (Reg E · prov. credit 23 Sep) and DSP00034 (Reg Z · withhold payment).",
+                    "status_badge": "2 RULES · 0 WRONG ANSWERS",
+                    "badge_color": "success",
                 },
                 {
-                    "day": "Day 2",
-                    "time": "11:20 UTC",
-                    "system": "Mobile Banking iOS (London, UK)",
-                    "title": "Heathrow & Apple Pay Setup Rejected",
-                    "detail": "Tokenization rejected in London (Travel Notice trv-lon-2026 verified) due to root lock.",
-                    "status_badge": "PROVISIONING_FAILED",
-                    "badge_color": "warning",
+                    "day": "10 Sep",
+                    "time": "07:20 UTC",
+                    "system": "Vertex AI Memory Bank",
+                    "title": "Early Return & Courier Reroute",
+                    "detail": "MEM00015 (10 Sep JFK return) supersedes MEM00003 (18 Sep); SHP00001 rerouted to NYC.",
+                    "status_badge": "CONSOLIDATED",
+                    "badge_color": "success",
                 },
             ],
             "resolution": {
-                "action_id": "ONE_CLICK_IDENTITY_UNLOCK",
-                "label": "Verify FaceID, Unlock Card *4821 & Credit $1,000",
-                "description": "One-touch biometric verification lifts lock, provisions Apple Pay VCN, and credits $1,000 Chicago fraud.",
+                "action_id": "DUAL_REG_RESOLUTION",
+                "label": "Confirm Reg E (23 Sep) + Reg Z (Withhold) & Reroute SHP00001",
+                "description": "Enforces freeze_card → revoke_wallet_token → issue_virtual_card → order_replacement_card.",
             },
         }
 

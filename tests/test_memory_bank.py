@@ -15,7 +15,7 @@ from backend.memory_bank import CustomerMemoryBank, StandaloneMemoryBankClient
 def test_memory_fragment_creation():
     frag = MemoryFragment(
         fragment_id="mem-001",
-        customer_id="cust_jpmc_88329",
+        customer_id="CUST00001",
         channel=BankChannel.FRAUD_DETECTION,
         timestamp=datetime(2026, 9, 7, 9, 15, 0, tzinfo=timezone.utc),
         day_label="Day 1 - 09:15 UTC",
@@ -31,7 +31,7 @@ def test_memory_fragment_creation():
 
 
 def test_customer_memory_bank_seeding():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.seed_default_scenario()
 
     fragments = mb.get_fragments()
@@ -44,7 +44,7 @@ def test_customer_memory_bank_seeding():
 
 
 def test_chronological_ordering():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.seed_default_scenario()
 
     fragments = mb.get_fragments()
@@ -54,7 +54,7 @@ def test_chronological_ordering():
 
 
 def test_ingest_custom_fragment():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.clear()
 
     mb.ingest_event(
@@ -70,7 +70,7 @@ def test_ingest_custom_fragment():
 
 
 def test_formatted_memory_context_string():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.seed_default_scenario()
 
     context_str = mb.get_formatted_context()
@@ -78,11 +78,11 @@ def test_formatted_memory_context_string():
     assert "FRAUD_DETECTION" in context_str
     assert "TELEPHONY_IVR" in context_str
     assert "MOBILE_APP" in context_str
-    assert "4821" in context_str
+    assert "CARD00004" in context_str
 
 
 def test_retrieve_relevant_memories_computes_token_savings():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.seed_default_scenario()
 
     result = mb.retrieve_relevant_memories(query="Chicago $1000 fraud lock", top_k=2)
@@ -92,7 +92,7 @@ def test_retrieve_relevant_memories_computes_token_savings():
 
 
 def test_compact_memories_consolidates_history_and_extracts_insights():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.seed_default_scenario()
 
     report = mb.compact_memories()
@@ -104,7 +104,7 @@ def test_compact_memories_consolidates_history_and_extracts_insights():
 
 
 def test_standalone_client_preloads_context_for_external_frameworks():
-    client = StandaloneMemoryBankClient(customer_id="cust_jpmc_88329")
+    client = StandaloneMemoryBankClient(customer_id="CUST00001")
 
     bundle = client.preload_context_for_external_agent(
         user_query="Why was my card declined in London?",

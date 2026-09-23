@@ -18,7 +18,7 @@ def test_agent_initialization():
 
 def test_synthesizer_zero_question_narrative_mocked():
     """Verify that agent synthesizes all 3 cross-system notes into a unified explanation without asking questions."""
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+    mb = CustomerMemoryBank(customer_id="CUST00001")
     mb.seed_default_scenario()
     
     agent = MemoryBankSynthesizerAgent(project_id="arsanjani-genai", location="us-central1")
@@ -34,7 +34,7 @@ def test_synthesizer_zero_question_narrative_mocked():
     
     with patch.object(agent, "_call_genai_synthesis", return_value=mock_llm_response):
         result = agent.synthesize_customer_issue(
-            customer_id="cust_jpmc_88329",
+            customer_id="CUST00001",
             user_prompt="why is nothing working?",
             memory_bank=mb
         )
