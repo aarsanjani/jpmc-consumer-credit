@@ -190,6 +190,18 @@ function groupSpansIntoSteps(spans, t0) {
         (f.sql || "query") +
         " · " + (o.rows != null ? o.rows + " rows" : "n/r rows") +
         (o.job_id ? " · job " + o.job_id : "");
+    } else if (span.label === "channel.produce") {
+      kind = "out";
+      what =
+        (f.agent || "channel") + " [" + (f.channel || "n/r") + "]" +
+        " · " + (o.sessions != null ? o.sessions + " sessions" : "n/r") +
+        " · " + (o.memories != null ? o.memories + " memories" : "n/r");
+    } else if (span.label === "fraud.card_control_or_escalate") {
+      kind = "out";
+      what =
+        (f.agent || "fraud_monitoring_agent") + " [" + (f.action || "CARD_BLOCK") + "]" +
+        " · " + (o.suspicious_rows != null ? o.suspicious_rows + " suspicious" : "n/r") +
+        " · " + (o.geo_rows != null ? o.geo_rows + " geo rows" : "n/r");
     } else if (span.label === "catalog.discover") {
       what =
         "searched " + (f.search || "") +
@@ -228,10 +240,16 @@ function groupSpansIntoSteps(spans, t0) {
 async function fetchAndRenderTrace(runId) {
   try {
     const resp = await fetch("/api/trace/" + (runId || "latest"));
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      renderRoster();
+      return;
+    }
     const data = await resp.json();
     const spans = (data.spans || []).slice().sort((a, b) => a.started_ms - b.started_ms);
-    if (!spans.length) return;
+    if (!spans.length) {
+      renderRoster();
+      return;
+    }
 
     const t0 = spans[0].started_ms;
     const last = spans.reduce((m, s) => Math.max(m, s.started_ms + s.elapsed_ms), t0);
@@ -247,12 +265,12 @@ async function fetchAndRenderTrace(runId) {
       { deny: 0, sql: 0, jobs: 0 }
     );
 
-    setAgentCountText(steps.length + " phases");
-    setRunMetaText(runMeta + " · " + steps.length + " steps · " + wall);
+    setAgentCountText("8 agents · " + steps.length + " phases");
+    setRunMetaText(runMeta + " · 8-agent desk · " + steps.length + " phases · " + wall);
     setStampText(runMeta + " · " + wall + " · ad-hoc SQL " + totals.sql);
     setTruthEngineText(
-      steps.length + " governed steps · " + wall + " · " + totals.jobs +
-      " BigQuery jobs · " + totals.deny + " refusals · ad-hoc SQL " + totals.sql
+      "8-agent hub-and-spoke · 5 live channels · " + steps.length + " phases in " + wall + " · " +
+      totals.jobs + " BigQuery jobs · " + totals.deny + " refusals · ad-hoc SQL " + totals.sql
     );
     pick(0);
     buildMenu();
@@ -266,16 +284,60 @@ async function fetchAndRenderTrace(runId) {
 function renderRoster() {
   const rosterList = $("agentRosterList");
   if (!rosterList) return;
-  if (!AGENTS.length) {
-    rosterList.innerHTML = "<div class='item'><p class='rd'>n/r — no run traced yet.</p></div>";
+
+  const summary = STATE.channelsSummary;
+  const deskAgents = (summary && Array.isArray(summary.agents)) ? summary.agents : [];
+  const channelMap = {};
+  if (summary && summary.snapshot && Array.isArray(summary.snapshot.channels)) {
+    summary.snapshot.channels.forEach((ch) => {
+      channelMap[ch.agent_id] = ch;
+      channelMap[ch.agent_name] = ch;
+    });
+  }
+
+  let html = "";
+  if (AGENTS.length) {
+    html += AGENTS.map((a, idx) => {
+      return `<div class="item ${a.state}" style="cursor:pointer" data-step="${idx}">
+        <div class="item-top"><span class="dot"></span>
+        <span class="nm">${escapeHtml(a.name)}</span><span class="tag ok">${escapeHtml(a.ms)}</span></div>
+        <p class="rd">${a.tools} spans &middot; ${a.contracts} golden &middot; ${a.deny} refused &middot; ${a.jobs} bq</p></div>`;
+    }).join("");
+  }
+
+  if (deskAgents.length) {
+    html += deskAgents.map((ag) => {
+      const ch = channelMap[ag.agent_id] || channelMap[ag.name];
+      const isAudit = ag.name === "memory_bank_audit_agent";
+      const isHub = ag.name === "consumer_credit_synthesizer_agent";
+      let badge = isAudit ? "ASYNC JOB" : (isHub ? "HUB · 7 SPOKES" : "LIVE");
+      let tagClass = isAudit ? "" : "ok";
+      let subline = escapeHtml(ag.role || "");
+      if (ch) {
+        badge = escapeHtml(ch.channel_label) + " · " + ch.session_count + " sess";
+        subline = `${ch.session_count} sessions &middot; ${ch.event_count} events &middot; ${ch.memory_count} memories &middot; ${(ag.tools || []).length} tools`;
+      } else if (isAudit) {
+        const st = (STATE.auditSweep && STATE.auditSweep.status) || "IDLE";
+        badge = "ASYNC · " + st;
+        subline = "95s consolidated sweep kept off turn path &middot; trigger on demand";
+      } else if (isHub) {
+        const totSess = (summary && summary.snapshot && summary.snapshot.total_sessions) || 0;
+        subline = `Synthesizes ${totSess} sessions across 5 channels + Dataplex glossary`;
+      }
+      return `<div class="item done">
+        <div class="item-top"><span class="dot"></span>
+        <span class="nm">${escapeHtml(ag.agent_id.replace(/_/g, " "))}</span>
+        <span class="tag ${tagClass}">${badge}</span></div>
+        <p class="rd">${subline}</p></div>`;
+    }).join("");
+  }
+
+  if (!html) {
+    rosterList.innerHTML = "<div class='item'><p class='rd'>Loading 8-agent desk &amp; 5 live channels…</p></div>";
     return;
   }
-  rosterList.innerHTML = AGENTS.map((a, idx) => {
-    return `<div class="item ${a.state}" style="cursor:pointer" data-step="${idx}">
-      <div class="item-top"><span class="dot"></span>
-      <span class="nm">${escapeHtml(a.name)}</span><span class="tag ok">${escapeHtml(a.ms)}</span></div>
-      <p class="rd">${a.contracts} golden &middot; ${a.deny} refused &middot; ${a.conditional} owner-only &middot; ${a.jobs} bq</p></div>`;
-  }).join("");
+
+  rosterList.innerHTML = html;
   rosterList.querySelectorAll("[data-step]").forEach((el) => {
     el.addEventListener("click", () => {
       pick(Number(el.getAttribute("data-step")));
@@ -753,6 +815,15 @@ function renderGovernanceTraps(spans) {
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || "HTTP " + resp.status);
+      if (data.channels_snapshot) {
+        STATE.channelsSummary = STATE.channelsSummary || {};
+        STATE.channelsSummary.snapshot = data.channels_snapshot;
+        renderChannelEventStream(data.channels_snapshot);
+      }
+      if (data.audit_sweep) {
+        STATE.auditSweep = data.audit_sweep;
+        renderAuditSweepState(data.audit_sweep);
+      }
       await fetchAndRenderTrace(data.run_id);
       revealStepsInOrder();
       if (livePulse) livePulse.classList.add("done");
@@ -779,7 +850,6 @@ function renderGovernanceTraps(spans) {
       const resp = await fetch(`/api/testbed?customer_id=${encodeURIComponent(cid)}`);
       const data = await resp.json();
       STATE.testbedData = data;
-      if (data.run_id) { fetchAndRenderTrace(data.run_id); }
 
       if (!resp.ok) {
         // A failed upstream call is shown, not hidden behind stale markup.
@@ -1026,6 +1096,19 @@ function renderGovernanceTraps(spans) {
           )}</span>${data.needs ? ` <small>(needs ${escapeHtml(data.needs)})</small>` : ""}`;
         }
         return;
+      }
+
+      if (data.channels_snapshot) {
+        STATE.channelsSummary = STATE.channelsSummary || {};
+        STATE.channelsSummary.snapshot = data.channels_snapshot;
+        renderChannelEventStream(data.channels_snapshot);
+      }
+      if (data.audit_sweep) {
+        STATE.auditSweep = data.audit_sweep;
+        renderAuditSweepState(data.audit_sweep);
+      }
+      if (data.run_id) {
+        fetchAndRenderTrace(data.run_id);
       }
 
       if ($("askAnswerTitle")) {
@@ -1595,21 +1678,243 @@ function renderGovernanceTraps(spans) {
       btnRestrict.addEventListener("click", () => submitCardDecision("KEEP_RESTRICTED"));
     }
 
-        // 8. Memory Bank Compaction (#btnRunCompaction)
+  function renderChannelEventStream(snapshot) {
+    const streamList = $("eventStreamList");
+    const badge = $("eventStreamColBadge");
+    if (!streamList || !snapshot) return;
+
+    const totalSessions = snapshot.total_sessions || 0;
+    const totalEvents = snapshot.total_events || 0;
+    if (badge) {
+      badge.textContent = `04 / ${totalSessions} sess · ${totalEvents} events · 5 channels`;
+    }
+
+    const events = Array.isArray(snapshot.events) ? snapshot.events : [];
+    if (!events.length) {
+      streamList.innerHTML =
+        "<li><span class='t'>0</span><span class='e'>No channel sessions recorded for this scope.</span></li>";
+      return;
+    }
+
+    streamList.innerHTML = events.slice(0, 12).map((ev) => {
+      const ts = String(ev.timestamp || "").replace(/^.*T/, "").slice(0, 8) || "live";
+      const ch = escapeHtml(ev.channel || "CHANNEL");
+      const sid = escapeHtml(ev.session_id || "");
+      const txt = escapeHtml(ev.text || "");
+      return `<li>
+        <span class="t">${escapeHtml(ts)}</span>
+        <span class="e"><span class="tag ok" style="margin-right:5px;">${ch}</span><code>${sid}</code> &middot; ${txt}</span>
+      </li>`;
+    }).join("");
+  }
+
+  let _auditPollTimer = null;
+
+  function renderAuditSweepState(sweep) {
+    if (!sweep) return;
+    STATE.auditSweep = sweep;
+    const tag = $("auditSweepStatusTag");
+    const out = $("auditSweepOutput");
+    const btn = $("btnTriggerAuditSweep");
+
+    const status = sweep.status || "IDLE";
+    if (tag) {
+      tag.textContent = "ASYNC · " + status;
+      tag.className = status === "DONE" ? "tag ok" : (status === "RUNNING" ? "tag on" : "tag");
+    }
+    if (status === "RUNNING") {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "⏳ Running 95s sweep in background…";
+      }
+      if (out) {
+        out.textContent = `Job ${sweep.job_id || ""} started at ${sweep.started_at || ""} — running off the chat path…`;
+      }
+      if (!_auditPollTimer) {
+        _auditPollTimer = setInterval(async () => {
+          try {
+            const r = await fetch("/api/audit-sweep/status");
+            if (!r.ok) return;
+            const st = await r.json();
+            renderAuditSweepState(st);
+            renderRoster();
+            if (st.status !== "RUNNING" && _auditPollTimer) {
+              clearInterval(_auditPollTimer);
+              _auditPollTimer = null;
+            }
+          } catch (e) {
+            console.error("audit poll failed", e);
+          }
+        }, 4000);
+      }
+    } else {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "▶ Run 95s audit sweep (async)";
+      }
+      if (status === "DONE" && out) {
+        const secs = sweep.elapsed_ms ? (sweep.elapsed_ms / 1000).toFixed(1) + "s" : "n/r";
+        const rep = sweep.report || {};
+        const anomalies = Array.isArray(rep.anomalies_detected) ? rep.anomalies_detected.length : (rep.total_anomalies || 0);
+        out.textContent = `Sweep complete in ${secs} · ${anomalies} anomalies reported across enterprise Memory Bank.`;
+      } else if (status === "ERROR" && out) {
+        out.textContent = `Sweep error: ${sweep.error || "failed"}`;
+      }
+    }
+  }
+
+  async function loadChannelsAndRosterSummary(customerId) {
+    const cid = customerId || DEFAULT_CUSTOMER_ID;
+    try {
+      const resp = await fetch(`/api/channels/summary?customer_id=${encodeURIComponent(cid)}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      STATE.channelsSummary = data;
+      if (data.snapshot) {
+        renderChannelEventStream(data.snapshot);
+      }
+      if (data.audit_sweep) {
+        renderAuditSweepState(data.audit_sweep);
+      }
+      renderRoster();
+
+      // If no chat run has been executed yet in this server process, hydrate the
+      // livebar and header with the live 8-agent + 5-channel state instead of
+      // leaving "Waiting for trace...".
+      if (!AGENTS.length && data.snapshot) {
+        const totSess = data.snapshot.total_sessions || 0;
+        const totEv = data.snapshot.total_events || 0;
+        setAgentCountText("8 agents · 5 channels");
+        setRunMetaText(`8-agent hub-and-spoke desk · ${totSess} live sessions (${totEv} events) across 5 channels`);
+        setStampText(`${totSess} sessions · 5 channels live`);
+        setTruthEngineText(
+          `8-agent desk ready · FRAUD_OPS_OUTBOUND, IVR, MOBILE_APP, WEB_CHAT, BRANCH (${totSess} sessions in Memory Bank)`
+        );
+        const biKind = $("biKind");
+        const biText = $("biText");
+        const biMetrics = $("biMetrics");
+        if (biKind) biKind.textContent = "HUB";
+        if (biText) biText.textContent = `consumer_credit_synthesizer_agent + 7 spokes · ${totSess} channel sessions`;
+        if (biMetrics) biMetrics.textContent = "click Replay run → to trace a turn";
+      }
+    } catch (err) {
+      console.error("loadChannelsAndRosterSummary failed", err);
+    }
+  }
+
+  async function injectLiveChannelEvent() {
+    const sel = $("channelIngestSelect");
+    const txt = $("channelIngestText");
+    const statusEl = $("channelIngestStatus");
+    const btn = $("btnInjectChannelEvent");
+    const channel = (sel && sel.value) || "FRAUD_OPS_OUTBOUND";
+    const text = (txt && txt.value.trim()) || `Live ${channel} event recorded`;
+
+    if (btn) btn.disabled = true;
+    if (statusEl) statusEl.textContent = `Writing live ${channel} session to Vertex AI Memory Bank…`;
+    try {
+      const resp = await fetch(`/api/channel/${encodeURIComponent(channel)}/event`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customer_id: DEFAULT_CUSTOMER_ID,
+          text: text,
+          intent: "LIVE_OPERATOR_INJECTION",
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "HTTP " + resp.status);
+      if (data.snapshot) {
+        STATE.channelsSummary = STATE.channelsSummary || {};
+        STATE.channelsSummary.snapshot = data.snapshot;
+        renderChannelEventStream(data.snapshot);
+        renderRoster();
+      }
+      if (data.run_id) {
+        await fetchAndRenderTrace(data.run_id);
+      }
+      const sid = pvText(data.ingested && data.ingested.session_id);
+      if (statusEl) {
+        statusEl.textContent = `Ingested ${channel} session ${sid} into Memory Bank · producer updated (${data.snapshot ? data.snapshot.total_sessions : "n/r"} total sessions).`;
+      }
+    } catch (err) {
+      if (statusEl) statusEl.textContent = `Channel ingest failed: ${err.message}`;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function triggerFraudCardControl() {
+    const txt = $("channelIngestText");
+    const statusEl = $("channelIngestStatus");
+    const btn = $("btnFraudCardControl");
+    const reason = (txt && txt.value.trim()) || "Velocity + impossible-travel anomaly across channels";
+
+    if (btn) btn.disabled = true;
+    if (statusEl) statusEl.textContent = "Running fraud_monitoring_agent (Golden 03 + 04 + FRAUD_OPS_OUTBOUND action)…";
+    try {
+      const resp = await fetch("/api/fraud/card-control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customer_id: DEFAULT_CUSTOMER_ID,
+          action: "CARD_BLOCK_AND_ESCALATE",
+          reason: reason,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "HTTP " + resp.status);
+      if (data.snapshot) {
+        STATE.channelsSummary = STATE.channelsSummary || {};
+        STATE.channelsSummary.snapshot = data.snapshot;
+        renderChannelEventStream(data.snapshot);
+        renderRoster();
+      }
+      if (data.run_id) {
+        await fetchAndRenderTrace(data.run_id);
+      }
+      const out = data.outcome || {};
+      const susp = pvText(out.suspicious_activity_rows);
+      const geo = pvText(out.impossible_travel_rows);
+      if (statusEl) {
+        statusEl.textContent = `fraud_monitoring_agent staged CARD_BLOCK_AND_ESCALATE (suspicious=${susp}, geo=${geo}) → consumer_credit_synthesizer_agent.`;
+      }
+    } catch (err) {
+      if (statusEl) statusEl.textContent = `Fraud card control failed: ${err.message}`;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function triggerAsyncAuditSweep() {
+    try {
+      const resp = await fetch("/api/audit-sweep/trigger", { method: "POST" });
+      if (!resp.ok) return;
+      const st = await resp.json();
+      renderAuditSweepState(st);
+      renderRoster();
+    } catch (err) {
+      console.error("triggerAsyncAuditSweep failed", err);
+    }
+  }
+
+    // 8. Memory Bank Compaction (#btnRunCompaction)
     const btnCompaction = $("btnRunCompaction");
     if (btnCompaction) {
       btnCompaction.addEventListener("click", runMemoryCompaction);
     }
 
+    // 9. Live 5-channel ingestion (B), fraud card control (C), and async 95s audit sweep (4)
+    const btnInject = $("btnInjectChannelEvent");
+    if (btnInject) btnInject.addEventListener("click", injectLiveChannelEvent);
+    const btnFraud = $("btnFraudCardControl");
+    if (btnFraud) btnFraud.addEventListener("click", triggerFraudCardControl);
+    const btnSweep = $("btnTriggerAuditSweep");
+    if (btnSweep) btnSweep.addEventListener("click", triggerAsyncAuditSweep);
+
     // Initial background data hydration for canonical CUST00001
-    // Panels that only fill on a question say so, rather than sitting blank and
-    // looking broken.
-    const streamList = $("eventStreamList");
-    if (streamList && !streamList.children.length) {
-      streamList.innerHTML =
-        "<li><span class='t'>n/r</span><span class='e'>Ask a question to stream this case</span></li>";
-    }
     loadScenarios();
+    loadChannelsAndRosterSummary(DEFAULT_CUSTOMER_ID);
     loadDeploymentIdentity(DEFAULT_CUSTOMER_ID);
     loadEvalScorecard();
     loadLiveTestbed(DEFAULT_CUSTOMER_ID);

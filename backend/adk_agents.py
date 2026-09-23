@@ -39,8 +39,12 @@ verifier rather than taken on trust.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -68,6 +72,7 @@ from backend.provenance import (
     static,
     identity,
     unmeasured,
+    value_of,
     NOT_RECORDED,
     require_env,
     LIVE_API,
@@ -839,6 +844,36 @@ def _memory_rows(bank: MemoryBankClient, scope: Dict[str, str], query: str,
     return rows
 
 
+_SESSIONS_CACHE_LOCK = threading.Lock()
+_SESSIONS_CACHE_AT: float = 0.0
+_SESSIONS_CACHE_ROWS: List[Dict[str, Any]] = []
+_SESSIONS_CACHE_TTL_S = 3.0
+
+
+def invalidate_sessions_cache() -> None:
+    """Called after any session/event write so the next channel read sees it."""
+    global _SESSIONS_CACHE_AT, _SESSIONS_CACHE_ROWS
+    with _SESSIONS_CACHE_LOCK:
+        _SESSIONS_CACHE_AT = 0.0
+        _SESSIONS_CACHE_ROWS = []
+
+
+def _cached_list_sessions(bank: MemoryBankClient, explicit_client: Optional[MemoryBankClient]) -> List[Dict[str, Any]]:
+    """Avoids calling sessions.list five times within one turn across the 5 channels."""
+    global _SESSIONS_CACHE_AT, _SESSIONS_CACHE_ROWS
+    if explicit_client is not None:
+        return list(bank.list_sessions())
+    now = time.monotonic()
+    with _SESSIONS_CACHE_LOCK:
+        if _SESSIONS_CACHE_ROWS and (now - _SESSIONS_CACHE_AT) < _SESSIONS_CACHE_TTL_S:
+            return list(_SESSIONS_CACHE_ROWS)
+    rows = list(bank.list_sessions())
+    with _SESSIONS_CACHE_LOCK:
+        _SESSIONS_CACHE_ROWS = rows
+        _SESSIONS_CACHE_AT = time.monotonic()
+    return list(rows)
+
+
 def _produce_channel_payload(
     channel: str,
     channel_source: str,
@@ -858,8 +893,15 @@ def _produce_channel_payload(
     bank = _memory_bank(client)
     scope = {"customer_id": customer_id}
     tokens = CHANNEL_SESSION_TOKENS.get(channel, (channel,))
+    agent_name = channel_source.split(".")[0] if channel_source else channel.lower()
 
-    span = obs.turn("channel.produce", LOG, channel=channel, customer_id=customer_id)
+    span = obs.turn(
+        "channel.produce",
+        LOG,
+        channel=channel,
+        agent=agent_name,
+        customer_id=customer_id,
+    )
     with span as turn_handle:
         turn_handle.debug_payload("accepted channel tokens", list(tokens))
         if channel not in CHANNEL_SESSION_TOKENS:
@@ -877,7 +919,7 @@ def _produce_channel_payload(
         skipped_channel = 0
         seen_labels: Dict[str, int] = {}
 
-        for session in bank.list_sessions():
+        for session in _cached_list_sessions(bank, client):
             considered += 1
             if _session_customer_id(session) != customer_id:
                 skipped_scope += 1
@@ -1083,6 +1125,7 @@ def execute_one_click_card_unlock(
             text="One-click unlock staged for %s. Reason on record: %s" % (
                 card_id, reason or NOT_RECORDED),
         )
+        invalidate_sessions_cache()
         audit_session = live(session_name, "sessions.create")
         audit_event_time = _tagged_value(mb_field(event, "timestamp"), "sessions.appendEvent")
 
@@ -1098,6 +1141,228 @@ def execute_one_click_card_unlock(
         "audit_event_timestamp": audit_event_time,
         "card_platform_confirmation": unmeasured(
             "no card issuing platform client exists in this process"),
+    }
+
+
+def execute_fraud_card_control_or_escalate(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    card_id: str = DEFAULT_CARD_ID,
+    action: str = "CARD_BLOCK_AND_ESCALATE",
+    reason: str = "",
+    record_to_memory_bank: bool = True,
+    client: Optional[MemoryBankClient] = None,
+) -> Dict[str, Any]:
+    """FRAUD_OPS_OUTBOUND action tool for `fraud_monitoring_agent`.
+
+    Cross-checks live suspicious activity (Golden Query 03) and impossible-travel
+    geography (Golden Query 04) on `card_id`, then stages a card block/unblock or
+    escalates the case to `consumer_credit_synthesizer_agent` by writing the
+    decision into Vertex AI Memory Bank under channel `FRAUD_OPS_OUTBOUND`.
+    """
+    bank = _memory_bank(client)
+    with obs.turn(
+        "fraud.card_control_or_escalate",
+        LOG,
+        agent="fraud_monitoring_agent",
+        customer_id=customer_id,
+        card_id=card_id,
+        action=action,
+    ) as span:
+        suspicious = golden_03_suspicious_activity_on_card_window(card_id=card_id)
+        impossible_geo = golden_04_geo_impossible_travel(card_id=card_id)
+        susp_rows = value_of(suspicious.get("row_count", 0)) or 0
+        geo_rows = value_of(impossible_geo.get("row_count", 0)) or 0
+
+        audit_session = unmeasured("audit trail not written: record_to_memory_bank=False")
+        audit_event_time = unmeasured("audit trail not written: record_to_memory_bank=False")
+        if record_to_memory_bank:
+            session_name = bank.create_session(
+                user_id=customer_id,
+                display_name="FRAUD OPS %s %s" % (action, card_id),
+                session_state={
+                    "channel": "FRAUD_OPS_OUTBOUND",
+                    "customer_id": customer_id,
+                    "card_id": card_id,
+                    "intent": action,
+                },
+            )
+            event_text = (
+                "FRAUD_OPS_OUTBOUND [%s] on %s (suspicious_rows=%d, geo_impossible_rows=%d) "
+                "escalated to consumer_credit_synthesizer_agent. Reason: %s"
+                % (action, card_id, int(susp_rows), int(geo_rows), reason or "velocity + geo anomaly")
+            )
+            event = bank.append_event(
+                session_name=session_name,
+                author="fraud_monitoring_agent",
+                text=event_text,
+            )
+            invalidate_sessions_cache()
+            audit_session = live(session_name, "sessions.create")
+            audit_event_time = _tagged_value(mb_field(event, "timestamp"), "sessions.appendEvent")
+
+        span.detail(
+            action=action,
+            suspicious_rows=int(susp_rows),
+            geo_rows=int(geo_rows),
+        )
+        return {
+            "channel": identity("FRAUD_OPS_OUTBOUND", "fraud_monitoring_agent.channel", "agent identity constant"),
+            "customer_scope": computed({"customer_id": customer_id}, "scope argument sent to sessions.create"),
+            "card_id": computed(card_id, "card_id argument passed to execute_fraud_card_control_or_escalate"),
+            "action": computed(action, "action argument passed to execute_fraud_card_control_or_escalate"),
+            "escalation_target": identity(
+                "consumer_credit_synthesizer_agent",
+                "fraud_monitoring_agent.escalation_target",
+                "hub agent identity in the 8-agent topology",
+            ),
+            "suspicious_activity_rows": computed(int(susp_rows), "golden_03_suspicious_activity_on_card_window"),
+            "impossible_travel_rows": computed(int(geo_rows), "golden_04_geo_impossible_travel"),
+            "audit_session": audit_session,
+            "audit_event_timestamp": audit_event_time,
+            "card_platform_confirmation": unmeasured("no card issuing platform client exists in this process"),
+        }
+
+
+CANONICAL_SEEDED_CHANNEL_LABELS: Dict[str, str] = {
+    BankChannel.FRAUD_DETECTION.value: "FRAUD_OPS_OUTBOUND",
+    "FRAUD_OPS_OUTBOUND": "FRAUD_OPS_OUTBOUND",
+    BankChannel.TELEPHONY_IVR.value: "IVR",
+    "IVR": "IVR",
+    BankChannel.MOBILE_APP.value: "MOBILE_APP",
+    BankChannel.WEB_PORTAL.value: "WEB_CHAT",
+    "WEB_CHAT": "WEB_CHAT",
+    BankChannel.BRANCH_SUPPORT.value: "BRANCH",
+    "BRANCH": "BRANCH",
+}
+
+
+def ingest_live_channel_event(
+    channel: str,
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    text: str = "",
+    intent: str = "LIVE_CHANNEL_EVENT",
+    card_id: str = DEFAULT_CARD_ID,
+    author: str = "",
+    client: Optional[MemoryBankClient] = None,
+) -> Dict[str, Any]:
+    """Writes a live event into Vertex AI Memory Bank under the channel's token.
+
+    Because `_produce_channel_payload` reads from the same engine and matches on
+    `CHANNEL_SESSION_TOKENS`, the corresponding channel producer spoke picks up
+    this session on the very next read.
+    """
+    bank = _memory_bank(client)
+    raw_upper = (channel or "").strip().upper()
+    canonical_label = CANONICAL_SEEDED_CHANNEL_LABELS.get(raw_upper, raw_upper or "WEB_CHAT")
+    event_author = author or ("channel_producer:%s" % canonical_label.lower())
+
+    with obs.turn(
+        "channel.ingest",
+        LOG,
+        channel=canonical_label,
+        customer_id=customer_id,
+        intent=intent,
+    ) as span:
+        session_name = bank.create_session(
+            user_id=customer_id,
+            display_name="%s · %s" % (canonical_label, intent),
+            session_state={
+                "channel": canonical_label,
+                "customer_id": customer_id,
+                "card_id": card_id,
+                "intent": intent,
+            },
+        )
+        event = bank.append_event(
+            session_name=session_name,
+            author=event_author,
+            text=text or ("%s live event recorded on %s" % (canonical_label, card_id)),
+        )
+        invalidate_sessions_cache()
+        session_id = str(session_name).split("/")[-1] if session_name else NOT_RECORDED
+        span.detail(session_id=session_id, channel=canonical_label)
+        return {
+            "channel_label": live(canonical_label, "sessions.create"),
+            "customer_id": computed(customer_id, "scope argument sent to sessions.create"),
+            "session_id": live(session_id, "sessions.create"),
+            "session_name": live(session_name, "sessions.create"),
+            "intent": computed(intent, "intent argument sent to sessions.create"),
+            "text": computed(text, "event text appended via sessions.appendEvent"),
+            "timestamp": _tagged_value(mb_field(event, "timestamp"), "sessions.appendEvent"),
+        }
+
+
+def produce_all_channels_snapshot(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    include_events: bool = True,
+    top_k: int = DEFAULT_CHANNEL_TOP_K,
+    client: Optional[MemoryBankClient] = None,
+) -> Dict[str, Any]:
+    """Runs all 5 channel producer tools against live Vertex AI Memory Bank.
+
+    Uses a warm session list and runs the 5 producers concurrently with
+    `contextvars.copy_context()` so every producer's `channel.produce` span lands
+    inside the caller's active trace run.
+    """
+    bank = _memory_bank(client)
+    _cached_list_sessions(bank, client)
+
+    specs = [
+        ("01_fraud_monitoring_agent", "fraud_monitoring_agent", "FRAUD_OPS_OUTBOUND", query_fraud_velocity_alerts),
+        ("02_telephony_ivr_agent", "telephony_ivr_agent", "IVR", query_ivr_call_records),
+        ("03_mobile_app_agent", "mobile_app_agent", "MOBILE_APP", query_mobile_wallet_events),
+        ("04_web_portal_agent", "web_portal_agent", "WEB_CHAT", query_web_portal_activity),
+        ("05_branch_support_agent", "branch_support_agent", "BRANCH", query_branch_teller_interactions),
+    ]
+
+    def _call_one(spec_tuple):
+        agent_id, agent_name, label, fn = spec_tuple
+        payload = fn(customer_id=customer_id, include_events=include_events, top_k=top_k)
+        sessions = payload.get("sessions", [])
+        events_flat: List[Dict[str, Any]] = []
+        for sess in sessions:
+            sid = value_of(sess.get("session_id"))
+            ch_label = value_of(sess.get("channel_label_in_data")) or label
+            created = value_of(sess.get("create_time"))
+            for ev in sess.get("events", []) or []:
+                events_flat.append({
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "channel": ch_label,
+                    "session_id": sid,
+                    "timestamp": value_of(ev.get("timestamp")) or created,
+                    "author": value_of(ev.get("author")),
+                    "text": value_of(ev.get("text")),
+                })
+        return {
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "channel_label": label,
+            "session_count": value_of(payload.get("session_count", 0)) or 0,
+            "memory_count": value_of(payload.get("memory_count", 0)) or 0,
+            "event_count": len(events_flat),
+            "events": events_flat,
+            "payload": payload,
+        }
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [
+            pool.submit(contextvars.copy_context().run, _call_one, spec)
+            for spec in specs
+        ]
+        channels = [fut.result() for fut in futures]
+
+    all_events: List[Dict[str, Any]] = []
+    for ch in channels:
+        all_events.extend(ch["events"])
+    all_events.sort(key=lambda e: str(e.get("timestamp") or ""), reverse=True)
+
+    return {
+        "customer_id": customer_id,
+        "total_sessions": sum(c["session_count"] for c in channels),
+        "total_events": len(all_events),
+        "channels": channels,
+        "events": all_events,
     }
 
 
@@ -1324,17 +1589,21 @@ def create_consumer_credit_synthesizer_agent(
     fraud_monitoring_agent = _spoke_agent(
         name="fraud_monitoring_agent",
         model=model,
-        description="Fraud Velocity Specialist (CHANNEL_PRODUCER, FRAUD_DETECTION): reads seeded velocity and card-lock sessions from Memory Bank.",
+        description="Fraud Velocity Specialist (CHANNEL_PRODUCER, FRAUD_DETECTION / FRAUD_OPS_OUTBOUND): reads velocity sessions, scores Golden Queries 03 & 04, and stages card block/unblock or escalates to the synthesizer.",
         instruction=(
-            "You are the FRAUD_DETECTION channel producer. Call query_fraud_velocity_alerts "
-            "with the customer_id you were given and report only what it returns. "
-            "If it returns no sessions and no memories, say so plainly - never supply an "
-            "example alert, and render any missing field as n/r."
+            "You are the FRAUD_DETECTION (FRAUD_OPS_OUTBOUND) channel producer and actor. "
+            "Call query_fraud_velocity_alerts with the customer_id in scope, cross-check "
+            "velocity and impossible-travel telemetry with "
+            "golden_03_suspicious_activity_on_card_window and golden_04_geo_impossible_travel, "
+            "and when anomalous activity is confirmed call execute_fraud_card_control_or_escalate "
+            "to stage a card block/unblock or escalate to consumer_credit_synthesizer_agent. "
+            "If a tool returns no sessions and no rows, say so plainly and render missing fields as n/r."
         ),
         tools=[
             FunctionTool(query_fraud_velocity_alerts),
             FunctionTool(golden_03_suspicious_activity_on_card_window),
             FunctionTool(golden_04_geo_impossible_travel),
+            FunctionTool(execute_fraud_card_control_or_escalate),
         ],
     )
 
@@ -1473,15 +1742,16 @@ def list_all_agents() -> List[AgentDescriptor]:
         AgentDescriptor(
             agent_id="01_fraud_monitoring_agent",
             name="fraud_monitoring_agent",
-            role="Fraud Velocity Specialist (CHANNEL_PRODUCER)",
+            role="Fraud Velocity Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)",
             channel=BankChannel.FRAUD_DETECTION,
             model=model_name,
             tools=[
                 "query_fraud_velocity_alerts",
                 "golden_03_suspicious_activity_on_card_window",
                 "golden_04_geo_impossible_travel",
+                "execute_fraud_card_control_or_escalate",
             ],
-            description="Reads the seeded FRAUD_DETECTION sessions for the customer in scope and scores the window with Golden Queries 03 and 04. Empty channel returns empty.",
+            description="Monitors FRAUD_DETECTION / FRAUD_OPS_OUTBOUND sessions, scores velocity and geography with Golden Queries 03 and 04, and stages card block/unblock or escalates to the synthesizer.",
         ),
         AgentDescriptor(
             agent_id="02_telephony_ivr_agent",
@@ -1543,11 +1813,11 @@ def list_all_agents() -> List[AgentDescriptor]:
         AgentDescriptor(
             agent_id="07_memory_bank_audit_agent",
             name="memory_bank_audit_agent",
-            role="Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR)",
+            role="Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)",
             channel=None,
             model=model_name,
             tools=["run_consolidated_memory_audit_sweep"],
-            description="Runs the enterprise-wide consolidated sweep across customer memory banks and reports anomalies. Implemented in backend/veracity_and_audit.py.",
+            description="Async / scheduled enterprise-wide consolidated sweep across customer memory banks (kept off the synchronous chat path; triggerable on demand).",
         ),
         AgentDescriptor(
             agent_id="08_consumer_credit_synthesizer_agent",
@@ -1555,7 +1825,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             role="Lead Synthesizer Orchestrator (LEAD_SYNTHESIZER)",
             channel=BankChannel.CORE_BANKING,
             model=model_name,
-            tools=["read_customer_memory_bank", "execute_one_click_card_unlock"],
+            tools=["list_memory_topics_tool", "read_customer_memory_bank", "execute_one_click_card_unlock"],
             description="Hub of the topology: collects every spoke's account, reconstructs the causal chain from Memory Bank, and stages the one-click unlock with its audit trail.",
         ),
     ]

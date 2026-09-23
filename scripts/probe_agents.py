@@ -71,6 +71,7 @@ LOG = obs.get_logger("probe")
 # reported as SKIPPED unless the operator opts in.
 WRITE_TOOLS = {
     "execute_one_click_card_unlock",
+    "execute_fraud_card_control_or_escalate",
     "validate_and_record_customer_claim",
 }
 

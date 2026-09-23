@@ -31,6 +31,7 @@ if root_dir not in sys.path:
 import importlib
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -931,6 +932,19 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
     # them, and the validator independently re-runs what it needs rather than
     # trusting a result handed to it. That is why the same query id appears
     # twice in one turn.
+    channels_snapshot: Dict[str, Any] = {"channels": [], "events": [], "total_sessions": 0, "total_events": 0}
+    if _adk is not None and hasattr(_adk, "produce_all_channels_snapshot"):
+        with obs.turn("phase.0_channels", LOG, customer_id=customer_id, channels=5) as _t:
+            try:
+                channels_snapshot = _adk.produce_all_channels_snapshot(customer_id=customer_id)
+                _t.detail(
+                    sessions=channels_snapshot.get("total_sessions", 0),
+                    events=channels_snapshot.get("total_events", 0),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.error("Channel snapshot production failed: %s", exc)
+                _t.detail(status="failed", error=str(exc))
+
     with obs.turn("phase.1_evidence", LOG, scenario=scenario,
                   avenues=len(AVENUE_PLANS[scenario])) as _t:
         avenues = [_run_avenue(spec, customer_id) for spec in AVENUE_PLANS[scenario]]
@@ -946,7 +960,8 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
                 glossary.append(unmeasured("dataplex.glossaryTerms.get:%s (%s)" % (term_id, exc)))
         _t.detail(resolved=sum(1 for g in glossary if isinstance(g, dict) and g.get("value")))
 
-    with obs.turn("phase.3_veracity", LOG, validator="ClaimVeracityValidatorAgent") as _t:
+    with obs.turn("phase.3_veracity", LOG, agent="claim_veracity_validator_agent",
+                  validator="ClaimVeracityValidatorAgent") as _t:
         if _veracity is None:
             verdict = {
                 "veracity_status": unmeasured("backend.veracity_and_audit"),
@@ -984,7 +999,8 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
 
     # Hand the turn to Memory Bank. Extraction and consolidation run inside the
     # managed service; this process never decides what is worth remembering.
-    with obs.turn("phase.4_memory_write", LOG, scope=customer_id) as _t:
+    with obs.turn("phase.4_memory_write", LOG, agent="consumer_credit_synthesizer_agent",
+                  scope=customer_id) as _t:
         try:
             operation = memory_client().generate_from_contents(
                 turns=[{"role": "user", "text": claim_text}] if claim_text else [],
@@ -1003,6 +1019,8 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
         "channel": identity(channel_str, "request payload channel", "the channel the turn arrived on"),
         "scenario": identity(scenario, "request payload preset_id", "operator-selected demo scenario"),
         "claim_text": computed(claim_text or NOT_RECORDED, "request payload prompt"),
+        "channels_snapshot": channels_snapshot,
+        "audit_sweep": dict(_AUDIT_SWEEP_STATE),
         "glossary_terms": glossary,
         "tool_trajectory": _containment_trajectory(),
         "veracity_evaluation": {
@@ -1019,6 +1037,149 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
         "memory_write_operation": write_back,
         "timestamp": computed(datetime.now(timezone.utc).isoformat(), "server clock"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Async 95s Consolidated Audit Sweep state & endpoints (Decision 4) +
+# Live 5-channel ingestion (Decision B) + Fraud Card Control (Decision C)
+# ---------------------------------------------------------------------------
+
+_AUDIT_SWEEP_LOCK = threading.Lock()
+_AUDIT_SWEEP_STATE: Dict[str, Any] = {
+    "status": "IDLE",
+    "job_id": None,
+    "started_at": None,
+    "completed_at": None,
+    "elapsed_ms": None,
+    "report": None,
+    "error": None,
+}
+
+
+def _run_audit_sweep_worker(job_id: str) -> None:
+    started_perf = time.perf_counter()
+    with obs.run_context(run_id=job_id, kind="audit"):
+        with obs.turn("audit.consolidated_sweep", LOG, agent="memory_bank_audit_agent") as span:
+            try:
+                report = _adk.run_consolidated_memory_audit_sweep() if _adk else {}
+                elapsed = round((time.perf_counter() - started_perf) * 1000.0, 1)
+                span.detail(status="DONE", elapsed_ms=elapsed)
+                with _AUDIT_SWEEP_LOCK:
+                    _AUDIT_SWEEP_STATE.update({
+                        "status": "DONE",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": elapsed,
+                        "report": report,
+                        "error": None,
+                    })
+            except Exception as exc:  # noqa: BLE001
+                elapsed = round((time.perf_counter() - started_perf) * 1000.0, 1)
+                span.detail(status="ERROR", error=str(exc))
+                with _AUDIT_SWEEP_LOCK:
+                    _AUDIT_SWEEP_STATE.update({
+                        "status": "ERROR",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": elapsed,
+                        "error": "%s: %s" % (type(exc).__name__, exc),
+                    })
+
+
+@app.route("/api/audit-sweep/status", methods=["GET"])
+def get_audit_sweep_status():
+    with _AUDIT_SWEEP_LOCK:
+        return jsonify(dict(_AUDIT_SWEEP_STATE))
+
+
+@app.route("/api/audit-sweep/trigger", methods=["POST"])
+def trigger_audit_sweep():
+    with _AUDIT_SWEEP_LOCK:
+        if _AUDIT_SWEEP_STATE.get("status") == "RUNNING":
+            return jsonify(dict(_AUDIT_SWEEP_STATE))
+        job_id = "aud-" + datetime.now(timezone.utc).strftime("%H%M%S")
+        _AUDIT_SWEEP_STATE.update({
+            "status": "RUNNING",
+            "job_id": job_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "elapsed_ms": None,
+            "report": None,
+            "error": None,
+        })
+        t = threading.Thread(target=_run_audit_sweep_worker, args=(job_id,), daemon=True)
+        t.start()
+        return jsonify(dict(_AUDIT_SWEEP_STATE))
+
+
+@app.route("/api/channels/summary", methods=["GET"])
+def get_channels_summary():
+    """Live 5-channel session/event summary + 8-agent roster + audit sweep status."""
+    with obs.run_context(kind="probe") as run_id:
+        customer_id = arg_customer()
+        snapshot = (
+            _adk.produce_all_channels_snapshot(customer_id=customer_id)
+            if _adk and hasattr(_adk, "produce_all_channels_snapshot")
+            else {"channels": [], "events": [], "total_sessions": 0, "total_events": 0}
+        )
+        roster = [a.model_dump(mode="json") for a in _adk.list_all_agents()] if _adk else []
+        with _AUDIT_SWEEP_LOCK:
+            sweep = dict(_AUDIT_SWEEP_STATE)
+        return jsonify({
+            "run_id": run_id,
+            "customer_id": customer_id,
+            "snapshot": snapshot,
+            "agents": roster,
+            "audit_sweep": sweep,
+        })
+
+
+@app.route("/api/channel/<channel>/event", methods=["POST"])
+def post_live_channel_event(channel: str):
+    """Decision B: writes a live channel event into Vertex AI Memory Bank and re-reads all 5 channels."""
+    with obs.run_context(kind="chat") as run_id:
+        body = payload()
+        customer_id = body_customer(body)
+        text = str(body.get("text") or body.get("message") or "").strip()
+        intent = str(body.get("intent") or "LIVE_CHANNEL_EVENT").strip()
+        card_id = str(body.get("card_id") or DEFAULT_CREDIT_CARD_ID).strip()
+        ingested = _adk.ingest_live_channel_event(
+            channel=channel,
+            customer_id=customer_id,
+            text=text,
+            intent=intent,
+            card_id=card_id,
+        )
+        snapshot = _adk.produce_all_channels_snapshot(customer_id=customer_id)
+        return jsonify({
+            "status": "SUCCESS",
+            "run_id": run_id,
+            "ingested": ingested,
+            "snapshot": snapshot,
+        })
+
+
+@app.route("/api/fraud/card-control", methods=["POST"])
+def post_fraud_card_control():
+    """Decision C: invokes fraud_monitoring_agent's execute_fraud_card_control_or_escalate tool."""
+    with obs.run_context(kind="chat") as run_id:
+        body = payload()
+        customer_id = body_customer(body)
+        card_id = str(body.get("card_id") or DEFAULT_CREDIT_CARD_ID).strip()
+        action = str(body.get("action") or "CARD_BLOCK_AND_ESCALATE").strip()
+        reason = str(body.get("reason") or "Velocity + geo anomaly detected across channels").strip()
+        outcome = _adk.execute_fraud_card_control_or_escalate(
+            customer_id=customer_id,
+            card_id=card_id,
+            action=action,
+            reason=reason,
+            record_to_memory_bank=True,
+        )
+        snapshot = _adk.produce_all_channels_snapshot(customer_id=customer_id)
+        return jsonify({
+            "status": "SUCCESS",
+            "run_id": run_id,
+            "outcome": outcome,
+            "snapshot": snapshot,
+        })
 
 
 @app.route("/api/chat", methods=["POST"])

@@ -17,8 +17,8 @@
 
     <div class="pickwrap" id="pickwrap">
       <button class="tok" id="tok" type="button" aria-haspopup="listbox" aria-expanded="false">
-        <span class="ix" id="tokIx">06</span>
-        <span class="an" id="tokName">memory writer</span>
+        <span class="ix" id="tokIx">08</span>
+        <span class="an" id="tokName">consumer_credit_synthesizer_agent</span>
         <span class="cv">▾</span>
       </button>
       <div class="menu" id="menu" role="listbox" hidden>
@@ -169,13 +169,39 @@
     </div>
 
     <div class="col">
-      <div class="colhead"><h2>Event stream</h2><span class="n">04 / this case</span></div>
+      <div class="colhead"><h2>Event stream</h2><span class="n" id="eventStreamColBadge">04 / 5 live channels</span></div>
+      <div class="item" id="channelIngestBar" style="margin-bottom:8px;padding:8px 10px;">
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px;">
+          <select class="chip chip-select" id="channelIngestSelect" aria-label="Channel" style="font-size:10px;padding:2px 20px 2px 7px;">
+            <option value="FRAUD_OPS_OUTBOUND">01 · FRAUD_OPS_OUTBOUND</option>
+            <option value="IVR">02 · IVR (telephony)</option>
+            <option value="MOBILE_APP">03 · MOBILE_APP</option>
+            <option value="WEB_CHAT">04 · WEB_CHAT (portal)</option>
+            <option value="BRANCH">05 · BRANCH (teller)</option>
+          </select>
+          <button type="button" class="chip" id="btnInjectChannelEvent" style="font-size:10px;padding:2px 8px;">+ Inject live event</button>
+          <button type="button" class="chip" id="btnFraudCardControl" style="font-size:10px;padding:2px 8px;">⚡ Fraud block / escalate</button>
+        </div>
+        <input type="text" id="channelIngestText" value="Concurrent Lisbon POS &amp; online login anomaly detected; staging CARD00002 block &amp; escalating to synthesizer." aria-label="Channel event text" style="width:100%;font-family:var(--mono);font-size:10.5px;padding:4px 6px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);">
+        <p class="rd" id="channelIngestStatus" style="margin-top:4px;font-size:10px;">Live Vertex AI Memory Bank sessions across 5 channel producers.</p>
+      </div>
       <ul class="tl" id="eventStreamList"></ul>
     </div>
 
     <div class="col">
-      <div class="colhead"><h2>Governance</h2><span class="n">05 / catalog decisions</span></div>
+      <div class="colhead"><h2>Governance</h2><span class="n">05 / catalog &amp; audit</span></div>
       <div id="govTrapsContainer"></div>
+      <div class="item" id="auditSweepCard" style="margin-top:8px;">
+        <div class="item-top">
+          <span class="dot" id="auditSweepDot"></span>
+          <span class="nm">07 · memory_bank_audit_agent</span>
+          <span class="tag" id="auditSweepStatusTag">ASYNC · IDLE</span>
+        </div>
+        <p class="rd" id="auditSweepOutput" style="margin-top:5px;">Consolidated sweep (~95s) kept off the synchronous turn path; trigger on demand.</p>
+        <div style="margin-top:7px;">
+          <button type="button" class="chip" id="btnTriggerAuditSweep" style="font-size:10px;padding:3px 9px;">▶ Run 95s audit sweep (async)</button>
+        </div>
+      </div>
     </div>
   </div>
 
