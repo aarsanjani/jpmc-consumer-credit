@@ -266,7 +266,7 @@ def _tools(*names: str) -> list:
 
 def create_memory_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
     return LlmAgent(
-        name="02_memory_context",
+        name="memory_context",
         model=model,
         description=(
             "Recovers what the customer has previously told the bank, and reports it as "
@@ -288,7 +288,7 @@ def create_memory_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
 
 def create_governance_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
     return LlmAgent(
-        name="03_data_governance",
+        name="data_governance",
         model=model,
         description="Decides which data may be read, from the catalog's aspects rather than from any list it was given.",
         instruction=(
@@ -308,7 +308,7 @@ def create_governance_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
 
 def create_warehouse_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
     return LlmAgent(
-        name="04_warehouse_evidence",
+        name="warehouse_evidence",
         model=model,
         description="Reads the system of record through named, governed queries.",
         instruction=(
@@ -327,7 +327,7 @@ def create_warehouse_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
 
 def create_policy_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
     return LlmAgent(
-        name="05_policy_and_vocabulary",
+        name="policy_and_vocabulary",
         model=model,
         description="Answers definitional and regulatory questions from the governed glossary.",
         instruction=(
@@ -347,7 +347,7 @@ def create_policy_agent(model: str = DEFAULT_MODEL) -> LlmAgent:
 
 def create_orchestrator(model: str = DEFAULT_MODEL) -> LlmAgent:
     return LlmAgent(
-        name="01_orchestrator",
+        name="orchestrator",
         model=model,
         description="Routes a customer question to the specialists and assembles the answer.",
         instruction=(
@@ -389,11 +389,11 @@ def list_all_agents() -> list[AgentInfo]:
     root = create_orchestrator()
     agents = [root, *root.sub_agents]
     roles = {
-        "01_orchestrator": "LEAD_ORCHESTRATOR",
-        "02_memory_context": "MEMORY_READER",
-        "03_data_governance": "CATALOG_AUTHORISER",
-        "04_warehouse_evidence": "SYSTEM_OF_RECORD",
-        "05_policy_and_vocabulary": "GLOSSARY_RESOLVER",
+        "orchestrator": "LEAD_ORCHESTRATOR",
+        "memory_context": "MEMORY_READER",
+        "data_governance": "CATALOG_AUTHORISER",
+        "warehouse_evidence": "SYSTEM_OF_RECORD",
+        "policy_and_vocabulary": "GLOSSARY_RESOLVER",
     }
     return [
         AgentInfo(

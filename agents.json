@@ -1,20 +1,20 @@
 {
   "agents": [
     {
-      "name": "01_orchestrator",
+      "name": "orchestrator",
       "path": "backend/adk_agents.py",
       "factory": "create_orchestrator",
       "role": "root",
       "description": "Routes a fraud-desk question to the specialist agents, then synthesises their findings. Holds no tools of its own so that every fact in an answer is traceable to a sub-agent's tool call.",
       "sub_agents": [
-        "02_memory_context",
-        "03_data_governance",
-        "04_warehouse_evidence",
-        "05_policy_and_vocabulary"
+        "memory_context",
+        "data_governance",
+        "warehouse_evidence",
+        "policy_and_vocabulary"
       ]
     },
     {
-      "name": "02_memory_context",
+      "name": "memory_context",
       "path": "backend/adk_agents.py",
       "factory": "create_memory_agent",
       "role": "sub_agent",
@@ -26,7 +26,7 @@
       ]
     },
     {
-      "name": "03_data_governance",
+      "name": "data_governance",
       "path": "backend/adk_agents.py",
       "factory": "create_governance_agent",
       "role": "sub_agent",
@@ -38,7 +38,7 @@
       ]
     },
     {
-      "name": "04_warehouse_evidence",
+      "name": "warehouse_evidence",
       "path": "backend/adk_agents.py",
       "factory": "create_warehouse_agent",
       "role": "sub_agent",
@@ -49,7 +49,7 @@
       ]
     },
     {
-      "name": "05_policy_and_vocabulary",
+      "name": "policy_and_vocabulary",
       "path": "backend/adk_agents.py",
       "factory": "create_policy_agent",
       "role": "sub_agent",

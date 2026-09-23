@@ -40,11 +40,11 @@ flowchart TD
     UI <--> Backend["Flask Service (backend/app.py)"]
     
     subgraph ADKMesh["Google Agent Development Kit (ADK) Multi-Agent Mesh"]
-        ORCH["01_orchestrator (Root Router & Synthesiser)"]
-        MEM["02_memory_context"]
-        GOV["03_data_governance"]
-        WH["04_warehouse_evidence"]
-        POL["05_policy_and_vocabulary"]
+        ORCH["orchestrator (Root Router & Synthesiser)"]
+        MEM["memory_context"]
+        GOV["data_governance"]
+        WH["warehouse_evidence"]
+        POL["policy_and_vocabulary"]
         
         ORCH --> MEM
         ORCH --> GOV
@@ -69,11 +69,11 @@ Implemented in [`backend/adk_agents.py`](backend/adk_agents.py) using the Google
 
 | Agent | Role | Tools Bound | Architectural Responsibility |
 |:---|:---|:---|:---|
-| **`01_orchestrator`** | Root Orchestrator | *None directly* | Receives the user question, determines which specialist sub-agents to invoke, and synthesises evidence into a final response. Because it possesses no direct data tools, every factual assertion is traceable to a sub-agent trace. |
-| **`02_memory_context`** | Sub-Agent | `list_memory_topics`, `search_customer_memory`, `list_all_customer_memory` | Read-only access to customer conversational history in Vertex AI Memory Bank. It cannot execute writes during an inquiry turn, eliminating state contamination during inspection. |
-| **`03_data_governance`** | Sub-Agent | `catalog_authorize_table`, `catalog_authorize_column`, `catalog_discover_tables` | Interrogates Dataplex Universal Catalog aspects prior to data access. Validates whether tables or columns are active or deprecated, and enforces owner-only or refusal rules. |
-| **`04_warehouse_evidence`** | Sub-Agent | `list_warehouse_queries`, `run_warehouse_query` | Executes pre-compiled, parameterised BigQuery SQL queries. Ad-hoc SQL strings from the model are blocked at the interface. |
-| **`05_policy_and_vocabulary`** | Sub-Agent | `glossary_lookup`, `glossary_search` | Resolves banking dispute concepts (Regulation E, Regulation Z, chargeback windows, provisional credit) against the official Dataplex Business Glossary. |
+| **`orchestrator`** | Root Orchestrator | *None directly* | Receives the user question, determines which specialist sub-agents to invoke, and synthesises evidence into a final response. Because it possesses no direct data tools, every factual assertion is traceable to a sub-agent trace. |
+| **`memory_context`** | Sub-Agent | `list_memory_topics`, `search_customer_memory`, `list_all_customer_memory` | Read-only access to customer conversational history in Vertex AI Memory Bank. It cannot execute writes during an inquiry turn, eliminating state contamination during inspection. |
+| **`data_governance`** | Sub-Agent | `catalog_authorize_table`, `catalog_authorize_column`, `catalog_discover_tables` | Interrogates Dataplex Universal Catalog aspects prior to data access. Validates whether tables or columns are active or deprecated, and enforces owner-only or refusal rules. |
+| **`warehouse_evidence`** | Sub-Agent | `list_warehouse_queries`, `run_warehouse_query` | Executes pre-compiled, parameterised BigQuery SQL queries. Ad-hoc SQL strings from the model are blocked at the interface. |
+| **`policy_and_vocabulary`** | Sub-Agent | `glossary_lookup`, `glossary_search` | Resolves banking dispute concepts (Regulation E, Regulation Z, chargeback windows, provisional credit) against the official Dataplex Business Glossary. |
 
 ---
 
