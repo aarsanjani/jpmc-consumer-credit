@@ -1,49 +1,115 @@
-"""
-Behavior-driven AAA unit tests for Enterprise Knowledge Catalog, Semantic Entity Graph,
-and AWS / On-Premise Hybrid Data Connector.
-"""
+import pytest
+from backend.knowledge_catalog import (
+    DataplexCatalogClient,
+    CatalogGovernor,
+    Decision,
+    NOT_RECORDED
+)
 
-from backend.knowledge_catalog import KnowledgeCatalog, AWSOnPremHybridConnector
+def test_decision_to_dict():
+    """Verify Decision correctly formats its output dict."""
+    decision = Decision(
+        allowed=False,
+        action="REFUSE",
+        subject="table.col",
+        reason="Because I said so",
+        evidence="aspect missing",
+        replacement="other_table.col",
+        regulation="GDPR"
+    )
+    assert decision.to_dict() == {
+        "allowed": False,
+        "action": "REFUSE",
+        "subject": "table.col",
+        "reason": "Because I said so",
+        "evidence": "aspect missing",
+        "replacement": "other_table.col",
+        "regulation": "GDPR"
+    }
 
+def test_check_table_allows_active(monkeypatch):
+    """Verify check_table permits tables with active lifecycle-status."""
+    client = DataplexCatalogClient(project="p")
+    
+    def mock_lookup(entry_name, view="ALL"):
+        return {
+            "aspects": {
+                "project.location.lifecycle-status": {
+                    "data": {"status": "ACTIVE"}
+                }
+            }
+        }
+    monkeypatch.setattr(client, "lookup_entry", mock_lookup)
+    
+    governor = CatalogGovernor(client)
+    decision = governor.check_table("t1", "d1")
+    assert decision.allowed is True
+    assert decision.action == "ALLOW"
+    assert "ACTIVE" in decision.reason
 
-def test_query_policies_returns_reg_e_and_step_up_protocols():
-    query = "step-up consent Reg E liability"
+def test_check_table_refuses_deprecated(monkeypatch):
+    """Verify check_table refuses tables with deprecated lifecycle-status."""
+    client = DataplexCatalogClient(project="p")
+    
+    def mock_lookup(entry_name, view="ALL"):
+        return {
+            "aspects": {
+                "project.location.lifecycle-status": {
+                    "data": {"status": "DEPRECATED", "authoritative_replacement": "t2"}
+                }
+            }
+        }
+    monkeypatch.setattr(client, "lookup_entry", mock_lookup)
+    
+    governor = CatalogGovernor(client)
+    decision = governor.check_table("t1", "d1")
+    assert decision.allowed is False
+    assert decision.action == "REFUSE"
+    assert decision.replacement == "t2"
 
-    matched_policies = KnowledgeCatalog.query_policies(query)
+def test_check_column_refuses_restricted(monkeypatch):
+    """Verify check_column acts on agent_behavior REFUSE."""
+    client = DataplexCatalogClient(project="p")
+    
+    def mock_lookup(entry_name, view="ALL"):
+        return {
+            "aspects": {
+                "project.location.sensitivity-class@Schema.ssn": {
+                    "data": {"agent_behavior": "REFUSE", "level": "RESTRICTED", "rationale": "PII"}
+                }
+            }
+        }
+    monkeypatch.setattr(client, "lookup_entry", mock_lookup)
+    
+    governor = CatalogGovernor(client)
+    decision = governor.check_column("t1", "ssn", "d1")
+    assert decision.allowed is False
+    assert decision.action == "REFUSE"
+    assert decision.reason == "PII"
 
-    policy_ids = [p.policy_id for p in matched_policies]
-    assert "POL-REG-E-001" in policy_ids
-    assert "POL-STEP-UP-2FA-002" in policy_ids
-
-
-def test_customer_risk_profile_returns_behavioral_baseline():
-    customer_id = "CUST00001"
-
-    profile = KnowledgeCatalog.get_customer_risk_profile(customer_id)
-
-    baseline = profile["historical_spending_baseline"]
-    assert "Lauren Morrison" in profile["full_name"]
-    assert baseline["average_transaction_usd"] > 0
-    assert baseline["p95_transaction_usd"] > 0
-
-
-def test_entity_subgraph_constructs_semantic_nodes_and_edges():
-    customer_id = "CUST00001"
-
-    subgraph = KnowledgeCatalog.get_entity_subgraph(customer_id)
-
-    node_ids = [n["node_id"] for n in subgraph["nodes"]]
-    assert subgraph["node_count"] >= 6
-    assert subgraph["edge_count"] >= 5
-    assert any(k in node_ids for k in ("card-9012", "card-00002", "CUST00001"))
-
-
-def test_hybrid_connector_reports_aws_and_onprem_latency_metrics():
-    topology = AWSOnPremHybridConnector.get_connector_topology()
-
-    sources = topology["data_sources"]
-    source_ids = [s["source_id"] for s in sources]
-    assert topology["architecture_mode"] == "DECOUPLED_HYBRID_FEDERATION"
-    assert "aws-rds-card-ledger" in source_ids
-    assert "aws-s3-interaction-lake" in source_ids
-    assert "onprem-ibm-zseries" in source_ids
+def test_authorize_combines_decisions(monkeypatch):
+    """Verify authorize() fails the whole query if any table or column is denied."""
+    client = DataplexCatalogClient(project="p")
+    
+    def mock_lookup(entry_name, view="ALL"):
+        return {
+            "aspects": {
+                "project.location.lifecycle-status": {
+                    "data": {"status": "ACTIVE"}
+                },
+                "project.location.sensitivity-class@Schema.good_col": {
+                    "data": {"agent_behavior": "ALLOW", "level": "PUBLIC"}
+                },
+                "project.location.sensitivity-class@Schema.bad_col": {
+                    "data": {"agent_behavior": "REFUSE", "level": "RESTRICTED"}
+                }
+            }
+        }
+    monkeypatch.setattr(client, "lookup_entry", mock_lookup)
+    
+    governor = CatalogGovernor(client)
+    result = governor.authorize("t1", ["good_col", "bad_col"], "d1")
+    assert result["allowed"] is False
+    assert result["table_decision"]["allowed"] is True
+    assert "t1.bad_col" in result["blocked_columns"]
+    assert "t1.good_col" not in result["blocked_columns"]
