@@ -3,182 +3,315 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>JPMorgan Chase - Bank Fraud Desk Operator Console</title>
+    <title>JPMorgan Chase — Gemini Enterprise Agent Platform &amp; Scale Memory Bank</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
-    <style>
-        .app-layout {
-            grid-template-columns: minmax(300px, 1fr) minmax(300px, 1fr) minmax(300px, 1fr);
-            overflow-y: auto;
-            height: auto;
-        }
-        .pane-content {
-            padding: 1rem;
-            overflow-y: auto;
-            max-height: 400px;
-        }
-        select, input {
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            color: #fff;
-            padding: 0.4rem;
-            border-radius: 4px;
-        }
-        table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
-        th, td { border: 1px solid rgba(255, 255, 255, 0.1); padding: 0.4rem; font-size: 0.8rem; }
-        pre, code { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; white-space: pre-wrap; overflow-x: auto; background: rgba(0,0,0,0.3); padding: 0.5rem; }
-        .tabs { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
-    </style>
 </head>
 <body>
+    <!-- Top Navigation Bar -->
     <header class="top-nav">
         <div class="nav-brand">
             <div class="brand-logo">
                 <span class="bank-icon">⚡</span>
-                <span class="brand-title">JPMorgan Chase <span>Fraud Desk</span></span>
+                <span class="brand-title">JPMorgan Chase <span>Gemini Enterprise Agent Platform</span></span>
             </div>
+            <div class="badge-tag" id="top-engine-badge">Scale Memory Bank • Dataplex Catalog • ADK Multi-Agent Mesh</div>
         </div>
         <div class="system-telemetry-bar">
-            <div class="telemetry-pill">
-                <span>Customer:</span>
-                <select id="customer-selector"></select>
+            <button id="view-agents-btn" class="telemetry-pill-btn" title="View live ADK Multi-Agent System topology &amp; bound tools">
+                <span class="status-dot purple pulse"></span>
+                <span>Agents Mesh: <strong id="top-agents-count">5 Active ADK Agents</strong></span>
+            </button>
+            <button id="top-eval-btn" class="telemetry-pill-btn" title="Open Empirical Retrieval Precision/Recall &amp; Write Efficacy Benchmarks">
+                <span class="status-dot green pulse"></span>
+                <span>Benchmarks: <strong>Precision &amp; Recall (95.9%)</strong></span>
+            </button>
+            <button id="top-comparison-btn" class="telemetry-pill-btn" title="Compare Google Native ADK Agent vs Direct Non-ADK Agent">
+                <span class="status-dot blue pulse"></span>
+                <span>Compare: <strong>Custom vs ADK Agent</strong></span>
+            </button>
+            <button id="run-audit-sweep-btn" class="telemetry-pill-btn" title="Reconcile Vertex AI Memory Bank against BigQuery Ground Truth">
+                <span class="status-dot red pulse"></span>
+                <span>Ground Truth: <strong id="top-audit-status">Audit &amp; Reconcile</strong></span>
+            </button>
+            <div class="telemetry-pill" title="Live Health Probe (/api/health)">
+                <span class="status-dot green pulse" id="health-status-dot"></span>
+                <span>Services: <strong id="top-health-status">Checking...</strong></span>
             </div>
-            <div class="telemetry-pill">
-                <span class="status-dot tooltip-host" id="health-dot"></span>
-                <span>System Health: <strong id="health-status">Checking...</strong></span>
-            </div>
-            <div class="telemetry-pill">
-                <span>Project: <strong id="session-project">Loading...</strong></span>
-            </div>
-            <div class="telemetry-pill">
-                <span>Glossary: <strong id="session-glossary">Loading...</strong></span>
+            <div class="telemetry-pill" style="padding: 0.2rem 0.55rem;">
+                <span class="status-dot gold"></span>
+                <span style="margin-right: 4px;">Customer:</span>
+                <select id="customer-selector" style="background: rgba(15,23,42,0.9); color: #f8fafc; border: 1px solid rgba(56,189,248,0.4); border-radius: 5px; padding: 2px 6px; font-size: 0.74rem; font-weight: 700; cursor: pointer;">
+                    <option value="CUST00001">CUST00001 — Priya Vantalis</option>
+                </select>
             </div>
         </div>
     </header>
 
+    <!-- Main Application 3-Column Container -->
     <main class="app-layout">
-        <!-- 1. Chat Pane -->
-        <section class="panel">
+
+        <!-- Column 1: Multi-Channel Mesh, Live Customer Ledger & Pre-Write Veracity / Intelligent Write Layer -->
+        <section class="panel left-panel">
             <div class="panel-header">
-                <h2>💬 Chat</h2>
+                <div class="panel-title-wrap">
+                    <span class="section-icon">🏛️</span>
+                    <div>
+                        <h2>Multi-Channel Mesh &amp; Live Telemetry</h2>
+                        <p class="section-sub">BigQuery Ground Truth (`jpmc_ccb_fraud`) + Memory Bank Recollections</p>
+                    </div>
+                </div>
+                <div class="header-action-group">
+                    <button id="play-sim-btn" class="btn-primary btn-sm" title="Animate cross-channel ingestion &amp; ground-truth reconciliation sequence">▶️ Play Demo Flow</button>
+                    <button id="reseed-btn" class="btn-secondary btn-sm" title="Reload live state from Vertex AI &amp; BigQuery">🔄 Sync Live</button>
+                </div>
             </div>
-            <div class="pane-content" style="display:flex; flex-direction:column; max-height:800px;">
-                <div id="chat-viewport" style="flex:1; overflow-y:auto; margin-bottom: 1rem; border: 1px solid var(--border-color); padding: 0.5rem; background: var(--bg-card); min-height:300px;"></div>
-                <form id="chat-form" style="display:flex; gap:0.5rem;">
-                    <input type="text" id="chat-input" placeholder="Ask a question..." style="flex:1;">
-                    <button type="submit" class="btn-primary">Send</button>
+
+            <!-- Live Subsystems / Channel Event Cards (Populated dynamically from BigQuery & Memory Bank) -->
+            <div class="subsystems-feed" id="subsystems-feed">
+                <div class="system-event-card border-red" id="card-fraud">
+                    <div class="event-card-header">
+                        <span class="system-tag red">Card &amp; Wallet Security (BigQuery + MB)</span>
+                        <span class="event-time" id="feed-card-time">Lisbon Theft • Sep 09</span>
+                    </div>
+                    <h3 class="event-title" id="feed-card-title">Stolen Wallet in Lisbon &amp; Card Replacement Chain</h3>
+                    <p class="event-desc" id="feed-card-desc">BigQuery shows physical cards <strong>CARD00002 (*0513 Credit)</strong> and <strong>CARD00004 (*6420 Debit)</strong> are <code>FROZEN (SUSPECTED_FRAUD_TRAVEL)</code>. Virtual card <strong>CARD00005 (*2758)</strong> is <code>ACTIVE</code>; replacement <strong>CARD00003 (*9013)</strong> is <code>PENDING_ACTIVATION</code>.</p>
+                    <div class="event-meta" id="feed-card-meta">
+                        <span class="meta-chip">Active Virtual: *2758</span>
+                        <span class="meta-chip">Frozen: *0513, *6420</span>
+                        <span class="veracity-badge true">✓ BigQuery Verified</span>
+                    </div>
+                </div>
+
+                <div class="system-event-card border-amber" id="card-ivr">
+                    <div class="event-card-header">
+                        <span class="system-tag amber">Travel Registry vs. Memory Distractor</span>
+                        <span class="event-time" id="feed-travel-time">Notice TRV0001 • IVR</span>
+                    </div>
+                    <h3 class="event-title" id="feed-travel-title">Lisbon Travel Notice vs. Unverified London Claim</h3>
+                    <p class="event-desc" id="feed-travel-desc">BigQuery <code>travel_notices</code> records <strong>Lisbon, PT</strong> (Aug 28 – Sep 18; early return to NY on <strong>Sep 10</strong>). One Memory Bank entry claims <strong>London</strong> travel—flagged automatically by the reconciler as a ground-truth contradiction.</p>
+                    <div class="event-meta" id="feed-travel-meta">
+                        <span class="meta-chip">BQ Truth: Lisbon, PT</span>
+                        <span class="meta-chip">Return: 2026-09-10</span>
+                        <span class="veracity-badge false">⚠️ London Claim Contradicted</span>
+                    </div>
+                </div>
+
+                <div class="system-event-card border-blue" id="card-mobile">
+                    <div class="event-card-header">
+                        <span class="system-tag blue">Open Disputes: Reg E (Debit) vs. Reg Z (Credit)</span>
+                        <span class="event-time" id="feed-dispute-time">6 Active Disputes • $2,635.88</span>
+                    </div>
+                    <h3 class="event-title" id="feed-dispute-title">Dual-Regulation Dispute Ledger (`disputes` Table)</h3>
+                    <p class="event-desc" id="feed-dispute-desc"><strong>DSP00033 ($26.30, CARD00004 Debit, Reg E)</strong>: Provisional credit issued Sep 12. <strong>DSP00034 ($1,065.76, CARD00002 Credit, Reg Z)</strong>: Open investigation due Nov 03; no provisional credit required under Reg Z.</p>
+                    <div class="event-meta" id="feed-dispute-meta">
+                        <span class="meta-chip">Reg E: PC Issued ($26.30)</span>
+                        <span class="meta-chip">Reg Z: $1,065.76 / $796.42</span>
+                        <span class="veracity-badge true">✓ Dataplex Governed</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Live Intelligent Write & Pre-Write Claim Veracity Tester -->
+            <div class="veracity-validator-panel">
+                <div class="validator-header">
+                    <span class="validator-icon">🛡️</span>
+                    <div>
+                        <h3 class="validator-title">Intelligent Write Filtering &amp; Pre-Write Veracity Tester</h3>
+                        <p class="validator-sub">Tests live `memories:generate` topic filtering + BigQuery ground-truth reconciliation</p>
+                    </div>
+                </div>
+                <div class="validator-controls">
+                    <div class="validator-input-row" style="margin-bottom: 0.45rem;">
+                        <select id="validator-channel-select" class="validator-select">
+                            <option value="LIVE_WRITE_AND_VERIFY">Mode: BigQuery Veracity + Live Memory Bank Write Filter (`generateMemories`)</option>
+                            <option value="VERIFY_ONLY">Mode: Fast BigQuery Ground-Truth Veracity Check Only</option>
+                        </select>
+                    </div>
+                    <div class="validator-input-row">
+                        <input type="text" id="validator-claim-input" class="validator-input" value="I will be in Porto from Nov 14 to Nov 29, so please do not freeze my card. Also what is the weather today, and my current balance is $4,280.50." placeholder="Enter customer utterance or transcript to test intelligent write &amp; veracity..." />
+                        <button id="validate-write-btn" class="btn-primary btn-sm">⚡ Test Write &amp; Verify</button>
+                    </div>
+                    <div class="validator-chips">
+                        <span style="font-size:0.65rem; color:#94a3b8;">Demo Scenarios:</span>
+                        <button class="claim-chip" data-claim="I will be in Porto from Nov 14 to Nov 29, so please do not freeze my card. Also what is the weather today, and my current balance is $4,280.50.">✓ Mixed Signal (Keeps Travel, Drops Weather &amp; $4,280 Balance)</button>
+                        <button class="claim-chip" data-claim="My name is Dana, I always fly out of Newark, my favorite color is blue, and what is the weather like today?">🚫 Off-Topic Chatter (`wrote_nothing: true` — 0 Memories Written)</button>
+                        <button class="claim-chip" data-claim="I traveled to London on a registered travel notice and my card was declined for 412 euros.">❌ Contradicted Claim (London &amp; 412 EUR vs. Lisbon BigQuery Truth)</button>
+                        <button class="claim-chip" data-claim="I traveled to Lisbon and returned early to New York on September 10, and disputed $26.30.">✅ Corroborated Claim (Matches Lisbon TRV0001 &amp; $26.30 Dispute)</button>
+                    </div>
+                </div>
+                <div id="validator-result" class="validator-result" style="display:none;"></div>
+            </div>
+
+            <!-- Live Card Portfolio & Dataplex Governance Status Widget -->
+            <div class="card-status-widget" id="card-status-widget">
+                <div class="visual-credit-card" id="visual-card">
+                    <div class="card-top-row" style="display:flex; justify-content:space-between; align-items:center;">
+                        <span class="card-chip">💳 JPMorgan Chase Reserve</span>
+                        <span class="badge-status danger" id="card-badge">2 FROZEN • 1 VIRTUAL ACTIVE</span>
+                    </div>
+                    <div class="card-number" id="card-number-display" style="font-family:'JetBrains Mono', monospace; font-size:0.85rem; margin: 0.45rem 0; color:#f8fafc;">
+                        *0513 (FROZEN) • *6420 (FROZEN) • *2758 (ACTIVE)
+                    </div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.7rem; color:#cbd5e1;">
+                        <span id="card-holder-display">PRIYA VANTALIS (CUST00001)</span>
+                        <span id="apple-pay-status" style="color:#34d399; font-weight:600;">✓ Google Pay Active • Apple Pay Revoked</span>
+                    </div>
+                </div>
+
+                <!-- Dataplex & Admin Quick Actions -->
+                <div style="margin-top:0.6rem; padding:0.65rem; background:rgba(15,23,42,0.85); border:1px solid rgba(56,189,248,0.3); border-radius:8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+                        <span style="font-size:0.72rem; font-weight:700; color:#38bdf8;">🔒 Dataplex Governance &amp; Card Oversight</span>
+                        <span id="admin-confidence-badge" class="badge-status success" style="font-size:0.65rem;">PAN_FULL: REFUSED</span>
+                    </div>
+                    <div id="admin-verification-summary" style="font-size:0.7rem; color:#cbd5e1; margin-bottom:0.5rem; line-height:1.35;">
+                        <strong>Standing Instruction:</strong> "Always notify me before any dispute on my account is closed. Text me first, do not just send an email."
+                    </div>
+                    <div style="display:flex; gap:0.4rem;">
+                        <button id="sim-verify-pass-btn" class="btn-secondary btn-sm" style="flex:1; font-size:0.68rem; padding:0.35rem;" title="Inspect Card &amp; Dispute Resolution Oversight">👮‍♂️ Card &amp; Reg E/Z Oversight</button>
+                        <button id="sim-verify-fail-btn" class="btn-secondary btn-sm" style="flex:1; font-size:0.68rem; padding:0.35rem;" title="Test Dataplex Refusal on Deprecated Table &amp; Full PAN">🛡️ Test Dataplex Refusals</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Column 2: Vertex AI Scale Memory Bank, Precision/Recall Benchmarks, Dataplex Catalog & ADK Comparison -->
+        <section class="panel center-panel">
+            <div class="panel-header">
+                <div class="panel-title-wrap">
+                    <span class="section-icon">🧠</span>
+                    <div>
+                        <h2>Vertex AI Scale Memory Bank &amp; Governance</h2>
+                        <p class="section-sub" id="center-engine-subtitle">Live Agent Engine Memory Vault • 7 Custom Fraud Topics</p>
+                    </div>
+                </div>
+                <div class="view-toggle-group">
+                    <button class="toggle-btn active" id="view-notes-btn" title="Live customer memories &amp; semantic vector distance search">Memory Vault</button>
+                    <button class="toggle-btn" id="view-compaction-btn" title="Empirical Retrieval Precision/Recall &amp; Intelligent Write Efficacy">📊 Precision &amp; Recall</button>
+                    <button class="toggle-btn" id="view-kg-btn" title="Dataplex Universal Catalog Aspects, Glossary &amp; BigQuery Golden Queries">📚 Knowledge Catalog</button>
+                    <button class="toggle-btn" id="view-comparison-btn" title="Side-by-side execution: Google ADK Agent vs Direct Non-ADK Agent">⚖️ Custom vs ADK</button>
+                    <button class="toggle-btn" id="view-audit-btn" title="Reconcile Memory Bank claims against BigQuery System of Record">🔍 Audit &amp; Reconcile</button>
+                    <button class="toggle-btn" id="view-admin-btn" title="Card Replacement Chain &amp; Regulation E / Regulation Z Matrix">👮‍♂️ Oversight</button>
+                    <button class="toggle-btn" id="view-json-btn" title="Raw JSON payload inspector">JSON</button>
+                </div>
+            </div>
+
+            <!-- Interactive Semantic Search & Topic Filter Bar inside Terminal Header -->
+            <div class="memory-bank-terminal" id="memory-bank-terminal">
+                <div class="terminal-header" style="flex-wrap: wrap; gap: 0.45rem;">
+                    <div style="display:flex; align-items:center; gap:0.4rem;">
+                        <span class="term-dot red"></span>
+                        <span class="term-dot yellow"></span>
+                        <span class="term-dot green"></span>
+                        <span class="term-title" id="terminal-scope-uri">memory_bank://scope/customer_id=CUST00001</span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:0.4rem; margin-left:auto;">
+                        <input type="text" id="memory-search-input" placeholder="Semantic search (e.g. Lisbon hotel, provisional credit)..." style="background:rgba(15,23,42,0.95); border:1px solid rgba(56,189,248,0.35); color:#f8fafc; border-radius:5px; padding:3px 8px; font-size:0.71rem; width:235px;" />
+                        <button id="memory-search-btn" class="btn-primary btn-sm" style="padding:3px 8px; font-size:0.68rem;">🔍 Retrieve (Top-K)</button>
+                        <button id="memory-reset-search-btn" class="btn-secondary btn-sm" style="padding:3px 7px; font-size:0.68rem;" title="Show all memories in scope">All</button>
+                        <span class="badge-pill term-badge" id="memory-count-badge">Loading...</span>
+                    </div>
+                </div>
+                <div class="terminal-body" id="memory-terminal-body">
+                    <!-- Dynamic view rendered via JS -->
+                </div>
+            </div>
+
+            <!-- Live Agent Trace Telemetry Panel -->
+            <div class="agent-trace-box">
+                <div class="trace-header">
+                    <span class="live-beacon"></span>
+                    <h3>Real-Time Agentic Reasoner &amp; Governance Telemetry</h3>
+                    <span class="trace-sub-pill" id="trace-mode-pill">Vertex AI • Dataplex • BigQuery</span>
+                </div>
+                <div class="trace-logs" id="agent-trace-logs">
+                    <div class="trace-item thought">
+                        <span class="trace-badge">READY</span>
+                        <span class="trace-msg">Fraud Desk Orchestrator connected to live Vertex AI Memory Bank, Dataplex Catalog, and BigQuery.</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Column 3: Synthesizer Chat & Dynamic A2UI Presentation -->
+        <section class="panel right-panel">
+            <div class="panel-header">
+                <div class="panel-title-wrap">
+                    <span class="section-icon">💬</span>
+                    <div>
+                        <h2>Fraud Desk Synthesizer Chat</h2>
+                        <p class="section-sub">Reconciles Memory Bank Recollections against BigQuery Truth</p>
+                    </div>
+                </div>
+                <span class="badge-pill live-pill">Live Stream</span>
+            </div>
+
+            <!-- Quick Scenario Triggers -->
+            <div class="quick-scenario-bar">
+                <span class="scenario-label">Demo Prompts:</span>
+                <div class="chip-container">
+                    <button class="quick-chip-btn active-chip" data-prompt="Where did this customer travel recently, and why does memory mention London while the bank's records show Lisbon?">
+                        "Travel: Lisbon Truth vs London Memory"
+                    </button>
+                    <button class="quick-chip-btn" data-prompt="What are the open disputes on this account, and why did DSP00033 receive provisional credit while DSP00034 did not?">
+                        "Disputes: Reg E vs Reg Z Provisional Credit"
+                    </button>
+                    <button class="quick-chip-btn" data-prompt="Which card is currently active, which cards are frozen, and what happened to the Apple Pay and Google Pay wallet tokens?">
+                        "Cards &amp; Digital Wallet Status"
+                    </button>
+                    <button class="quick-chip-btn" data-prompt="What has the bank promised this customer on previous calls, and what are her standing contact instructions?">
+                        "Agent Commitments &amp; Contact Preferences"
+                    </button>
+                </div>
+            </div>
+
+            <!-- Chat Message Viewport -->
+            <div class="chat-viewport" id="chat-viewport">
+                <div class="chat-message system">
+                    <div class="msg-bubble" id="welcome-chat-bubble">
+                        👋 <strong>Fraud Desk Active (`CUST00001 — Priya Vantalis`)</strong>. Select any demo prompt above or ask a question to retrieve live Vertex AI Memory Bank recollections, verify Dataplex Catalog governance aspects, and reconcile against BigQuery ground truth.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dynamic A2UI Evidence & Causal Synthesis Container -->
+            <div id="a2ui-presentation-container" class="a2ui-container"></div>
+
+            <!-- Chat Input Area -->
+            <div class="chat-input-area">
+                <form id="chat-form" class="chat-input-form">
+                    <input type="text" id="chat-input" placeholder="Ask about travel notices, disputes (Reg E / Reg Z), cards, or memory vs. warehouse truth..." autocomplete="off" value="Where did this customer travel recently, and why does memory mention London while the bank's records show Lisbon?">
+                    <button type="submit" id="send-btn" class="btn-primary">
+                        <span>Synthesize</span>
+                        <span class="send-arrow">➔</span>
+                    </button>
                 </form>
             </div>
         </section>
 
-        <div style="display:flex; flex-direction:column; gap:1rem;">
-            <!-- 2. Memory Bank Pane -->
-            <section class="panel">
-                <div class="panel-header">
-                    <h2>🧠 Memory Bank</h2>
-                </div>
-                <div class="pane-content">
-                    <div class="tabs">
-                        <button class="btn-secondary" id="btn-memory-topics">Topics</button>
-                        <button class="btn-secondary" id="btn-memory-list">List Customer Corpus</button>
-                    </div>
-                    <form id="memory-search-form" style="display:flex; gap:0.5rem; margin-bottom: 0.5rem;">
-                        <input type="text" id="memory-search-input" placeholder="Search query..." style="flex:1;">
-                        <button type="submit" class="btn-secondary btn-sm">Retrieve (Sim. Search)</button>
-                    </form>
-                    <form id="memory-generate-form" style="display:flex; flex-direction: column; gap:0.5rem; margin-bottom: 0.5rem;">
-                        <textarea id="memory-generate-input" rows="3" placeholder="Paste transcript text here... (Example: user: help\nmodel: sure)" style="background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255,255,255,0.2); color:#fff;"></textarea>
-                        <button type="submit" class="btn-secondary btn-sm">Generate from Transcript</button>
-                    </form>
-                    <div id="memory-output"></div>
-                </div>
-            </section>
-
-            <!-- 3. Knowledge Catalog Pane -->
-            <section class="panel">
-                <div class="panel-header">
-                    <h2>📚 Knowledge Catalog</h2>
-                </div>
-                <div class="pane-content">
-                    <div class="tabs">
-                        <button class="btn-secondary" id="btn-catalog-overview">Overview</button>
-                    </div>
-                    <form id="catalog-search-form" style="display:flex; gap:0.5rem; margin-bottom: 0.5rem;">
-                        <input type="text" id="catalog-search-input" placeholder="Search terms..." style="flex:1;">
-                        <button type="submit" class="btn-secondary btn-sm">Search Terms</button>
-                    </form>
-                    <form id="catalog-auth-form" style="display:flex; gap:0.5rem; margin-bottom: 0.5rem;">
-                        <input type="text" id="catalog-auth-table" placeholder="Table" style="width:100px;">
-                        <input type="text" id="catalog-auth-column" placeholder="Column (opt)" style="flex:1;">
-                        <button type="submit" class="btn-secondary btn-sm">Check Auth</button>
-                    </form>
-                    <div id="catalog-output"></div>
-                </div>
-            </section>
-        </div>
-
-        <div style="display:flex; flex-direction:column; gap:1rem;">
-            <!-- 4. Warehouse Pane -->
-            <section class="panel">
-                <div class="panel-header">
-                    <h2>🏛️ Warehouse</h2>
-                </div>
-                <div class="pane-content">
-                    <div class="tabs">
-                        <button class="btn-secondary" id="btn-warehouse-queries">List Queries</button>
-                    </div>
-                    <form id="warehouse-run-form" style="display:flex; gap:0.5rem; margin-bottom: 0.5rem;">
-                        <select id="warehouse-query-id"></select>
-                        <button type="submit" class="btn-secondary btn-sm">Run Query</button>
-                    </form>
-                    <div id="warehouse-output" style="overflow-x:auto;"></div>
-                </div>
-            </section>
-
-            <!-- 5. Agents Pane -->
-            <section class="panel">
-                <div class="panel-header">
-                    <h2>🤖 Agents Topology</h2>
-                </div>
-                <div class="pane-content">
-                    <div class="tabs">
-                        <button class="btn-secondary" id="btn-agents-list">List Architecture</button>
-                    </div>
-                    <form id="agent-run-form" style="display:flex; gap:0.5rem; margin-bottom: 0.5rem;">
-                        <input type="text" id="agent-run-input" placeholder="Question to graph..." style="flex:1;">
-                        <button type="submit" class="btn-secondary btn-sm">Run Topology</button>
-                    </form>
-                    <div id="agents-output"></div>
-                </div>
-            </section>
-
-            <!-- 6. Evidence / Evaluation Pane -->
-            <section class="panel">
-                <div class="panel-header">
-                    <h2>📊 Evidence & Evaluation</h2>
-                </div>
-                <div class="pane-content">
-                    <div class="tabs">
-                        <button class="btn-secondary" id="btn-eval-probes">Probes</button>
-                        <button class="btn-secondary" id="btn-eval-reconcile">Reconcile Client</button>
-                        <button class="btn-secondary" id="btn-eval-retrieval">Retrieval Eval</button>
-                    </div>
-                    <form id="eval-policy-form" style="display:flex; gap:0.5rem; margin-bottom: 0.5rem;">
-                        <select id="eval-experiment-select">
-                            <option value="inclusion">inclusion</option>
-                            <option value="topics">topics</option>
-                            <option value="scope">scope</option>
-                            <option value="consolidation">consolidation</option>
-                        </select>
-                        <button type="submit" class="btn-secondary btn-sm">Run Write Policy Eval</button>
-                    </form>
-                    <div id="eval-output"></div>
-                </div>
-            </section>
-        </div>
     </main>
+
+    <!-- Modal: Multi-Agent Roster & Architecture Specification -->
+    <div id="agents-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content glass-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="modal-icon">🤖</span>
+                    <div>
+                        <h3 id="modal-roster-title">Google ADK Multi-Agent System Roster</h3>
+                        <p class="modal-sub">Live Agent Graph (`backend/adk_agents.py`) • Vertex AI Memory Bank • Dataplex Universal Catalog • BigQuery</p>
+                    </div>
+                </div>
+                <button id="close-modal-btn" class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body" id="agents-roster-container">
+                <!-- Dynamic agent cards rendered via JS -->
+            </div>
+        </div>
+    </div>
 
     <script src="/static/js/app.js"></script>
 </body>

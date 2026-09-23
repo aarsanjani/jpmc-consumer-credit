@@ -493,6 +493,159 @@ def eval_reconcile():
     )
 
 
+@app.get("/api/eval/summary")
+@guarded
+def eval_summary():
+    """Return the verified live benchmark runs across all stages plus live reconciliation."""
+    from pathlib import Path
+
+    customer_id = request.args.get("customer_id", "CUST00001")
+    summary_path = Path(PROBES_PATH).resolve().parent / "latest_eval_results.json"
+    stages_data = {}
+    if summary_path.exists():
+        raw = summary_path.read_text()
+        raw = raw.replace("<project_number>", str(SETTINGS.project_number or ""))
+        raw = raw.replace("<project_id>", str(SETTINGS.project_id or ""))
+        raw = raw.replace("<engine_id>", str(SETTINGS.agent_engine_id or ""))
+        stages_data = json.loads(raw)
+
+    memories = _memory.list_memories({"customer_id": customer_id})
+    amounts = reconcile.reconcile_amounts(memories, _reader, customer_id)
+    travel = reconcile.reconcile_travel(memories, _reader, customer_id)
+    return jsonify(
+        {
+            "customer_id": customer_id,
+            "engine": SETTINGS.agent_engine_resource,
+            "benchmark": stages_data,
+            "reconcile": {
+                "passed": amounts.passed and travel.passed,
+                "amounts": amounts.to_dict(),
+                "travel": travel.to_dict(),
+            },
+        }
+    )
+
+
+@app.get("/api/customer/overview")
+@guarded
+def customer_overview():
+    """Consolidated live 360 profile, cards, disputes, travel, and reconciled memories for the UI."""
+    customer_id = required_arg("customer_id", request.args)
+    c360 = _reader.run("customer_360", {"customer_id": customer_id}).rows
+    cards = _reader.run("cards_for_customer", {"customer_id": customer_id}).rows
+    disputes = _reader.run("open_disputes", {"customer_id": customer_id}).rows
+    travel_rows = _reader.run("travel_notices", {"customer_id": customer_id}).rows
+    tokens = _reader.run("wallet_tokens", {"customer_id": customer_id}).rows
+    contacts = _reader.run("contact_history", {"customer_id": customer_id}).rows
+    standing = _reader.run("standing_instructions", {"customer_id": customer_id}).rows
+
+    memories = _memory.list_memories({"customer_id": customer_id})
+    amounts_rep = reconcile.reconcile_amounts(memories, _reader, customer_id)
+    travel_rep = reconcile.reconcile_travel(memories, _reader, customer_id)
+
+    finding_by_mem: dict[str, list[dict]] = {}
+    for f in (*amounts_rep.findings, *travel_rep.findings):
+        finding_by_mem.setdefault(f.memory_id, []).append(f.to_dict())
+
+    mem_list = []
+    for m in memories:
+        d = m.to_dict()
+        m_findings = finding_by_mem.get(m.memory_id, [])
+        if any(x["status"] == "CONTRADICTED" for x in m_findings):
+            d["reconciliation_status"] = "CONTRADICTED"
+        elif any(x["status"] == "CORROBORATED" for x in m_findings):
+            d["reconciliation_status"] = "CORROBORATED"
+        else:
+            d["reconciliation_status"] = "UNVERIFIABLE"
+        d["reconciliation_findings"] = m_findings
+        mem_list.append(d)
+
+    return jsonify(
+        {
+            "customer_id": customer_id,
+            "profile": c360[0] if c360 else {},
+            "standing_instructions": standing[0] if standing else {},
+            "cards": cards,
+            "open_disputes": disputes,
+            "travel_notices": travel_rows,
+            "wallet_tokens": tokens,
+            "contact_history": contacts[:10],
+            "memories": mem_list,
+            "reconciliation": {
+                "passed": amounts_rep.passed and travel_rep.passed,
+                "amounts": amounts_rep.to_dict(),
+                "travel": travel_rep.to_dict(),
+            },
+        }
+    )
+
+
+@app.post("/api/veracity/validate")
+@guarded
+def veracity_validate():
+    """Validate a customer statement against BigQuery ground truth and optionally test Memory Bank intelligent write filtering."""
+    from backend.veracity_and_audit import ClaimValidator
+
+    payload = request.get_json(silent=True) or {}
+    customer_id = required_arg("customer_id", payload)
+    claim_text = required_arg("claim_text", payload)
+    test_write = bool(payload.get("test_write", True))
+
+    validator = ClaimValidator(SETTINGS, reader=_reader, governor=_governor)
+    verdict = validator.validate(customer_id, claim_text)
+
+    write_test_result = None
+    if test_write:
+        sandbox_scope = {
+            "customer_id": customer_id,
+            "sandbox_probe": f"ui_{int(time.time() * 1000)}",
+        }
+        try:
+            gen = _memory.generate_from_conversation(
+                scope=sandbox_scope,
+                turns=[{"role": "user", "text": claim_text}],
+                wait=True,
+            )
+            extracted = _memory.list_memories(sandbox_scope) if not gen.wrote_nothing else []
+            write_test_result = {
+                "wrote_nothing": gen.wrote_nothing,
+                "generated_count": len(extracted),
+                "actions": [g.action for g in gen.generated],
+                "extracted_memories": [m.to_dict() for m in extracted],
+                "latency_ms": gen.latency_ms.to_dict(),
+                "explanation": (
+                    "Memory Bank rejected all utterances (wrote_nothing=True) because no facts matched the 7 configured custom fraud topics."
+                    if gen.wrote_nothing
+                    else f"Memory Bank selectively extracted {len(extracted)} durable fact(s) matching configured custom topics and excluded off-topic/volatile chatter."
+                ),
+            }
+        finally:
+            try:
+                _memory.delete_scope(sandbox_scope)
+            except Exception:
+                pass
+
+    return jsonify(
+        {
+            "customer_id": customer_id,
+            "claim_text": claim_text,
+            "veracity": verdict.to_dict(),
+            "intelligent_write": write_test_result,
+        }
+    )
+
+
+@app.get("/api/audit/customer/<customer_id>")
+@guarded
+def audit_customer(customer_id: str):
+    """Run a live MemoryCorpusAuditor sweep for a customer against BigQuery ground truth."""
+    from backend.veracity_and_audit import MemoryCorpusAuditor
+
+    auditor = MemoryCorpusAuditor(SETTINGS, memory=_memory, reader=_reader)
+    report = auditor.audit(customer_id)
+    return jsonify(report.to_dict())
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5055))
     log.info("configuration: %s", SETTINGS.redacted())
