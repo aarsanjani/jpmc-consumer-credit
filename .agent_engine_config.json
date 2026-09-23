@@ -1,9 +1,10 @@
 {
-  "display_name": "JPMC Consumer Credit Memory Bank Synthesizer",
-  "description": "Enterprise multi-agent system synthesizing cross-system observations via Gemini Memory Bank and Knowledge Catalog",
+  "display_name": "JPMC Consumer Credit Fraud Desk",
+  "description": "Fraud-desk agent over Vertex AI Agent Engine Memory Bank, Dataplex Universal Catalog and BigQuery. Memory Bank supplies conversational history, Dataplex authorises each read and resolves vocabulary, BigQuery supplies authoritative figures.",
   "project": "your-gcp-project-id",
   "location": "us-central1",
   "adk_version": "2.9.1",
-  "memory_service_uri": "memory://",
-  "session_service_uri": "memory://"
+  "root_agent": "agent.agent:root_agent",
+  "_comment_project": "Replace `project` before deploying. The running application does NOT read this file; it reads the environment via backend/config.py. This descriptor exists for `adk deploy`.",
+  "_comment_memory": "session_service_uri and memory_service_uri are intentionally omitted. The previous version set both to `memory://`, which is ADK's in-process store, so a deployment using it would have discarded every session and memory on restart while the README claimed a live Memory Bank. This application talks to Memory Bank directly through backend/memory_bank.py over the REST API, so no ADK memory service is configured."
 }

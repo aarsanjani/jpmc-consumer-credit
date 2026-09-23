@@ -1,116 +1,99 @@
-"""
-TDD Unit Tests for Gemini Enterprise Memory Bank, Semantic Retrieval, Asynchronous Compaction,
-and Standalone Framework-Agnostic Client API.
-"""
+import pytest
+from backend.memory_bank import MemoryBankClient, Memory, MemoryTopic, GeneratedMemory, GenerateResult
 
-from datetime import datetime, timezone
-from backend.models import (
-    MemoryFragment,
-    BankChannel,
-    SeverityLevel,
-)
-from backend.memory_bank import CustomerMemoryBank, StandaloneMemoryBankClient
+def test_retrieve_shape(mocker):
+    """Retrieve parses the correct Distance and Memory Topic flat shape."""
+    client = MemoryBankClient()
+    mock_request = mocker.patch.object(client, "_request")
+    
+    mock_request.return_value = {
+        "retrievedMemories": [{
+            "memory": {
+                "name": "projects/000000000000/locations/us-central1/reasoningEngines/000000000000000000/memories/m1",
+                "fact": "Customer called about travel",
+                "scope": {"customer_id": "CUST00001"},
+                "topics": [{"customMemoryTopicLabel": "TRAVEL_STATUS"}]
+            },
+            "distance": 0.42
+        }]
+    }
 
+    result = client.retrieve(scope={"customer_id": "CUST00001"}, query="query")
+    
+    assert len(result.memories) == 1
+    memory = result.memories[0]
+    assert memory.memory_id == "m1"
+    assert memory.fact == "Customer called about travel"
+    assert memory.distance == 0.42
+    assert "TRAVEL_STATUS" in memory.topics
 
-def test_memory_fragment_creation():
-    frag = MemoryFragment(
-        fragment_id="mem-001",
-        customer_id="cust_jpmc_88329",
-        channel=BankChannel.FRAUD_DETECTION,
-        timestamp=datetime(2026, 9, 7, 9, 15, 0, tzinfo=timezone.utc),
-        day_label="Day 1 - 09:15 UTC",
-        summary="Concurrent logins from New York and Chicago flagged as velocity anomaly. Card ending in 4821 locked.",
-        metadata={"locations": ["New York, NY", "Chicago, IL"], "action_taken": "LOCK_CARD", "card_last4": "4821"},
-        severity=SeverityLevel.HIGH,
-    )
+def test_list_shape(mocker):
+    """List processes memory pages until nextPageToken is null."""
+    client = MemoryBankClient()
+    mock_request = mocker.patch.object(client, "_request")
+    
+    mock_request.side_effect = [
+        {"memories": [{"name": "fake1"}], "nextPageToken": "token"},
+        {"memories": [{"name": "fake2"}], "nextPageToken": None}
+    ]
+    
+    memories = client.list_memories()
+    assert len(memories) == 2
+    assert memories[0].memory_id == "fake1"
+    assert memories[1].memory_id == "fake2"
 
-    assert frag.fragment_id == "mem-001"
-    assert frag.channel == BankChannel.FRAUD_DETECTION
-    assert frag.severity == SeverityLevel.HIGH
-    assert "4821" in frag.summary
+def test_generate_lro_with_write(mocker):
+    """generate_from_conversation computes done LROs parsing generated memories."""
+    client = MemoryBankClient()
+    mocker.patch.object(client, "_request", return_value={"name": "op1"})
+    
+    mock_await = mocker.patch.object(client, "_await_operation")
+    mock_await.return_value = {
+        "done": True,
+        "response": {
+            "generatedMemories": [
+                {
+                    "memory": {"name": "memXYZ", "memoryType": "KNOWLEDGE"},
+                    "action": "CREATED"
+                }
+            ]
+        }
+    }
+    
+    res = client.generate_from_conversation(turns=[{"text": "hello"}], scope={"a": "b"})
+    assert res.done is True
+    assert res.wrote_nothing is False
+    assert len(res.generated) == 1
+    assert res.generated[0].action == "CREATED"
+    assert res.generated[0].memory.name == "memXYZ"
 
+def test_generate_lro_wrote_nothing(mocker):
+    """Generating nothing MUST result in wrote_nothing=True. This is a load-bearing invariant."""
+    client = MemoryBankClient()
+    mocker.patch.object(client, "_request", return_value={"name": "op1"})
+    
+    mock_await = mocker.patch.object(client, "_await_operation")
+    # LRO done but NO response key.
+    mock_await.return_value = {"done": True}
+    
+    res = client.generate_from_conversation(turns=[{"text": "meaningless chatter"}], scope={"a": "b"})
+    
+    assert res.done is True
+    assert res.generated == []
+    assert res.wrote_nothing is True
 
-def test_customer_memory_bank_seeding():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
-    mb.seed_default_scenario()
+def test_topic_shapes_parse_correctly():
+    """Conflating nested config topic and flat memory topic is a real defect."""
+    # From API Config shape
+    topic = MemoryTopic.from_api({"customMemoryTopic": {"label": "CFG_TOPIC", "description": "desc"}})
+    assert topic.label == "CFG_TOPIC"
+    assert topic.kind == "CUSTOM"
 
-    fragments = mb.get_fragments()
-    channels = [f.channel for f in fragments]
-
-    assert len(fragments) == 3
-    assert BankChannel.FRAUD_DETECTION in channels
-    assert BankChannel.TELEPHONY_IVR in channels
-    assert BankChannel.MOBILE_APP in channels
-
-
-def test_chronological_ordering():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
-    mb.seed_default_scenario()
-
-    fragments = mb.get_fragments()
-    timestamps = [f.timestamp for f in fragments]
-
-    assert timestamps == sorted(timestamps)
-
-
-def test_ingest_custom_fragment():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
-    mb.clear()
-
-    mb.ingest_event(
-        channel=BankChannel.FRAUD_DETECTION,
-        day_label="Day 1 - 09:15 UTC",
-        summary="Card locked due to multi-city login anomaly.",
-        metadata={"card_last4": "4821"},
-        severity=SeverityLevel.HIGH,
-    )
-
-    assert len(mb.get_fragments()) == 1
-    assert mb.get_fragments()[0].channel == BankChannel.FRAUD_DETECTION
-
-
-def test_formatted_memory_context_string():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
-    mb.seed_default_scenario()
-
-    context_str = mb.get_formatted_context()
-
-    assert "FRAUD_DETECTION" in context_str
-    assert "TELEPHONY_IVR" in context_str
-    assert "MOBILE_APP" in context_str
-    assert "4821" in context_str
-
-
-def test_retrieve_relevant_memories_computes_token_savings():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
-    mb.seed_default_scenario()
-
-    result = mb.retrieve_relevant_memories(query="Chicago $1000 fraud lock", top_k=2)
-
-    assert result["retrieved_count"] == 2
-    assert result["tokenomics"]["token_savings_pct"] > 80.0
-
-
-def test_compact_memories_consolidates_history_and_extracts_insights():
-    mb = CustomerMemoryBank(customer_id="cust_jpmc_88329")
-    mb.seed_default_scenario()
-
-    report = mb.compact_memories()
-
-    assert report.token_reduction_pct >= 80.0
-    assert report.raw_token_count > report.compacted_token_count
-    assert len(report.distilled_customer_insights) >= 3
-    assert any(f.is_compacted_summary for f in mb.get_fragments())
-
-
-def test_standalone_client_preloads_context_for_external_frameworks():
-    client = StandaloneMemoryBankClient(customer_id="cust_jpmc_88329")
-
-    bundle = client.preload_context_for_external_agent(
-        user_query="Why was my card declined in London?",
-        framework_name="CrewAI",
-    )
-
-    assert bundle["client_mode"] == "STANDALONE_MEMORY_BANK_API"
-    assert bundle["caller_agent_framework"] == "CrewAI"
-    assert len(bundle["retrieved_memories"]) > 0
+    # Managed cfg topic
+    topic_m = MemoryTopic.from_api({"managedMemoryTopic": {"managedTopicEnum": "MANAGED_CFG"}})
+    assert topic_m.label == "MANAGED_CFG"
+    
+    # Flat Memory shape
+    from backend.memory_bank import _topic_labels
+    labels = _topic_labels([{"customMemoryTopicLabel": "TRAVEL_STATUS"}])
+    assert labels == ["TRAVEL_STATUS"]

@@ -54,7 +54,7 @@ except ImportError:
 * **The Issue**: Querying memory across sessions will fail if customer entity keys (`customer_id`, `account_id`) are not synchronized with the session scope.
 * **Day-1 Best Practice**: Initialize the customer context explicitly on the memory provider and verify session linkage prior to agent generation:
 ```python
-memory_bank = CustomerMemoryBank(customer_id="cust_jpmc_88329")
+memory_bank = CustomerMemoryBank(customer_id="CUST00001")
 memory_notes = memory_bank.get_consolidated_notes()
 ```
 

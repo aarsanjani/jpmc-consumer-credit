@@ -1,22 +1,67 @@
 {
   "agents": [
     {
-      "name": "consumer_credit_synthesizer_agent",
+      "name": "01_orchestrator",
       "path": "backend/adk_agents.py",
-      "maturity_level": 3,
-      "description": "Lead Consumer Credit Synthesizer Orchestrator Agent using Memory Bank and Knowledge Catalog"
+      "factory": "create_orchestrator",
+      "role": "root",
+      "description": "Routes a fraud-desk question to the specialist agents, then synthesises their findings. Holds no tools of its own so that every fact in an answer is traceable to a sub-agent's tool call.",
+      "sub_agents": [
+        "02_memory_context",
+        "03_data_governance",
+        "04_warehouse_evidence",
+        "05_policy_and_vocabulary"
+      ]
     },
     {
-      "name": "claim_veracity_validator_agent",
-      "path": "backend/veracity_and_audit.py",
-      "maturity_level": 3,
-      "description": "Multi-Avenue Ground-Truth Pre-Write Claim Veracity Validator Agent"
+      "name": "02_memory_context",
+      "path": "backend/adk_agents.py",
+      "factory": "create_memory_agent",
+      "role": "sub_agent",
+      "description": "Reads the customer's conversational history from Vertex AI Agent Engine Memory Bank. Read-only: it retrieves and lists, it never generates memories, so an inspection turn cannot mutate the corpus it is inspecting.",
+      "tools": [
+        "list_memory_topics",
+        "search_customer_memory",
+        "list_all_customer_memory"
+      ]
     },
     {
-      "name": "memory_bank_audit_agent",
-      "path": "backend/veracity_and_audit.py",
-      "maturity_level": 3,
-      "description": "Consolidated Enterprise Sweep & Anomaly Detection Audit Agent"
+      "name": "03_data_governance",
+      "path": "backend/adk_agents.py",
+      "factory": "create_governance_agent",
+      "role": "sub_agent",
+      "description": "Asks Dataplex Universal Catalog whether a table or column may be read before anything reads it, and discovers sibling tables. Acts on the aspect's agent_behavior field, never on its sensitivity level.",
+      "tools": [
+        "catalog_authorize_table",
+        "catalog_authorize_column",
+        "catalog_discover_tables"
+      ]
+    },
+    {
+      "name": "04_warehouse_evidence",
+      "path": "backend/adk_agents.py",
+      "factory": "create_warehouse_agent",
+      "role": "sub_agent",
+      "description": "Runs named, parameterised golden queries against BigQuery for authoritative figures. Ad-hoc SQL is not reachable from the model, so the query surface is auditable and fixed.",
+      "tools": [
+        "list_warehouse_queries",
+        "run_warehouse_query"
+      ]
+    },
+    {
+      "name": "05_policy_and_vocabulary",
+      "path": "backend/adk_agents.py",
+      "factory": "create_policy_agent",
+      "role": "sub_agent",
+      "description": "Resolves business vocabulary and regulatory terminology against the Dataplex business glossary rather than relying on the model's priors.",
+      "tools": [
+        "glossary_lookup",
+        "glossary_search"
+      ]
     }
-  ]
+  ],
+  "notes": {
+    "topology_source": "backend/adk_agents.py::list_all_agents walks the constructed graph at runtime; this file documents it but is not the source of truth.",
+    "execution": "backend/adk_agents.py::run_turn drives a real ADK Runner. Tool calls reported anywhere in the UI come from the observed RunTrace."
+  }
 }

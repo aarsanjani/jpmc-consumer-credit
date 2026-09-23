@@ -1,277 +1,270 @@
-# JPMorgan Chase Consumer Credit: Gemini Enterprise Scale Memory Bank & Multi-Agent Mesh
+# JPMorgan Chase Consumer Credit: Vertex AI Memory Bank & Data Governance Mesh
 
-[![Google Cloud](https://img.shields.io/badge/Google%20Cloud-Agent%20Engine-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/)
-[![ADK](https://img.shields.io/badge/Agent%20Development%20Kit-Google%20ADK-34A853?logo=google&logoColor=white)](https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank/adk-quickstart)
-[![Gemini Enterprise](https://img.shields.io/badge/Gemini%20Enterprise-Scale%20Memory%20Bank-8E75B2?logo=google&logoColor=white)](https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank)
-[![Tests](https://img.shields.io/badge/pytest-40%20passed-brightgreen.svg)](tests/)
+[![Google Cloud](https://img.shields.io/badge/Google%20Cloud-Vertex%20AI%20Agent%20Engine-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/vertex-ai)
+[![ADK](https://img.shields.io/badge/Agent%20Development%20Kit-Google%20ADK-34A853?logo=google&logoColor=white)](https://google.github.io/agent-development-kit/)
+[![Dataplex](https://img.shields.io/badge/Google%20Cloud-Dataplex%20Catalog-EA4335?logo=googlecloud&logoColor=white)](https://cloud.google.com/dataplex)
+[![BigQuery](https://img.shields.io/badge/Google%20Cloud-BigQuery%20Warehouse-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/bigquery)
+[![Tests](https://img.shields.io/badge/pytest-49%20passed%20offline-brightgreen.svg)](tests/)
 
-Enterprise multi-agent system built on the **Google Cloud Agentic Stack** (Google Agent Development Kit, Gemini Enterprise Agent Engine Scale Memory Bank, and A2UI Reactive Presentation Layer).
-
-It demonstrates cross-channel session management, pre-write claim veracity validation against authoritative ground-truth telemetry, consolidated enterprise memory auditing, and zero-question causal synthesis across fragmented banking systems.
+An enterprise fraud-desk multi-agent platform pairing **Google Cloud Vertex AI Agent Engine Memory Bank**, **Dataplex Universal Catalog**, and **BigQuery Ground Truth** using the **Google Agent Development Kit (ADK)**.
 
 ---
 
 ## 📑 Table of Contents
 
-1. [Architectural Overview](#-1-architectural-overview)
-2. [Multi-Agent Topology (8 Active Agents)](#-2-multi-agent-topology-8-active-agents)
-3. [Scale Memory Bank & Cross-Channel Ingestion](#-3-scale-memory-bank--cross-channel-ingestion)
-4. [Pre-Write Claim Veracity Validation Layer](#-4-pre-write-claim-veracity-validation-layer)
-5. [Consolidated Memory Bank Audit Sweep Agent](#-5-consolidated-memory-bank-audit-sweep-agent)
-6. [Zero-Question Causal Synthesis & A2UI Presentation](#-6-zero-question-causal-synthesis--a2ui-presentation)
-7. [API Specification](#-7-api-specification)
-8. [Local Quickstart & Verification Runbook](#-8-local-quickstart--verification-runbook)
+1. [Architectural Overview](#1-architectural-overview)
+2. [Multi-Agent Topology](#2-multi-agent-topology)
+3. [Memory Bank: Capabilities, Mechanics & Experimental Evidence](#3-memory-bank-capabilities-mechanics--experimental-evidence)
+4. [Dataplex Universal Catalog: Pre-Read Governance](#4-dataplex-universal-catalog-pre-read-governance)
+5. [Warehouse Ground Truth: Reconciling Memory Against Facts](#5-warehouse-ground-truth-reconciling-memory-against-facts)
+6. [Side-by-Side Comparison: ADK vs. Direct Implementation](#6-side-by-side-comparison-adk-vs-direct-implementation)
+7. [API Specification](#7-api-specification)
+8. [Setup & Quickstart Runbook](#8-setup--quickstart-runbook)
 
 ---
 
-## 🏛️ 1. Architectural Overview
+## 1. Architectural Overview
 
-In modern retail banking, customer touchpoints span isolated subsystems (Risk/Fraud Velocity Engines, Contact Center IVRs, Mobile Digital Wallets, Web Banking Portals, and Physical Branch Tellers).
+In retail banking fraud and dispute operations, customer interactions span disparate systems: digital wallets, IVR phone logs, travel notices, and core ledger balances. A common architectural failure in LLM systems is treating LLM memory as an authoritative database, or allowing agents to read sensitive tables without policy validation.
 
-The **Gemini Enterprise Scale Memory Bank** acts as a centralized epistemic memory vault that captures timestamped, veracity-evaluated observations from decoupled channel agents, allowing a single lead orchestrator agent to reconstruct full multi-day causal chains without interrogating the user with repetitive questions.
+This platform enforces a strict separation of concerns:
+
+- **BigQuery is authoritative for facts**: Account balances, dispute records, card lifecycles, and travel notices reside in BigQuery tables. Ad-hoc SQL is rejected; agents query through audited, parameterised golden queries.
+- **Dataplex Universal Catalog is authoritative for policy & vocabulary**: Every table and column read must be pre-authorised against Dataplex governance aspects (`agent_behavior: ALLOW | ALLOW_TO_OWNER_ONLY | REFUSE`). Regulatory definitions are grounded in the Dataplex Business Glossary.
+- **Vertex AI Memory Bank is authoritative for customer narrative**: Preserves cross-session conversational context, customer statements, preferences, and commitments. It records what the customer *said*, not what the core banking system *executed*.
+- **Google ADK orchestrates the mesh**: Specialized agents delegate through a root orchestrator with auditable tool boundaries.
 
 ```mermaid
 flowchart TD
-    subgraph ChannelMesh["Multi-Channel Agent Mesh - Session Producers"]
-        A1["Fraud Monitoring Agent - Channel: FRAUD_DETECTION"] -->|"Session: Geo-Velocity Alert"| PVL
-        A2["Telephony IVR Agent - Channel: TELEPHONY_IVR"] -->|"Session: Call Dropped Pre-2FA"| PVL
-        A3["Mobile Banking Agent - Channel: MOBILE_APP"] -->|"Session: Apple Pay Restricted"| PVL
-        A4["Web Portal Agent - Channel: WEB_PORTAL"] -->|"Session: Online Dispute"| PVL
-        A5["Branch Support Agent - Channel: BRANCH_SUPPORT"] -->|"Session: In-Person Banker Note"| PVL
+    User["Fraud Desk Operator"] <--> UI["Operator Console (Vanilla ES6)"]
+    UI <--> Backend["Flask Service (backend/app.py)"]
+    
+    subgraph ADKMesh["Google Agent Development Kit (ADK) Multi-Agent Mesh"]
+        ORCH["01_orchestrator (Root Router & Synthesiser)"]
+        MEM["02_memory_context"]
+        GOV["03_data_governance"]
+        WH["04_warehouse_evidence"]
+        POL["05_policy_and_vocabulary"]
+        
+        ORCH --> MEM
+        ORCH --> GOV
+        ORCH --> WH
+        ORCH --> POL
     end
-
-    subgraph PreWriteValidation["Pre-Write Veracity Validation Gatekeeper"]
-        PVL["ClaimVeracityValidatorAgent"] <-->|"Cross-Check Relevant Telemetry"| GT[("GroundTruthTelemetryStore - IPs, IVR, POS, Travel Notices")]
-        PVL -->|"Validated Fragment + Veracity Flag"| MB[("Gemini Enterprise Scale Memory Bank")]
-    end
-
-    subgraph GovernanceAndSynthesis["Governance, Admin Oversight & Resolution"]
-        MB <-->|"Periodic Cross-Customer Sweep"| AUD["MemoryBankAuditAgent - Anomaly & Contradiction Sweep"]
-        MB -->|"Zero-Question Causal Retrieval"| SYN["ConsumerCreditSynthesizerAgent - Gemini 2.5 Flash"]
-        SYN -->|"Chat Verification + Confidence Score"| ADM["Dashboard Admin Oversight - YES Enable / NO Keep Restricted"]
-        ADM -->|"JSON-RPC 2.0 SSE Stream"| A2UI["A2UI Dynamic Client Engine - Card Unlock & Customer Chat Notice"]
-    end
+    
+    Backend --> ADKMesh
+    Backend --> Eval["Memory Evaluation & Reconciler Harness"]
+    
+    MEM <--> MB[("Vertex AI Memory Bank\nReasoning Engine")]
+    GOV <--> DP[("Dataplex Universal Catalog\nAspects & Glossary")]
+    WH <--> BQ[("BigQuery Ground Truth\njpmc_ccb_fraud Dataset")]
+    POL <--> DP
 ```
 
 ---
 
-## 🤖 2. Multi-Agent Topology (8 Active Agents)
+## 2. Multi-Agent Topology
 
-The system leverages the **Google Agent Development Kit (`google.adk.agents.LlmAgent`)** organized in a disciplined Hub-and-Spoke topology with strict communication guardrails (`disallow_transfer_to_parent=True`, `disallow_transfer_to_peers=True`):
+Implemented in [`backend/adk_agents.py`](backend/adk_agents.py) using the Google Agent Development Kit (`google.adk.agents.LlmAgent`) and driven by a real `InMemoryRunner`:
 
-```mermaid
-flowchart LR
-    SYN["Lead Orchestrator: consumer_credit_synthesizer_agent"] --> FMA["fraud_monitoring_agent"]
-    SYN --> TIA["telephony_ivr_agent"]
-    SYN --> MAA["mobile_app_agent"]
-    SYN --> WPA["web_portal_agent"]
-    SYN --> BSA["branch_support_agent"]
-    SYN --> CVA["claim_veracity_validator_agent"]
-    SYN --> MBA["memory_bank_audit_agent"]
+| Agent | Role | Tools Bound | Architectural Responsibility |
+|:---|:---|:---|:---|
+| **`01_orchestrator`** | Root Orchestrator | *None directly* | Receives the user question, determines which specialist sub-agents to invoke, and synthesises evidence into a final response. Because it possesses no direct data tools, every factual assertion is traceable to a sub-agent trace. |
+| **`02_memory_context`** | Sub-Agent | `list_memory_topics`, `search_customer_memory`, `list_all_customer_memory` | Read-only access to customer conversational history in Vertex AI Memory Bank. It cannot execute writes during an inquiry turn, eliminating state contamination during inspection. |
+| **`03_data_governance`** | Sub-Agent | `catalog_authorize_table`, `catalog_authorize_column`, `catalog_discover_tables` | Interrogates Dataplex Universal Catalog aspects prior to data access. Validates whether tables or columns are active or deprecated, and enforces owner-only or refusal rules. |
+| **`04_warehouse_evidence`** | Sub-Agent | `list_warehouse_queries`, `run_warehouse_query` | Executes pre-compiled, parameterised BigQuery SQL queries. Ad-hoc SQL strings from the model are blocked at the interface. |
+| **`05_policy_and_vocabulary`** | Sub-Agent | `glossary_lookup`, `glossary_search` | Resolves banking dispute concepts (Regulation E, Regulation Z, chargeback windows, provisional credit) against the official Dataplex Business Glossary. |
+
+---
+
+## 3. Memory Bank: Capabilities, Mechanics & Experimental Evidence
+
+Vertex AI Agent Engine Memory Bank provides semantic memory persistence over reasoning engines. Rather than treating it as a black-box vector database, the codebase includes an evaluation suite in [`backend/memory_eval/`](backend/memory_eval/) that measures its operational behavior.
+
+Full experimental data and methodology are documented in [`docs/MEMORY_BANK_EVIDENCE.md`](docs/MEMORY_BANK_EVIDENCE.md).
+
+### A. Intelligent Writes: Topics Decide What to Write and What to Exclude
+
+Memory Bank does not append raw transcripts. During extraction (`POST {engine}/memories:generate`), topics act as an **inclusion filter**:
+
+- **Custom Fraud Desk Topics**: The engine is configured with seven domain topics (`TRAVEL_STATUS`, `DISPUTE_HISTORY`, `CONTACT_PREFERENCE`, `DEVICE_WALLET_INVENTORY`, `AGENT_COMMITMENTS`, `CARD_LIFECYCLE`, `SPENDING_CONTEXT`).
+- **Managed Default Topics**: The platform defaults (`USER_PERSONAL_INFO`, `USER_PREFERENCES`, `KEY_CONVERSATION_DETAILS`, `EXPLICIT_INSTRUCTIONS`).
+
+In a controlled three-arm experiment across identical transcripts and scopes:
+- When processing a personal dialogue transcript (`personal_info_only`), an engine with `desk_custom` topics wrote **0 memories** (`done: true` with no response body).
+- The exact same transcript under `managed_defaults` extracted **2 memories** (`USER_PERSONAL_INFO`).
+- **Finding**: Topics are not tags applied after extraction; they govern whether extraction occurs.
+
+In the `inclusion` benchmark (`mixed_signal_call`, 9 utterances):
+- **Durable facts retained**: 4 of 4 (`durable_coverage = 1.0`).
+- **Disposable chatter leaked**: 0 (`disposable_leaked_ids = []`).
+- **Warehouse balances leaked**: 0 (`warehouse_leaked_ids = []`). The statement balance of "$4,280.50" was discarded because it is volatile ledger data that belongs in BigQuery.
+
+### B. Tenant Boundary: Scope Isolation
+
+- Memory operations are partitioned by `scope` (e.g., `{"customer_id": "CUST00001"}`).
+- Queries across differing scopes yield **0 results**.
+- Scope matching is exact: adding an unexpected key returns **0 results**. A session-scoped write cannot be retrieved with a customer-level scope.
+
+### C. Fact Consolidation vs. Append Logs
+
+- In an incremental dialogue test, updating an itinerary from "Lisbon in October" to "Lisbon from October 2 to October 11" produced an **`UPDATE`** action, keeping corpus size at 1 rather than creating duplicate fragments.
+- An explicit cancellation statement triggered a **`DELETED`** action, leaving the corpus at 0.
+
+### D. Retrieval Precision and Recall
+
+Evaluated across 12 diagnostic probes in [`benchmarks/retrieval_probes.json`](benchmarks/retrieval_probes.json) against the live corpus:
+
+| Metric | k=1 | k=3 | k=5 (Preset Headline) | k=10 |
+|:---|:---:|:---:|:---:|:---:|
+| **Macro Precision** | 0.5833 | 0.5833 | **0.5000** | 0.2750 |
+| **Macro Recall** | 0.2554 | 0.7208 | **0.9589** | 1.0000 |
+| **Macro F1** | 0.5241 | 0.6781 | **0.6404** | 0.4315 |
+| **Mean Reciprocal Rank (MRR)** | 1.0000 | 0.8500 | **0.7955** | 0.7955 |
+| **nDCG** | 0.6364 | 0.7919 | **0.8599** | 0.8599 |
+
+*Note on Precision Ceiling*: In a corpus of 12 memories where queries have an average of ~2.75 relevant items, retrieving $k=5$ yields a maximum theoretical precision of $\frac{2.75}{5} = 0.55$. The measured precision of $0.50$ indicates that nearly all returned items up to the relevant set boundary are true positives.
+
+---
+
+## 4. Dataplex Universal Catalog: Pre-Read Governance
+
+Data governance is enforced via [`backend/knowledge_catalog.py`](backend/knowledge_catalog.py). Prior to querying BigQuery, the system queries Dataplex aspect metadata:
+
+- **Lifecycle Governance**: Tables with `lifecycle-status.status == DEPRECATED` (e.g., `authorizations_deprecated_v1`) trigger a **`REFUSE`** decision with agent guidance directing queries to the active table.
+- **Sensitivity Governance**: The `sensitivity-class` aspect defines `agent_behavior` (`ALLOW`, `ALLOW_TO_OWNER_ONLY`, `REFUSE`).
+- **Column-Level Overrides**: The system inspects column aspect suffixes (e.g., `sensitivity-class@Schema.pan_full`). A query attempting to read full PANs is intercepted and refused.
+- **Business Glossary Grounding**: 45 standardized terms across 5 categories in the `ccb-fraud-disputes` glossary provide verified definitions for dispute handling.
+
+---
+
+## 5. Warehouse Ground Truth: Reconciling Memory Against Facts
+
+Memory Bank records what a customer claimed or requested. Core banking ledgers record transactional facts. [`backend/memory_eval/reconcile.py`](backend/memory_eval/reconcile.py) detects divergences between memory and ledger state:
+
+1. **Travel Notice Discrepancy**: A customer conversational memory asserts travel to **London**. BigQuery `travel_notices` records an active travel window for **Lisbon** with an early return date. The reconciler flags the London assertion as unverified/contradicted.
+2. **Disputed Amounts**: Memories quoting conversational figures ("412 euros", "90 euros") are reconciled against authoritative BigQuery dispute records (`DSP00024`, `DSP00025`, `DSP00033`).
+3. **Hygiene Rules**: Card suffixes (e.g., "card ending in 4417") and bare quantities are explicitly protected from false numeric contradiction checks against monetary amounts.
+
+---
+
+## 6. Side-by-Side Comparison: ADK vs. Direct Implementation
+
+Implemented in [`backend/custom_agent_comparison.py`](backend/custom_agent_comparison.py) and exposed via `POST /api/agents/run` / UI:
+
+- **Lane A (Google ADK)**: Declarative multi-agent system using `LlmAgent`, sub-agent delegation, and tool schemas.
+- **Lane B (Direct / Non-Framework)**: Direct sequential Python calls to `MemoryBankClient.retrieve()`, `CatalogGovernor.search_terms()`, and `GroundTruthReader.run()`, feeding a manually formatted prompt to `genai.Client`.
+- **Honest Provenance**:
+  - Integration LOC is computed dynamically at runtime using `inspect.getsourcelines()`.
+  - Latencies are measured using `time.perf_counter()`.
+  - Unreported metrics (e.g. ADK runner internal token counts) render strictly as `n/r` ("not reported") via [`backend/provenance.py`](backend/provenance.py), rather than substituting fabricated estimates.
+  - Epistemic parity verifies whether both approaches observed the exact same set of underlying Memory Bank memory IDs.
+
+---
+
+## 7. API Specification
+
+The Flask service in [`backend/app.py`](backend/app.py) provides 21 REST endpoints (and `/` for the operator console):
+
+```
+System & Session
+  GET  /api/health                     - Probes live Vertex AI, BigQuery, and Dataplex connectivity
+  GET  /api/session                    - Active GCP project, engine, dataset, and available customers
+
+Memory Bank Operations
+  GET  /api/memory/topics              - Registered engine topics (custom and managed)
+  GET  /api/memory/list                - List all stored memories for a customer scope
+  POST /api/memory/retrieve            - Similarity search returning distance-ranked memories
+  POST /api/memory/generate            - Extract memories from dialogue with intelligent write/exclusion
+
+Dataplex Catalog & Governance
+  GET  /api/catalog/overview           - Health, glossary summary, and registered table facets
+  GET  /api/catalog/terms              - Search or list business glossary definitions
+  GET  /api/catalog/authorize          - Evaluate table or column governance aspects
+  GET  /api/catalog/discover           - Discover active replacement tables for deprecated assets
+
+BigQuery Warehouse Evidence
+  GET  /api/warehouse/queries          - List audited golden query definitions
+  POST /api/warehouse/run              - Execute a parameterised golden query with catalog guardrails
+
+Agent Execution & Interaction
+  POST /api/chat                       - Fraud desk agent turnaround with evidence citations
+  POST /api/chat/stream                - Server-Sent Events (SSE) streaming chat response
+  GET  /api/agents/list                - Topology of the 5-agent ADK mesh
+  POST /api/agents/run                 - Execute ADK turn or side-by-side comparison
+
+Evaluation & Verification Harness
+  GET  /api/eval/probes                - Diagnostic retrieval evaluation probes
+  POST /api/eval/retrieval             - Run precision/recall benchmark across k sweep
+  POST /api/eval/write-policy          - Run write inclusion, topic filtering, or scope tests
+  GET  /api/eval/reconcile             - Audit memory statements against BigQuery facts
 ```
 
-### Agent Roster Catalog
-
-| # | Agent Name | Domain Role | Agent Type | Primary Tools & Responsibilities |
-| :- | :--- | :--- | :--- | :--- |
-| **1** | [`fraud_monitoring_agent`](backend/adk_agents.py) | Fraud Velocity Specialist | `CHANNEL_PRODUCER` | `query_fraud_velocity_alerts`: Evaluates multi-city login anomalies (NY & Chicago) and deposits automated card restriction notes. |
-| **2** | [`telephony_ivr_agent`](backend/adk_agents.py) | Contact Center IVR Specialist | `CHANNEL_PRODUCER` | `query_ivr_call_records`: Ingests inbound phone records, declined $142.50 Target transactions, and dropped 2FA sessions. |
-| **3** | [`mobile_app_agent`](backend/adk_agents.py) | Mobile & Digital Wallet Specialist | `CHANNEL_PRODUCER` | `query_mobile_wallet_events`: Diagnoses Apple Pay tokenization rejections (`CARD_STATUS_LOCKED_RESTRICTED`). |
-| **4** | [`web_portal_agent`](backend/adk_agents.py) | Online Web Banking Specialist | `CHANNEL_PRODUCER` | `query_web_portal_activity`: Tracks browser authentication headers, disputes, and card toggle preferences. |
-| **5** | [`branch_support_agent`](backend/adk_agents.py) | Branch & Teller Specialist | `CHANNEL_PRODUCER` | `query_branch_teller_interactions`: Records physical branch banker consultations and in-person ID validations. |
-| **6** | [`claim_veracity_validator_agent`](backend/veracity_and_audit.py) | Pre-Write Veracity Gatekeeper | `PRE_WRITE_VALIDATOR` | `validate_and_record_customer_claim`: Validates customer claims against relevant ground-truth avenues before writing to Memory Bank. |
-| **7** | [`memory_bank_audit_agent`](backend/veracity_and_audit.py) | Consolidated Sweep Auditor | `CONSOLIDATED_AUDITOR` | `run_consolidated_memory_audit_sweep`: Executes enterprise-wide consolidated sweeps across customer memory banks for anomalies. |
-| **8** | [`consumer_credit_synthesizer_agent`](backend/adk_agents.py) | Lead Synthesizer Orchestrator | `LEAD_SYNTHESIZER` | `read_customer_memory_bank`, `execute_one_click_card_unlock`: Reconstructs the causal chain and streams zero-question resolution via A2UI. |
-
 ---
 
-## 🧠 3. Scale Memory Bank & Cross-Channel Ingestion
-
-Reference: [Google Cloud Scale Memory Bank Documentation](https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank) and [ADK Memory Bank Quickstart](https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank/adk-quickstart).
-
-The [`CustomerMemoryBank`](backend/memory_bank.py) persists chronological observation fragments across sessions and channels without point-to-point coupling:
-
-```
-[CustomerMemoryBank: cust_jpmc_88329]
-├── Note 1 (Day 1 - 09:15 UTC) [FRAUD_DETECTION]
-│   ├── Summary: Concurrent logins in New York (IP 198.51.100.4) & Chicago (IP 203.0.113.19). Card *4821 locked.
-│   └── Veracity: VERIFIED_TRUE (99%) | Corroborating: IP 198.51.100.4 (NY), IP 203.0.113.19 (Chicago)
-│
-├── Note 2 (Day 1 - 14:32 UTC) [TELEPHONY_IVR]
-│   ├── Summary: Inbound IVR call regarding $142.50 Target decline. Call dropped before 2FA passcode entry.
-│   └── Veracity: VERIFIED_TRUE (98%) | Corroborating: Call duration 48s, SMS OTP dispatched to +1-212-555-0198
-│
-└── Note 3 (Day 2 - 11:20 UTC) [MOBILE_APP]
-    ├── Summary: Apple Pay tokenization failed: CARD_STATUS_LOCKED_RESTRICTED on iPhone 16 Pro.
-    └── Veracity: VERIFIED_TRUE (99%) | Corroborating: iOS gateway response CARD_STATUS_LOCKED_RESTRICTED
-```
-
----
-
-## 🛡️ 4. Pre-Write Claim Veracity Validation Layer
-
-To prevent hallucinations, malicious false claims, or erroneous memory pollution, every claim made during a customer session must pass through the **Pre-Write Veracity Validation Layer** (`ClaimVeracityValidatorAgent`), which dynamically selects only the ground-truth avenues relevant to that claim:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Customer as Customer Session
-    participant Validator as ClaimVeracityValidatorAgent
-    participant Telemetry as GroundTruthTelemetryStore
-    participant MemoryBank as CustomerMemoryBank
-
-    Customer->>Validator: Submit Claim ("London Duty-Free Decline" or "Never in Chicago")
-    Validator->>Telemetry: Query Only Claim-Relevant Telemetry Avenues
-    Telemetry-->>Validator: Return Matching POS, Travel Notice, or IP Session Logs
-    Validator->>Validator: Evaluate Veracity & Confidence Score (VERIFIED_TRUE or CONTRADICTED)
-    Validator->>MemoryBank: Commit Fragment with Claim-Specific Audit Metadata
-    MemoryBank-->>Validator: Memory Fragment Persisted
-    Validator-->>Customer: Return Veracity Evaluation & Admin Review Status
-```
-
-### Claim Evaluation Matrix
-
-| Customer Claim in Session | Ground-Truth Telemetry Check | Assigned Veracity Status | Resulting Action |
-| :--- | :--- | :--- | :--- |
-| *"My Sapphire Reserve card was declined for £185 at London Heathrow Duty Free despite my London travel notice"* | Checked only *Geo & Travel Notice Registry* (`ACTIVE_VERIFIED` London, UK), *POS Log* (`CARD_STATUS_LOCKED_RESTRICTED`), and *Policy `POL-GEO-VEL-003`*. | `VERIFIED_TRUE` (98%) | Forwarded to Dashboard Admin (`98% Confidence`) to enable Card `*4821` (`YES`). |
-| *"My call dropped before I could finish entering the 2FA SMS code"* | Inbound IVR log: Call disconnected at 48s; OTP dispatched at 14:32:35. | `VERIFIED_TRUE` (98%) | Committed as verified observation fact. |
-| *"I was never in Chicago and never logged in from Chicago"* | IP log: Authenticated login from Chicago IP `203.0.113.19` on Comcast ISP. | `CONTRADICTED_BY_TELEMETRY` (96%) | Flagged as contradiction; Admin keeps Card `*4821` restricted (`NO`). |
-
----
-
-## 🔍 5. Consolidated Memory Bank Audit Sweep Agent
-
-The [`MemoryBankAuditAgent`](backend/veracity_and_audit.py) performs enterprise-wide sweeps across all customer Memory Banks:
-
-1. **Cross-Channel Contradiction Detection**: Flags mismatches between what a customer stated in Voice IVR vs Mobile Chat vs Web Portal.
-2. **Cascade Friction Analysis**: Identifies root triggers that caused domino failures across downstream channels.
-3. **Risk Profile Classification**: Categorizes customer accounts into `LOW`, `MEDIUM`, `HIGH`, or `CRITICAL` risk tiers with actionable recommendations.
-
----
-
-## ⚡ 6. Zero-Question Causal Synthesis & A2UI Presentation
-
-When a customer asks *"why is nothing working?"*, the **Consumer Credit Synthesizer Agent** never interrogates the user. It executes **zero-question causal synthesis**:
-
-```mermaid
-flowchart TD
-    Trigger["1. Root Trigger (Day 1 - 09:15 UTC): Dual-city logins in NY and Chicago triggered automated card lock."]
-    Intermediary["2. Intermediary Friction (Day 1 - 14:32 UTC): Target decline inquiry dropped before 2FA completed."]
-    Downstream["3. Ripple Effect (Day 2 - 11:20 UTC): London Duty-Free & Apple Pay rejected while card restricted."]
-    Resolution["4. Support Chat Verification & Admin Oversight: 98% Confidence Verified -> Admin clicks YES to Enable Card."]
-
-    Trigger --> Intermediary --> Downstream --> Resolution
-```
-
-The server streams real-time JSON-RPC 2.0 trace frames over Server-Sent Events (`/api/chat/stream`):
-- `onAgentThought`: Emits internal reasoning steps.
-- `onMemoryBankAccess`: Transmits retrieved memory fragments.
-- `onAgentSynthesis`: Delivers causal narrative.
-- `onUiComponentDelivery`: Renders the interactive A2UI Timeline & 1-Click Unlock card.
-
----
-
-## 📡 7. API Specification
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/api/agents/list` | List all 8 active agents with roles, channels, agent types, and tools. |
-| `POST` | `/api/session/channel/open` | Open an active channel session (Fraud, Telephony IVR, Mobile, Web, Branch). |
-| `GET` | `/api/session/channel/list` | List active channel sessions for a customer. |
-| `POST` | `/api/claims/validate-and-write` | Pre-write veracity validation layer; validates claim against telemetry before writing. |
-| `POST` | `/api/audit/sweep` | Trigger consolidated sweep across all customer Memory Banks and return `AuditReport`. |
-| `GET` | `/api/audit/customer/<customer_id>` | Retrieve audit anomalies and contradiction flags for a specific customer. |
-| `GET` | `/api/telemetry/<customer_id>` | Inspect authoritative ground-truth telemetry (IPs, IVR, transactions). |
-| `GET` | `/api/memory/get` | Retrieve all current memory fragments for a customer. |
-| `POST` | `/api/memory/seed` | Reset and re-seed the baseline 3-system cross-day scenario. |
-| `POST` | `/api/card/unlock` | Execute 1-click biometric card unlock and Apple Pay tokenization. |
-| `POST / GET` | `/api/chat/stream` | Reactive SSE stream delivering JSON-RPC 2.0 frames and A2UI dynamic components. |
-
----
-
-## 🛠️ 8. Local Quickstart & Verification Runbook
+## 8. Setup & Quickstart Runbook
 
 ### Prerequisites
-- Python 3.11+ / Python 3.14
-- Google Cloud SDK (`gcloud auth application-default login`)
 
-### Environment Setup
+- Python 3.11+
+- Google Cloud SDK (`gcloud`) authenticated with access to Vertex AI, BigQuery, and Dataplex
+- Standard Linux/macOS environment
+
+### Environment Configuration
+
+Copy `.env.example` to `.env` and fill in your GCP resource identifiers:
+
 ```bash
-export GOOGLE_GENAI_USE_VERTEXAI=true
-export GOOGLE_CLOUD_PROJECT="arsanjani-genai"
-export GOOGLE_CLOUD_LOCATION="us-central1"
+cp .env.example .env
 ```
 
-### Running the Test Suite (40 Passed Tests)
-```bash
-PYTHONPATH=. .venv/bin/pytest -v
+```ini
+# .env
+GOOGLE_GENAI_USE_VERTEXAI=true
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+GOOGLE_CLOUD_PROJECT_NUMBER=000000000000
+GOOGLE_CLOUD_LOCATION=us-central1
+VERTEX_AGENT_ENGINE_ID=000000000000000000
+BIGQUERY_DATASET=your_dataset_id
+DATAPLEX_GLOSSARY=your-glossary-id
+PORT=5060
 ```
 
-### Launching the Application
+> [!NOTE]
+> `backend/config.py` validates all required environment variables on startup. Missing configurations raise a descriptive `ConfigurationError` rather than falling back to mock defaults.
+
+### Running Tests Offline
+
+The test suite runs 100% offline without network calls or GCP credentials:
+
 ```bash
-PYTHONPATH=. .venv/bin/python backend/app.py
+PYTHONPATH=. pytest tests/ -v
 ```
-Open **`http://localhost:5055`** in your browser to interact with the A2UI glassmorphic workspace.
 
----
+All 49 unit and contract tests pass offline in < 3 seconds.
 
-## 🔍 Key Architectural Loopholes Resolved & Capabilities Showcased
+### Running the Evaluation Suite
 
-This implementation directly addresses enterprise architectural challenges in retail banking AI systems by replacing hard-wired string matching with **live Google Cloud Vertex AI (`google-genai` SDK) & Agent Engine Scale Memory Bank (`google.adk.memory.VertexAiMemoryBankService`)**:
+To evaluate Memory Bank precision, recall, topic filtering, and ground-truth reconciliation:
 
-1. **Claim-Specific Ground-Truth Avenue Selection (`RelevantAvenueCheck` — Zero Cross-Claim Leakage)**:
-   - Every customer claim is dynamically evaluated by **Gemini 2.5 Flash structured output (`response_schema=ClaimVeracityGenAIOutput`)**, which selects and checks **ONLY the ground-truth avenues relevant to that specific claim**:
-     - For example, a **London Heathrow Duty Free Decline (£185)** claim checks *Geo & Travel Notice Registry* (`ACTIVE_VERIFIED` for London, UK), *POS Authorization Log* (`CARD_STATUS_LOCKED_RESTRICTED`), and *Travel Override Policy (`POL-GEO-VEL-003`)* — **never** checking or displaying unrelated Chicago $1,000 SMS Y/N consent logs.
-     - Conversely, **Multi-Step SMS Y/N Consent & eSIM Carrier Audit** is invoked *only* when the customer's claim specifically disputes an SMS step-up challenge or the $1,000 Chicago Luxury Electronics transaction.
+```bash
+set -a && . ./.env && set +a
 
-2. **Confidence-Score Card Flagging, Support Chat Verification & Dashboard Admin Oversight (`AdminCardOversightManager`)**:
-   - **Step 1 (System Flag & Block)**: When anomalous velocity or high-risk activity occurs, the system flags the transaction and places Card `*4821` into `RESTRICTED` status.
-   - **Step 2 (Customer Support Chat Verification)**: The customer reaches out in the **Support Chat** to verify themselves. The system evaluates their chat statements, device hardware attestation (`iPhone 16 Pro Secure Enclave`), active travel notice, and telemetry consistency to compute a live **Verification Confidence Score (0%–100%)**.
-   - **Step 3 (Dashboard Admin YES/NO Oversight & Real-Time Chat Notification)**:
-     - The **Dashboard Risk Admin** reviews the customer's chat verification transcript, confidence score badge (`98% PASSED` vs `14% FAILED`), and individual check items in the **👮‍♂️ Admin Card Oversight Panel**.
-     - Clicking **`✅ YES — Enable Card Access`** unlocks Card `*4821` (`ACTIVE`), restores Apple Pay/POS provisioning, logs an audit note to Vertex AI Memory Bank, and immediately posts an approval notification into the Customer Chat.
-     - Clicking **`❌ NO — Keep Restricted`** when verification fails (`14% Confidence — Telemetry Contradiction`) keeps Card `*4821` blocked, records the security denial in Memory Bank, and immediately notifies the customer in chat that their unlock request was denied.
+# Run all diagnostic stages
+PYTHONPATH=. python3 -m backend.memory_eval.runner --json-out /tmp/eval_results.json
 
-3. **Real Vertex AI Vector Embeddings (`text-embedding-005`) for Memory & Knowledge Catalog**:
-   - Both `CustomerMemoryBank.retrieve_relevant_memories()` and `KnowledgeCatalog.query_policies()` generate 768-dimensional dense vectors via Google Cloud's `text-embedding-005` model.
-   - Ranking uses exact mathematical cosine similarity ($\frac{A \cdot B}{\|A\|\|B\|}$), ensuring semantically accurate retrieval across policies and customer history regardless of phrasing.
+# Run individual stages
+PYTHONPATH=. python3 -m backend.memory_eval.runner --only retrieval
+PYTHONPATH=. python3 -m backend.memory_eval.runner --only inclusion
+PYTHONPATH=. python3 -m backend.memory_eval.runner --only topics
+PYTHONPATH=. python3 -m backend.memory_eval.runner --only reconcile
+```
 
-4. **Real Vertex AI Agent Engine Memory Bank Sync (`VertexAiMemoryBankService`)**:
-   - Connected to live Vertex AI Reasoning Engine resource: `projects/959117511771/locations/us-central1/reasoningEngines/915213137995628544`.
-   - Implements the **Dreaming Service (`compact_memories()`)** using Gemini 2.5 Flash structured compaction (`DynamicCompactionSchema`) and exact token accounting via `client.models.count_tokens()` to achieve ~70–85% context window compression while preserving verifiable banking facts.
+### Launching the Web Operator Console
 
-5. **Multi-Cloud & Hybrid Portability (AWS / On-Premise Integration)**:
-   - Demonstrates how external non-Google workloads (e.g., AWS ECS/EKS microservices or on-premise banking cores) securely consume Google Cloud Memory Bank and Knowledge Catalog via **Workload Identity Federation (Keyless STS)** and REST/SDK clients without orchestration vendor lock-in.
+```bash
+set -a && . ./.env && set +a
+PYTHONPATH=. python3 backend/app.py
+```
 
----
-
-## ⚖️ Custom Non-ADK Agents vs. Google Native ADK Agents: Fair Comparison & Trade-Off Matrix
-
-To evaluate how custom enterprise agent frameworks compare against Google Cloud's native Agent Development Kit (ADK) when integrating with **Memory Bank** and **Knowledge Catalog**, the platform includes a live side-by-side execution engine (`backend/custom_agent_comparison.py` & `POST /api/comparison/run`).
-
-Both agents execute concurrently against the exact same customer profile, ground-truth telemetry, `text-embedding-005` Knowledge Catalog, and Vertex AI Memory Bank:
-
-| Architectural Dimension | Google Cloud Native ADK Agent (`google.adk.agents.LlmAgent`) | Custom Framework / State-Machine Agent (LangGraph / Custom DAG) | Fair Trade-Off Verdict |
-| :--- | :--- | :--- | :--- |
-| **1. Memory Bank Integration & Lifecycle** | Native `VertexAiMemoryBankService` + `PreloadMemoryTool`. Automatic pre-turn vector injection and post-session `add_session_to_memory()` background sync to `reasoningEngines`. | Consumes Memory Bank via `StandaloneMemoryBankClient` / REST API (`memories.retrieve` & `memories.create`). Requires manual state dictionary serialization and explicit async write calls. | **ADK wins on developer velocity** (~3x less boilerplate code); **Custom Agent wins** when embedding into existing non-Google state machines. |
-| **2. Knowledge Catalog & Vector Grounding** | Declarative Python function tools automatically bound to Gemini's function-calling schema; seamless multi-turn tool execution. | Direct invocation of `text-embedding-005` cosine similarity search (`KnowledgeCatalog.query_policies`) inside deterministic graph nodes before LLM prompt assembly. | **ADK** provides dynamic LLM-driven tool selection; **Custom Agent** guarantees deterministic pre-LLM retrieval on every turn. |
-| **3. Multi-Cloud & Hybrid Portability (AWS / On-Prem)** | Optimized for GCP Cloud Run and Vertex AI Agent Engine managed runtime; couples orchestration to ADK runtime libraries. | 100% runtime agnostic. Runs natively inside AWS ECS/EKS, Azure, or JPMC On-Premise Kubernetes connecting to GCP Memory Bank via Workload Identity Federation (Keyless STS). | **Custom Agent wins** for strict multi-cloud/AWS-hosted agent mandates requiring zero orchestration lock-in. |
-| **4. Orchestration Control & Determinism** | Autonomous `LlmAgent` / Hierarchical Sub-Agent delegation (`transfer_to_agent`). High flexibility for complex conversational routing. | Explicit Directed Acyclic Graph (DAG) / State Machine transitions. Strict deterministic ordering of compliance checks before synthesis. | **Tie** — ADK excels at dynamic conversational concierges; Custom State Graphs excel at rigid, regulatory-locked workflows. |
-| **5. Enterprise Governance, Safety & Observability** | Native Cloud Trace / OpenTelemetry spans, built-in Vertex AI Model Armor & Cloud DLP hooks, IAM per-agent identity. | Requires custom API Gateway wrappers, manual OpenTelemetry instrumentation, and standalone DLP / Model Armor REST API calls. | **ADK wins** on out-of-the-box Google Cloud security & observability integration. |
-| **6. Code Maintenance & Boilerplate (LOC)** | ~35 Lines of Code for full agent + memory + tool binding. | ~110+ Lines of Code for state graph definition, prompt construction, REST client parsing, and memory write-back. | **ADK reduces maintenance surface area by ~68%**. |
-
----
-
-## 🚀 Live Cloud Run & Agent Platform Deployments
-
-### 🌐 Live Cloud Run Web Application (Custom vs. ADK Comparison & Full A2UI Suite)
-👉 **[https://jpmc-consumer-credit-a2ui-959117511771.us-central1.run.app](https://jpmc-consumer-credit-a2ui-959117511771.us-central1.run.app)**
-*(Reference Baseline Deployment: [https://jpmc-consumer-credit-a2ui-376877710448.us-central1.run.app](https://jpmc-consumer-credit-a2ui-376877710448.us-central1.run.app))*
-
-The live application serves the interactive glassmorphic workspace featuring:
-- **⚖️ Live Custom Agent vs. Google ADK Agent Comparison Tab** (concurrent execution with live latency, token count, and architectural trade-off matrix)
-- **🧠 Real Vertex AI Scale Memory Bank Epistemic Vault** (`projects/959117511771/locations/us-central1/reasoningEngines/915213137995628544`)
-- **📚 Vector-Grounded Knowledge Catalog** (`text-embedding-005` 768-dim cosine similarity search)
-- **🛡️ Dynamic Gemini 2.5 Flash Pre-Write Claim Veracity Gatekeeper** (Zero hardcoded string checks)
-- **🔍 Consolidated Enterprise Audit Sweep & Zero-Question Causal Synthesis**
-
+Open `http://localhost:5060` in your browser to access the Fraud Desk Console.

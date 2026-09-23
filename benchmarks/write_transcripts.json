@@ -1,0 +1,143 @@
+{
+  "fixture_id": "write_policy_v1",
+  "description": "Transcripts for measuring what Memory Bank's generateMemories keeps and what it discards. Each utterance carries an expectation written by a human before the experiment was run, so the service is being scored against a prior commitment rather than against whatever it happened to do.",
+  "expectation_legend": {
+    "durable": "A fact about this customer that should still matter on a future call. A memory bank that drops this is losing something.",
+    "disposable": "True in the moment and worthless later: pleasantries, questions, transient state, things the agent said. A memory bank that keeps this is polluting the context window of every future turn.",
+    "warehouse": "A real fact, but one that belongs in BigQuery and not in a memory bank, because the warehouse is authoritative for it and a second copy can go stale and contradict. Keeping this is the failure the reconciler exists to catch."
+  },
+  "notes": [
+    "The 'warehouse' category is the interesting one. It is not noise, so a naive extractor keeps it, and it is exactly what creates a second contradicting source of truth for money. Whether the service keeps it is a real finding either way.",
+    "Expectations are the fixture author's judgement, not the service's. Where the service disagrees, the report shows the disagreement rather than relabelling the fixture to make the score look better."
+  ],
+  "transcripts": [
+    {
+      "transcript_id": "mixed_signal_call",
+      "summary": "A single fraud-desk call containing durable facts, chatter, and warehouse-owned numbers, deliberately interleaved.",
+      "turns": [
+        {
+          "utterance_id": "u01",
+          "role": "user",
+          "text": "Hi, good morning. Is it raining where you are as well?",
+          "expectation": "disposable",
+          "why": "Pleasantry. Carries nothing about the customer that matters next time."
+        },
+        {
+          "utterance_id": "u02",
+          "role": "model",
+          "text": "Good morning. I can help with that card issue - let me pull up your account.",
+          "expectation": "disposable",
+          "why": "Agent process narration."
+        },
+        {
+          "utterance_id": "u03",
+          "role": "user",
+          "text": "I am going to be in Porto from the 14th of November until the 29th, so please do not freeze the card while I am there.",
+          "expectation": "durable",
+          "why": "Travel window plus an instruction about card behaviour. Directly changes how a future authorisation should be treated."
+        },
+        {
+          "utterance_id": "u04",
+          "role": "user",
+          "text": "Also my statement balance is 4,280 dollars and 50 cents at the moment.",
+          "expectation": "warehouse",
+          "why": "A balance is authoritative in the warehouse and changes daily. Storing it creates a second source of truth that is wrong within hours."
+        },
+        {
+          "utterance_id": "u05",
+          "role": "user",
+          "text": "Please stop sending me email alerts. Text me instead, on the mobile number ending 0198.",
+          "expectation": "durable",
+          "why": "Explicit standing instruction about contact channel."
+        },
+        {
+          "utterance_id": "u06",
+          "role": "user",
+          "text": "What time do you close today?",
+          "expectation": "disposable",
+          "why": "A question, not a fact. Nothing about the customer."
+        },
+        {
+          "utterance_id": "u07",
+          "role": "user",
+          "text": "One more thing - I lost my watch last week, the one I had the card loaded onto. Can you kill that token?",
+          "expectation": "durable",
+          "why": "A wallet token on a lost device is a live spending risk and must survive the call."
+        },
+        {
+          "utterance_id": "u08",
+          "role": "model",
+          "text": "Done. I have also noted that I will call you back before Friday with the outcome of the dispute.",
+          "expectation": "durable",
+          "why": "A commitment the bank made. The next agent must not contradict it."
+        },
+        {
+          "utterance_id": "u09",
+          "role": "user",
+          "text": "Great, thanks very much. Bye.",
+          "expectation": "disposable",
+          "why": "Closing pleasantry."
+        }
+      ]
+    },
+    {
+      "transcript_id": "consolidation_first",
+      "summary": "First half of a two-part consolidation test. Establishes a fact.",
+      "turns": [
+        {
+          "utterance_id": "c01",
+          "role": "user",
+          "text": "I am travelling to Porto next month and I will be there for about two weeks.",
+          "expectation": "durable",
+          "why": "Vague but durable travel fact. The second transcript sharpens it."
+        }
+      ]
+    },
+    {
+      "transcript_id": "consolidation_second",
+      "summary": "Second half. Sharpens the same fact, and should consolidate rather than duplicate.",
+      "turns": [
+        {
+          "utterance_id": "c02",
+          "role": "user",
+          "text": "About my Porto trip - the exact dates are the 14th to the 29th of November, and I am flying back on the 29th.",
+          "expectation": "durable",
+          "why": "Same underlying fact, more precise. A bank that stores this as a second memory now holds two answers to one question. An UPDATE here is the correct behaviour and is what distinguishes a memory bank from an append-only log."
+        }
+      ]
+    },
+    {
+      "transcript_id": "contradiction",
+      "summary": "Contradicts a fact established in consolidation_second. Tests whether the service revises or accumulates.",
+      "turns": [
+        {
+          "utterance_id": "x01",
+          "role": "user",
+          "text": "I need to correct something from earlier - the Porto trip is cancelled. I am not travelling at all this year.",
+          "expectation": "durable",
+          "why": "A correction. The right outcome is that the earlier travel memory stops being retrievable as current fact, whether by update or deletion. If both survive, retrieval will later return two contradictory answers with no way to tell which is live."
+        }
+      ]
+    },
+    {
+      "transcript_id": "personal_info_only",
+      "summary": "Contains only facts that the four default managed topics cover and the desk's seven custom topics do not. Isolates topic configuration as the variable.",
+      "turns": [
+        {
+          "utterance_id": "p01",
+          "role": "user",
+          "text": "By the way, my first name is Dana, I have two daughters, and my wedding anniversary is the 3rd of June.",
+          "expectation": "durable",
+          "why": "Textbook USER_PERSONAL_INFO. Durable by any reasonable standard - but only extractable if a topic covers it. Under the desk's seven fraud-domain topics there is no home for it, and it should be dropped. That drop is a feature, not a bug: a fraud desk has no business retaining a customer's anniversary."
+        },
+        {
+          "utterance_id": "p02",
+          "role": "user",
+          "text": "I always fly out of Newark rather than JFK if I can help it.",
+          "expectation": "durable",
+          "why": "Textbook USER_PREFERENCES. Same argument as above."
+        }
+      ]
+    }
+  ]
+}

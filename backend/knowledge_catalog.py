@@ -1,391 +1,587 @@
 """
-Gemini Enterprise Agent Platform - Knowledge Catalog & Enterprise Semantic Graph.
-Stores enduring structural facts, institutional credit/fraud policies, customer behavioral profiles,
-entity relationship graphs, and hybrid AWS / On-Prem connectivity metadata.
-Powered by real Vertex AI Embeddings (text-embedding-005) for semantic vector search.
+Dataplex Universal Catalog -- the real Knowledge Catalog.
+
+On `main`, `KnowledgeCatalog` was a class holding four `PolicyRule` literals and
+two customer profiles, with `text-embedding-005` cosine similarity computed over
+them in Python. It described itself as an "Enterprise Knowledge Catalog". It was
+a dictionary with an embedding model bolted on, and the embedding was only used
+to rank four items.
+
+This module reads the catalog that actually exists in the project: business
+glossary terms, BigQuery entries, and the governance aspects attached to them.
+
+THE IDEA
+    Governance is configuration, not code. There is no list of forbidden tables
+    in this file and no list of restricted columns. Every verdict is derived at
+    call time from aspects stored in Dataplex. Change `lifecycle-status` to
+    DEPRECATED in the console and the desk refuses that table on the next
+    request, with no code change and no deploy.
+
+    That is the thing worth demonstrating: not "the agent refused", but
+    "governance changed and the agent changed with it".
+
+THE ASPECT CONTRACT
+    The aspects deliberately separate the human label from the machine
+    instruction:
+
+        level:          RESTRICTED        <- what a person reads
+        agent_behavior: REFUSE            <- what the agent executes
+
+    This module acts only on `agent_behavior`. A label on its own stops nothing,
+    and conflating the two is how a catalog ends up full of scary words that no
+    system reads.
+
+WHAT THIS IS NOT
+    It is not an enforcement point. Dataplex is not in the query path and cannot
+    block a query. It supplies the facts an agent needs in order to stop itself,
+    and this module records whether it did. Hard enforcement is IAM, column-level
+    security, and the tool surface. Any UI built on this must say "the agent
+    declined", never "Dataplex blocked" -- see `CATALOG_ADVISORY_NOTE`.
+
+REST surface used (no SDK, so the calls are legible in a trace):
+    GET  /v1/{location}:lookupEntry?entry=...&view=ALL
+    POST /v1/{location}:searchEntries
+    GET  /v1/{glossary}/terms
+    GET  /v1/{glossary}/terms/{term}
+
+Reference: https://cloud.google.com/dataplex/docs/reference/rest
 """
 
-import math
-import os
+from __future__ import annotations
+
 import logging
-from typing import Dict, Any, List, Optional
-import certifi
-from dotenv import load_dotenv
-from google import genai
-from backend.models import PolicyRule, EntityNode, EntityEdge
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
-load_dotenv()
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+import google.auth
+import google.auth.transport.requests
+import requests
+
+from backend.config import Settings, settings as load_settings
+from backend.provenance import NOT_RECORDED
+
+log = logging.getLogger(__name__)
+
+SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+
+CATALOG_ADVISORY_NOTE = (
+    "Dataplex advises; it does not enforce. These verdicts are read from catalog "
+    "aspects and honoured voluntarily by the agent. Nothing in the query path was "
+    "blocked. Any interface presenting this must say the agent declined, never "
+    "that the catalog prevented the read."
+)
+
+ASPECT_LIFECYCLE = "lifecycle-status"
+ASPECT_SENSITIVITY = "sensitivity-class"
+ASPECT_DOMAIN = "data-domain"
+ASPECT_CRITICALITY = "criticality"
+ASPECT_RETENTION = "retention-policy"
 
 
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot_product / (norm_a * norm_b)
+class CatalogError(RuntimeError):
+    """A Dataplex call failed. Status and body preserved verbatim.
 
-
-class AWSOnPremHybridConnector:
+    The body matters. When `ListEntryLinks` is unavailable, Dataplex says
+    `Method not visible to labels: {PUBLIC}` -- which is actionable. Collapsing
+    that into "503 Service Unavailable" throws away the only useful part.
     """
-    Models cross-cloud and hybrid data federation from AWS and On-Premise data sources
-    into Vertex AI Memory Bank and Knowledge Catalog without requiring full Agent Builder lock-in.
-    """
 
-    @staticmethod
-    def get_connector_topology() -> Dict[str, Any]:
+    def __init__(self, message: str, *, status: Optional[int] = None, body: str = "", url: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+        self.url = url
+
+    def to_dict(self) -> dict:
         return {
-            "architecture_mode": "DECOUPLED_HYBRID_FEDERATION",
-            "auth_mechanism": "Google Cloud Workload Identity Federation (Keyless AWS IAM <-> GCP STS)",
-            "network_transport": "Cross-Cloud Interconnect + Private Service Connect (PSC)",
-            "data_sources": [
-                {
-                    "source_id": "aws-rds-card-ledger",
-                    "environment": "AWS (us-east-1)",
-                    "service": "Amazon Aurora PostgreSQL (Core Card Authorization Ledger)",
-                    "sync_mode": "CDC Streaming via Kafka / PubSub Bridge",
-                    "p50_latency_ms": 11.4,
-                    "p99_latency_ms": 24.8,
-                    "encryption": "CMEK + TLS 1.3 mTLS",
-                    "status": "ONLINE_SYNCED",
-                },
-                {
-                    "source_id": "aws-s3-interaction-lake",
-                    "environment": "AWS (us-east-1)",
-                    "service": "Amazon S3 (Multi-Year Customer Interaction & Transcript Archive)",
-                    "sync_mode": "BigQuery Omni Zero-Copy + Asynchronous Memory Compaction",
-                    "p50_latency_ms": 18.2,
-                    "p99_latency_ms": 42.0,
-                    "encryption": "AWS KMS <-> GCP Cloud KMS Federation",
-                    "status": "ONLINE_SYNCED",
-                },
-                {
-                    "source_id": "onprem-ibm-zseries",
-                    "environment": "JPMC On-Premise Core Mainframe (New York Metro)",
-                    "service": "IBM zSeries CICS / DB2 (Account Statements & Settlement Balances)",
-                    "sync_mode": "Dedicated Interconnect Direct Peering (REST/gRPC Gateway)",
-                    "p50_latency_ms": 8.7,
-                    "p99_latency_ms": 16.5,
-                    "encryption": "IPsec + Quantum-Safe TLS",
-                    "status": "ONLINE_SYNCED",
-                },
-            ],
-            "performance_penalty_analysis": {
-                "synchronous_cross_cloud_penalty_ms": 11.4,
-                "preload_memory_cache_hit_latency_ms": 2.1,
-                "mitigation_strategy": (
-                    "Asynchronous event ingestion (generate_memories()) decouples AWS/On-Prem write latency "
-                    "from user turn latency. PreloadMemoryTool caches hot semantic vectors at session start."
-                ),
-            },
+            "error": str(self),
+            "http_status": self.status,
+            "response_body": self.body[:2000],
+            "url": self.url,
         }
 
 
-class KnowledgeCatalog:
+def field_at(obj: Optional[dict], *path: str, default: Any = NOT_RECORDED) -> Any:
+    """Read a nested field, or return `n/r`.
+
+    The only place in this module where a missing value becomes printable, and
+    it never invents one.
     """
-    Enterprise Knowledge Catalog storing enduring structural ground truths, regulatory policies,
-    customer behavioral baselines, and semantic entity graphs.
-    Uses Vertex AI text-embedding-005 vector similarity for policy discovery.
-    Can be queried standalone via REST/SDK by any agent framework (ADK, LangGraph, CrewAI, Custom).
-    """
+    node: Any = obj
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return default
+        node = node[key]
+    if node is None or node == "" or node == []:
+        return default
+    return node
 
-    _embedding_cache: Dict[str, List[float]] = {}
-    _client: Optional[genai.Client] = None
 
-    _policies: Dict[str, PolicyRule] = {
-        "POL-REG-E-001": PolicyRule(
-            policy_id="POL-REG-E-001",
-            title="Regulation E & JPMC Zero Liability Protection Policy",
-            category="FRAUD_AND_DISPUTES",
-            regulatory_framework="12 CFR Part 1005 (Regulation E) / JPMC Consumer Card Agreement",
-            description=(
-                "Protects consumers from financial liability for unauthorized electronic fund transfers and credit card "
-                "charges reported promptly. However, transactions where authenticated step-up consent (e.g., SMS OTP or "
-                "biometric Y/N confirmation) was explicitly provided by the primary accountholder device require "
-                "a First-Party Consent Audit before provisional credit is issued."
-            ),
-            decision_criteria=[
-                "Verify whether card was physically present (EMV Chip/Contactless) or Card-Not-Present.",
-                "Audit whether Step-Up Two-Factor Verification (SMS Y/N or Biometric Push) was triggered and approved.",
-                "Cross-reference customer device GPS/IP location against merchant terminal location at transaction timestamp.",
-            ],
-            automated_action="Run 5-Avenue Ground-Truth Claim Veracity Audit before auto-disputing or issuing provisional credit.",
-        ),
-        "POL-STEP-UP-2FA-002": PolicyRule(
-            policy_id="POL-STEP-UP-2FA-002",
-            title="Multi-Step Out-of-Pattern Transaction Verification Protocol (Decline -> Y/N Consent -> Retry)",
-            category="STEP_UP_AUTHENTICATION",
-            regulatory_framework="FFIEC Authentication in an Internet Banking Environment / JPMC RiskOps Standard",
-            description=(
-                "When a card transaction exhibits high behavioral deviation or out-of-region spend without an active "
-                "Travel Notice, the authorization engine automatically DECLINES the first attempt and dispatches an "
-                "instant SMS/Push Step-Up challenge asking the customer to reply 'Y' (Yes, I authorized this) or 'N' (No, block card). "
-                "If 'Y' is received from the customer's verified mobile phone number within 15 minutes, a temporary "
-                "single-merchant override window opens allowing the customer to retry and complete the purchase."
-            ),
-            decision_criteria=[
-                "Initial high-risk transaction must be declined with code STEP_UP_REQUIRED.",
-                "SMS/Push prompt dispatched to registered phone number on file.",
-                "If customer replies 'Y', subsequent retry for the identical merchant and amount within 15 minutes is APPROVED.",
-                "If customer later claims fraud on a 'Y'-consented retry, flag as PARTIALLY_VERIFIED_CONSENT_DISPUTE and audit SIM-swap / device telemetry.",
-            ],
-            automated_action="Correlate initial decline, SMS 'Y/N' timestamp, carrier/device telemetry, and retry approval.",
-        ),
-        "POL-GEO-VEL-003": PolicyRule(
-            policy_id="POL-GEO-VEL-003",
-            title="Geo-Velocity Containment & Travel Notice Exception Policy",
-            category="VELOCITY_RISK_MANAGEMENT",
-            regulatory_framework="JPMC Enterprise Fraud Velocity Ruleset v4.2",
-            description=(
-                "Concurrent authentication or transaction events across geographically distant metropolitan areas "
-                "(distance > 300 miles within < 60 minutes) trigger an automated SECURITY_LOCKED containment state "
-                "unless a verified Travel Notice or Mobile App Location Permission match exists in the Memory Bank."
-            ),
-            decision_criteria=[
-                "Calculate spatial distance and time delta between consecutive IP logins or POS swipes.",
-                "Check Memory Bank and Knowledge Catalog for active Travel Notices covering the destination region.",
-                "If unverified dual-location activity occurs (e.g., NY and Chicago within 9 minutes), lock card immediately.",
-            ],
-            automated_action="Place SECURITY_LOCKED on card instrument and require biometric 1-click identity re-verification.",
-        ),
-        "POL-VCN-ISSUANCE-004": PolicyRule(
-            policy_id="POL-VCN-ISSUANCE-004",
-            title="Instant Virtual Card Number (VCN) Provisioning & Emergency Travel Replacement",
-            category="CARD_CONTINUITY",
-            regulatory_framework="Visa/Mastercard Token Service (VTS) Digital Issuance Standard",
-            description=(
-                "When a traveling customer's physical card is compromised or locked due to fraud, the Issuance Sub-Agent "
-                "can provision an instant Digital Virtual Card Number (VCN) directly into Apple Pay / Google Pay after "
-                "biometric verification, while Logistics dispatches next-day physical plastic to their verified hotel address."
-            ),
-            decision_criteria=[
-                "Confirm customer identity via Mobile App Biometrics (FaceID/TouchID) or verified session.",
-                "Verify active travel itinerary or overseas location.",
-            ],
-            automated_action="Issue instant VCN token to digital wallet and schedule DHL/FedEx emergency courier delivery.",
-        ),
-    }
+# --------------------------------------------------------------------------
+# Value types
+# --------------------------------------------------------------------------
 
-    _customer_risk_profiles: Dict[str, Dict[str, Any]] = {
-        "cust_jpmc_88329": {
-            "customer_id": "cust_jpmc_88329",
-            "full_name": "Alex Morgan",
-            "primary_residence": "New York, NY (Manhattan)",
-            "tenure_years": 6.5,
-            "credit_tier": "PRIME_PLUS (FICO 795)",
-            "historical_spending_baseline": {
-                "average_transaction_usd": 95.00,
-                "p95_transaction_usd": 420.00,
-                "max_single_tx_last_12m_usd": 1450.00,
-                "typical_merchant_categories": [
-                    "Airlines & Travel",
-                    "Fine Dining & Restaurants",
-                    "Department Stores (Target, Whole Foods)",
-                    "Digital Subscriptions",
-                ],
-                "atypical_high_risk_categories": [
-                    "Standalone High-Ticket Electronics > $800 in Unregistered Out-of-State Cities",
-                    "Cryptocurrency Exchanges",
-                    "Wire Transfers",
-                ],
-            },
-            "registered_devices": [
-                {
-                    "device_id": "dev-ios-991",
-                    "model": "iPhone 16 Pro",
-                    "os": "iOS 14.8.2",
-                    "biometric_status": "FACE_ID_ENROLLED",
-                    "phone_number": "+1-212-555-0198",
-                    "trusted": True,
-                },
-                {
-                    "device_id": "dev-mac-442",
-                    "model": "MacBookPro M3",
-                    "os": "macOS Sequoia",
-                    "browser": "Safari",
-                    "trusted": True,
-                },
-            ],
-            "prior_fraud_claims_last_3y": 0,
-            "behavioral_trust_score": 0.94,
-        },
-        "cust_jpmc_77412": {
-            "customer_id": "cust_jpmc_77412",
-            "full_name": "Jordan Taylor",
-            "primary_residence": "Dallas, TX",
-            "tenure_years": 3.2,
-            "credit_tier": "PRIME (FICO 740)",
-            "historical_spending_baseline": {
-                "average_transaction_usd": 110.00,
-                "p95_transaction_usd": 600.00,
-                "typical_merchant_categories": ["Domestic Airlines", "Gas & Automotive", "Groceries"],
-            },
-            "prior_fraud_claims_last_3y": 1,
-            "behavioral_trust_score": 0.88,
-        },
-    }
+
+@dataclass(frozen=True)
+class GovernanceDecision:
+    """What the catalog says about one table or column, and why."""
+
+    resource: str
+    kind: str  # "TABLE" or "COLUMN"
+    allowed: bool
+    action: str  # ALLOW / ALLOW_TO_OWNER_ONLY / REFUSE / UNKNOWN
+    basis: str  # the aspect and value the verdict rests on
+    rationale: str = NOT_RECORDED
+    lifecycle_status: str = NOT_RECORDED
+    sensitivity_level: str = NOT_RECORDED
+    agent_guidance: str = NOT_RECORDED
+    latency_ms: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "resource": self.resource,
+            "kind": self.kind,
+            "allowed": self.allowed,
+            "action": self.action,
+            "basis": self.basis,
+            "rationale": self.rationale,
+            "lifecycle_status": self.lifecycle_status,
+            "sensitivity_level": self.sensitivity_level,
+            "agent_guidance": self.agent_guidance,
+            "latency_ms": self.latency_ms,
+            "advisory_note": CATALOG_ADVISORY_NOTE,
+        }
+
+
+@dataclass(frozen=True)
+class GlossaryTerm:
+    """One business term, as the glossary defines it."""
+
+    term_id: str
+    display_name: str
+    description: str
+    category: str = NOT_RECORDED
 
     @classmethod
-    def _get_genai_client(cls) -> genai.Client:
-        if cls._client is None:
-            os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-            cls._client = genai.Client(
-                vertexai=True,
-                project=project_id,
-                location=location,
-            )
-        return cls._client
+    def from_api(cls, payload: dict) -> "GlossaryTerm":
+        name = payload.get("name", "")
+        parent = payload.get("parent", "")
+        return cls(
+            term_id=name.rsplit("/", 1)[-1] if name else NOT_RECORDED,
+            display_name=payload.get("displayName", NOT_RECORDED),
+            description=payload.get("description", NOT_RECORDED),
+            category=parent.rsplit("/", 1)[-1] if "/categories/" in parent else NOT_RECORDED,
+        )
 
-    @classmethod
-    def _get_embedding(cls, text: str) -> Optional[List[float]]:
-        if text in cls._embedding_cache:
-            return cls._embedding_cache[text]
+    def to_dict(self) -> dict:
+        return {
+            "term_id": self.term_id,
+            "display_name": self.display_name,
+            "description": self.description,
+            "category": self.category,
+        }
+
+
+@dataclass
+class Facet:
+    """One independently-failing part of a catalog overview.
+
+    Facets exist because the previous implementation put five unrelated reads in
+    one `try`. Dataplex does not expose `ListEntryLinks` publicly, so that single
+    unavailable method made the glossary, the governance verdicts and everything
+    else return 503 -- reported to the UI as an empty catalog. An empty list and
+    an unanswerable question are very different statements.
+    """
+
+    name: str
+    ok: bool
+    value: Any = None
+    error: Optional[dict] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "facet": self.name,
+            "status": "OK" if self.ok else "UNAVAILABLE",
+            "value": self.value if self.ok else NOT_RECORDED,
+            "error": self.error,
+        }
+
+
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
+
+
+class CatalogGovernor:
+    """Reads Dataplex and turns aspects into agent-actionable verdicts."""
+
+    def __init__(
+        self,
+        cfg: Optional[Settings] = None,
+        credentials: Any = None,
+        session: Optional[requests.Session] = None,
+        timeout_s: float = 30.0,
+    ) -> None:
+        self.cfg = cfg or load_settings()
+        self.timeout_s = timeout_s
+        self._session = session or requests.Session()
+        self._credentials = credentials
+        self._sibling_cache: dict[str, list[str]] = {}
+        self.calls: list[str] = []
+
+    # -- plumbing ----------------------------------------------------------
+
+    @property
+    def location_path(self) -> str:
+        return f"projects/{self.cfg.project_id}/locations/{self.cfg.location}"
+
+    def _base(self) -> str:
+        return f"{self.cfg.dataplex_endpoint}/v1"
+
+    def bigquery_entry_name(self, table: str) -> str:
+        return (
+            f"{self.location_path}/entryGroups/@bigquery/entries/"
+            f"bigquery.googleapis.com/projects/{self.cfg.project_id}"
+            f"/datasets/{self.cfg.bigquery_dataset}/tables/{table}"
+        )
+
+    def _token(self) -> str:
+        if self._credentials is None:
+            self._credentials, _ = google.auth.default(scopes=list(SCOPES))
+        if not self._credentials.valid:
+            self._credentials.refresh(google.auth.transport.requests.Request())
+        return self._credentials.token
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ) -> dict:
+        url = path if path.startswith("http") else f"{self._base()}/{path.lstrip('/')}"
+        self.calls.append(f"{method} {url.split('/v1/')[-1][:110]}")
+        headers = {
+            "Authorization": f"Bearer {self._token()}",
+            "Content-Type": "application/json",
+        }
         try:
-            client = cls._get_genai_client()
-            res = client.models.embed_content(
-                model="text-embedding-005",
-                contents=text,
+            resp = self._session.request(
+                method, url, headers=headers, json=body, params=params, timeout=self.timeout_s
             )
-            if res.embeddings and res.embeddings[0].values:
-                vec = list(res.embeddings[0].values)
-                cls._embedding_cache[text] = vec
-                return vec
-        except Exception as e:
-            logging.debug("Vertex AI embedding lookup fallback triggered: %s", e)
-        return None
+        except requests.RequestException as exc:
+            raise CatalogError(f"{method} {url} failed: {exc}", url=url) from exc
 
-    @classmethod
-    def get_all_policies(cls) -> List[PolicyRule]:
-        return list(cls._policies.values())
+        if resp.status_code >= 400:
+            raise CatalogError(
+                f"{method} {url} returned HTTP {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text,
+                url=url,
+            )
+        return resp.json() if resp.content else {}
 
-    @classmethod
-    def get_policy(cls, policy_id: str) -> Optional[PolicyRule]:
-        return cls._policies.get(policy_id)
+    def _aspect(self, entry: dict, suffix: str) -> dict:
+        """Find an aspect by its type suffix.
 
-    @classmethod
-    def query_policies(cls, query: str, top_k: int = 3) -> List[PolicyRule]:
+        Aspect keys are `{project_number}.{location}.{type}`, so matching on the
+        suffix rather than reconstructing the whole key means this keeps working
+        when the project number is not configured.
         """
-        Semantic Vector Search across Knowledge Catalog policies using Vertex AI text-embedding-005.
-        Computes cosine similarity between query embedding vector and policy document vectors.
+        for key, value in (entry.get("aspects") or {}).items():
+            if key.endswith(f".{suffix}"):
+                return value.get("data", {}) or {}
+        return {}
+
+    def _column_aspect(self, entry: dict, column: str, suffix: str) -> dict:
+        """Find a column-scoped aspect, keyed `...{suffix}@Schema.{column}`."""
+        needle = f".{suffix}@Schema.{column}"
+        for key, value in (entry.get("aspects") or {}).items():
+            if key.endswith(needle):
+                return value.get("data", {}) or {}
+        return {}
+
+    # -- entries -----------------------------------------------------------
+
+    def lookup_table(self, table: str) -> dict:
+        """Fetch a BigQuery table entry with all aspects."""
+        return self._request(
+            "GET",
+            f"{self.location_path}:lookupEntry",
+            params={"entry": self.bigquery_entry_name(table), "view": "ALL"},
+        )
+
+    def check_table(self, table: str) -> GovernanceDecision:
+        """Ask the catalog whether this table may be read, and why.
+
+        Two aspects can each refuse, and they refuse for different reasons:
+        `lifecycle-status` (the table is deprecated) and `sensitivity-class`
+        (the contents are restricted). Lifecycle is checked first because a
+        deprecated table should not be read even if its contents are innocuous.
         """
-        query_vec = cls._get_embedding(query)
-        if query_vec is not None:
-            scored_policies: List[tuple[float, PolicyRule]] = []
-            for pol in cls._policies.values():
-                doc_text = (
-                    f"{pol.policy_id} {pol.title} {pol.category} {pol.regulatory_framework} "
-                    f"{pol.description} {' '.join(pol.decision_criteria)} {pol.automated_action}"
+        started = time.perf_counter()
+        try:
+            entry = self.lookup_table(table)
+        except CatalogError as exc:
+            return GovernanceDecision(
+                resource=table,
+                kind="TABLE",
+                allowed=False,
+                action="UNKNOWN",
+                basis=f"catalog unreachable: HTTP {exc.status}",
+                rationale=exc.body[:400],
+                latency_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+
+        lifecycle = self._aspect(entry, ASPECT_LIFECYCLE)
+        sensitivity = self._aspect(entry, ASPECT_SENSITIVITY)
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+
+        status = lifecycle.get("status", NOT_RECORDED)
+        guidance = lifecycle.get("agent_guidance", NOT_RECORDED)
+        level = sensitivity.get("level", NOT_RECORDED)
+        behavior = sensitivity.get("agent_behavior", "ALLOW")
+
+        if status in ("DEPRECATED", "RETIRED", "QUARANTINED"):
+            return GovernanceDecision(
+                resource=table,
+                kind="TABLE",
+                allowed=False,
+                action="REFUSE",
+                basis=f"{ASPECT_LIFECYCLE}.status = {status}",
+                rationale=guidance,
+                lifecycle_status=status,
+                sensitivity_level=level,
+                agent_guidance=guidance,
+                latency_ms=elapsed,
+            )
+
+        if behavior == "REFUSE":
+            return GovernanceDecision(
+                resource=table,
+                kind="TABLE",
+                allowed=False,
+                action="REFUSE",
+                basis=f"{ASPECT_SENSITIVITY}.agent_behavior = REFUSE",
+                rationale=sensitivity.get("rationale", NOT_RECORDED),
+                lifecycle_status=status,
+                sensitivity_level=level,
+                agent_guidance=guidance,
+                latency_ms=elapsed,
+            )
+
+        return GovernanceDecision(
+            resource=table,
+            kind="TABLE",
+            allowed=True,
+            action=behavior if behavior != "ALLOW" else "ALLOW",
+            basis=f"{ASPECT_LIFECYCLE}.status = {status}; {ASPECT_SENSITIVITY}.agent_behavior = {behavior}",
+            rationale=sensitivity.get("rationale", NOT_RECORDED),
+            lifecycle_status=status,
+            sensitivity_level=level,
+            agent_guidance=guidance,
+            latency_ms=elapsed,
+        )
+
+    def check_column(self, table: str, column: str) -> GovernanceDecision:
+        """Ask the catalog whether one column may be selected.
+
+        Columns carry their own `sensitivity-class` aspect, which overrides the
+        table's. That is the whole reason column-level aspects exist: a table can
+        be readable while one field in it is not.
+        """
+        started = time.perf_counter()
+        resource = f"{table}.{column}"
+        try:
+            entry = self.lookup_table(table)
+        except CatalogError as exc:
+            return GovernanceDecision(
+                resource=resource,
+                kind="COLUMN",
+                allowed=False,
+                action="UNKNOWN",
+                basis=f"catalog unreachable: HTTP {exc.status}",
+                rationale=exc.body[:400],
+                latency_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+
+        column_aspect = self._column_aspect(entry, column, ASPECT_SENSITIVITY)
+        source = "column"
+        if not column_aspect:
+            column_aspect = self._aspect(entry, ASPECT_SENSITIVITY)
+            source = "table (no column-level aspect)"
+
+        behavior = column_aspect.get("agent_behavior", "ALLOW")
+        level = column_aspect.get("level", NOT_RECORDED)
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+
+        return GovernanceDecision(
+            resource=resource,
+            kind="COLUMN",
+            allowed=behavior != "REFUSE",
+            action=behavior,
+            basis=f"{ASPECT_SENSITIVITY}.agent_behavior = {behavior} (from {source})",
+            rationale=column_aspect.get("rationale", NOT_RECORDED),
+            sensitivity_level=level,
+            latency_ms=elapsed,
+        )
+
+    def discover_sibling_tables(self, term: str, refresh: bool = False) -> list[str]:
+        """Search the catalog for tables matching a term.
+
+        This is what makes a governance demo honest. The agent is not handed a
+        list of tables including the deprecated one; it *searches*, gets back
+        whatever exists, and then judges each result on its aspects. The trap is
+        discovered, not named.
+
+        `searchEntries` returns more than tables -- a search for "authorizations"
+        also matches glossary terms whose descriptions contain the word -- so
+        results are filtered to BigQuery tables and views.
+        """
+        if term in self._sibling_cache and not refresh:
+            return self._sibling_cache[term]
+
+        payload = self._request(
+            "POST",
+            f"{self.location_path}:searchEntries",
+            body={"query": term, "pageSize": 25},
+        )
+        tables: list[str] = []
+        for result in payload.get("results", []):
+            # Each hit nests the entry under `dataplexEntry`; `entryType` is not
+            # at the top level. Reading it from the wrong level matches nothing
+            # and yields an empty list, which reads as "there are no siblings"
+            # rather than "the parser is wrong" -- so this is asserted by a test.
+            entry = result.get("dataplexEntry", result)
+            entry_type = entry.get("entryType", "")
+            if not entry_type.endswith(("bigquery-table", "bigquery-view")):
+                continue
+            name = entry.get("name", "") or result.get("linkedResource", "")
+            if "/tables/" not in name:
+                continue
+            table = name.rsplit("/tables/", 1)[-1]
+            if f"/datasets/{self.cfg.bigquery_dataset}/" in name and table not in tables:
+                tables.append(table)
+        self._sibling_cache[term] = tables
+        return tables
+
+    # -- glossary ----------------------------------------------------------
+
+    def list_terms(self, page_size: int = 100) -> list[GlossaryTerm]:
+        """Every business term in the glossary, paged to exhaustion."""
+        terms: list[GlossaryTerm] = []
+        params: dict[str, Any] = {"pageSize": page_size}
+        token: Optional[str] = None
+        while True:
+            if token:
+                params["pageToken"] = token
+            payload = self._request("GET", f"{self.cfg.glossary_resource}/terms", params=params)
+            terms.extend(GlossaryTerm.from_api(t) for t in payload.get("terms", []))
+            token = payload.get("nextPageToken")
+            if not token:
+                return terms
+
+    def get_term(self, term_id: str) -> GlossaryTerm:
+        """One term by id.
+
+        This is where governed answers come from. When the desk is asked why a
+        credit card dispute has no provisional credit date, the answer is in the
+        `provisional-credit` term text -- retrieved from agreed vocabulary, not
+        reasoned out by a model and not written into a prompt.
+        """
+        payload = self._request("GET", f"{self.cfg.glossary_resource}/terms/{term_id}")
+        return GlossaryTerm.from_api(payload)
+
+    def search_terms(self, query: str, top_k: int = 5) -> list[GlossaryTerm]:
+        """Rank glossary terms against a query.
+
+        Deliberately a plain token-overlap score over live term text rather than
+        an embedding call. The previous implementation used `text-embedding-005`
+        to rank **four hardcoded policies**, which spent a network round trip to
+        sort a list that could not be wrong. Here the corpus is real and the
+        ranking is transparent; if this needs to be semantic later, it should be
+        a catalog-side search, not a local cosine over everything we downloaded.
+        """
+        terms = self.list_terms()
+        tokens = {t for t in query.lower().split() if len(t) > 2}
+        if not tokens:
+            return terms[:top_k]
+
+        scored: list[tuple[float, GlossaryTerm]] = []
+        for term in terms:
+            haystack = f"{term.display_name} {term.description} {term.term_id}".lower()
+            hits = sum(1 for t in tokens if t in haystack)
+            if hits:
+                scored.append((hits / len(tokens), term))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [term for _, term in scored[:top_k]]
+
+    # -- composite ---------------------------------------------------------
+
+    def overview(self, tables: Optional[list[str]] = None) -> dict:
+        """A catalog summary whose parts fail independently.
+
+        Each facet is attempted separately. One unavailable method degrades the
+        response to PARTIAL and names itself; it does not take the working
+        facets down with it.
+        """
+        facets: list[Facet] = []
+
+        try:
+            terms = self.list_terms()
+            facets.append(
+                Facet(
+                    "glossary",
+                    True,
+                    {
+                        "glossary": self.cfg.dataplex_glossary_id,
+                        "term_count": len(terms),
+                        "categories": sorted({t.category for t in terms if t.category != NOT_RECORDED}),
+                        "sample": [t.to_dict() for t in terms[:8]],
+                    },
                 )
-                pol_vec = cls._get_embedding(doc_text)
-                if pol_vec is not None:
-                    sim = _cosine_similarity(query_vec, pol_vec)
-                    scored_policies.append((sim, pol))
-            if scored_policies:
-                scored_policies.sort(key=lambda item: item[0], reverse=True)
-                return [item[1] for item in scored_policies[:top_k]]
+            )
+        except CatalogError as exc:
+            facets.append(Facet("glossary", False, error=exc.to_dict()))
 
-        query_lower = query.lower()
-        matched: List[PolicyRule] = []
-        for pol in cls._policies.values():
-            searchable = f"{pol.title} {pol.category} {pol.description} {' '.join(pol.decision_criteria)}".lower()
-            if any(term in searchable for term in query_lower.split() if len(term) > 2):
-                matched.append(pol)
-        return matched[:top_k] if matched else list(cls._policies.values())[:top_k]
+        probe_tables = tables or ["disputes", "customers", "cards", "authorizations"]
+        try:
+            decisions = [self.check_table(t).to_dict() for t in probe_tables]
+            facets.append(Facet("table_governance", True, decisions))
+        except CatalogError as exc:
+            facets.append(Facet("table_governance", False, error=exc.to_dict()))
 
-    @classmethod
-    def get_customer_risk_profile(cls, customer_id: str) -> Dict[str, Any]:
-        return cls._customer_risk_profiles.get(customer_id, {
-            "customer_id": customer_id,
-            "primary_residence": "Unknown",
-            "historical_spending_baseline": {
-                "average_transaction_usd": 100.00,
-                "typical_merchant_categories": ["General Retail"],
-            },
-            "behavioral_trust_score": 0.80,
-        })
+        try:
+            discovered = self.discover_sibling_tables("authorizations")
+            verdicts = [self.check_table(t).to_dict() for t in discovered]
+            facets.append(
+                Facet(
+                    "discovery",
+                    True,
+                    {
+                        "search_term": "authorizations",
+                        "discovered": discovered,
+                        "refused": [v["resource"] for v in verdicts if not v["allowed"]],
+                        "verdicts": verdicts,
+                    },
+                )
+            )
+        except CatalogError as exc:
+            facets.append(Facet("discovery", False, error=exc.to_dict()))
 
-    @classmethod
-    def get_entity_subgraph(cls, customer_id: str = "cust_jpmc_88329") -> Dict[str, Any]:
-        """
-        Constructs the enterprise semantic knowledge graph mapping relationships between
-        Customer, Accounts, Card Instruments, Digital Wallet Tokens, Travel Notices, Transactions, and Policies.
-        """
-        nodes = [
-            EntityNode(
-                node_id=customer_id,
-                entity_type="CUSTOMER",
-                label="Alex Morgan",
-                attributes={"tier": "Chase Private Client / Sapphire", "home_city": "New York, NY"},
-            ),
-            EntityNode(
-                node_id="acct-sapphire-88329",
-                entity_type="CREDIT_ACCOUNT",
-                label="Sapphire Preferred Credit Line",
-                attributes={"credit_limit_usd": 25000.00, "current_balance_usd": 4280.50, "status": "ACTIVE"},
-            ),
-            EntityNode(
-                node_id="card-4821",
-                entity_type="CARD_INSTRUMENT",
-                label="Visa Infinite *4821",
-                attributes={"status": "SECURITY_LOCKED", "lock_reason": "Geo-Velocity NY/Chicago"},
-            ),
-            EntityNode(
-                node_id="tok-apple-pay-16pro",
-                entity_type="DIGITAL_WALLET_TOKEN",
-                label="Apple Pay Token (iPhone 16 Pro)",
-                attributes={"status": "PROVISIONING_BLOCKED", "error": "CARD_STATUS_LOCKED_RESTRICTED"},
-            ),
-            EntityNode(
-                node_id="trv-lon-2026",
-                entity_type="TRAVEL_NOTICE",
-                label="Travel Notice: London, UK (Sep 8 - Sep 15)",
-                attributes={"destination": "London, United Kingdom", "verified_by": "Mobile App Biometrics"},
-            ),
-            EntityNode(
-                node_id="tx-chi-1000",
-                entity_type="DISPUTED_TRANSACTION",
-                label="$1,000.00 @ Chicago Luxury Electronics",
-                attributes={
-                    "initial_attempt": "DECLINED (Step-Up Triggered)",
-                    "sms_consent_reply": "Y (Approved by +1-212-555-0198)",
-                    "retry_attempt": "APPROVED ($1,000.00 Posted)",
-                },
-            ),
-            EntityNode(
-                node_id="POL-STEP-UP-2FA-002",
-                entity_type="INSTITUTIONAL_POLICY",
-                label="Multi-Step Y/N Consent Protocol",
-                attributes={"framework": "FFIEC / JPMC RiskOps Standard"},
-            ),
-            EntityNode(
-                node_id="POL-REG-E-001",
-                entity_type="INSTITUTIONAL_POLICY",
-                label="Reg E Zero Liability Policy",
-                attributes={"framework": "12 CFR Part 1005"},
-            ),
-        ]
-
-        edges = [
-            EntityEdge(source_id=customer_id, target_id="acct-sapphire-88329", relationship="OWNS_ACCOUNT"),
-            EntityEdge(source_id="acct-sapphire-88329", target_id="card-4821", relationship="ISSUES_INSTRUMENT"),
-            EntityEdge(source_id="card-4821", target_id="tok-apple-pay-16pro", relationship="PROVISIONS_TOKEN"),
-            EntityEdge(source_id=customer_id, target_id="trv-lon-2026", relationship="REGISTERED_TRAVEL"),
-            EntityEdge(source_id="card-4821", target_id="tx-chi-1000", relationship="CHARGED_ON_INSTRUMENT"),
-            EntityEdge(source_id="tx-chi-1000", target_id="POL-STEP-UP-2FA-002", relationship="GOVERNED_BY_PROTOCOL"),
-            EntityEdge(source_id="tx-chi-1000", target_id="POL-REG-E-001", relationship="AUDITED_UNDER_POLICY"),
-        ]
-
+        ok = sum(1 for f in facets if f.ok)
         return {
-            "customer_id": customer_id,
-            "graph_version": "ent-kg-v2.5-vector-indexed",
-            "embedding_model": "text-embedding-005 (768-dim Vertex AI)",
-            "node_count": len(nodes),
-            "edge_count": len(edges),
-            "nodes": [n.model_dump() for n in nodes],
-            "edges": [e.model_dump() for e in edges],
-            "hybrid_connector": AWSOnPremHybridConnector.get_connector_topology(),
+            "status": "OK" if ok == len(facets) else ("PARTIAL" if ok else "UNAVAILABLE"),
+            "facets_ok": ok,
+            "facets_total": len(facets),
+            "advisory_note": CATALOG_ADVISORY_NOTE,
+            "facets": [f.to_dict() for f in facets],
+            "api_calls": list(self.calls),
         }
+
+
+def create_default_catalog_governor() -> CatalogGovernor:
+    """Build a governor from the process configuration."""
+    return CatalogGovernor()

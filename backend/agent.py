@@ -1,263 +1,430 @@
 """
-Gemini Enterprise Synthesizer Agent.
-Reads cross-system notes from the shared Memory Bank and Knowledge Catalog, performing automated
-causal synthesis without asking redundant clarification questions.
+The fraud desk agent.
+
+The defect this file exists to fix is the one you identified: the demo wrote to
+Memory Bank and never read from it. On `main`, `MemoryBankSynthesizerAgent`
+called `memory_bank.get_formatted_context()` -- a local Python list -- and then,
+if the Gemini call threw, returned a five-paragraph narrative hardcoded at
+`agent.py:94-100`, naming specific dollar amounts and a policy id, stamped
+`confidence_score=0.99`. A total Vertex outage produced a confident, specific,
+wrong answer that no caller could distinguish from a real one.
+
+What a turn does now, in order:
+
+    1. RETRIEVE from Memory Bank. A real `memories:retrieve` against the
+       customer's scope. This is the read that did not exist.
+
+    2. RECONCILE every retrieved memory against BigQuery. A memory is what the
+       customer *said*; a row is what *happened*. Contradicted memories are kept
+       in the evidence and flagged, not silently dropped -- the agent needs to
+       know the customer believes something untrue.
+
+    3. GROUND the vocabulary in Dataplex. Regulatory terms are resolved from the
+       glossary, so the answer to "why is there no provisional credit date"
+       comes from agreed definitions rather than from a sentence someone wrote
+       into a prompt.
+
+    4. SYNTHESISE with Gemini over that evidence, under rules that forbid
+       inventing a number.
+
+    5. WRITE the turn back with `generateMemories`, letting the service decide
+       what was worth keeping.
+
+There is no canned fallback anywhere in this file. If a step fails the response
+says which step failed and why. A desk that cannot reach its evidence has
+nothing to say, and saying nothing is the correct output.
 """
 
-import os
+from __future__ import annotations
+
 import json
 import logging
-from typing import Generator, Dict, Any, List, Optional
-import certifi
-from dotenv import load_dotenv
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterator, Optional
+
 from google import genai
-from backend.models import SynthesisResult, CausalStep, SeverityLevel
-from backend.memory_bank import CustomerMemoryBank, GroundTruthTelemetryStore
-from backend.knowledge_catalog import KnowledgeCatalog
+from google.genai import types
 
-load_dotenv()
+from backend.config import Settings, settings as load_settings
+from backend.ground_truth import GroundTruthError, GroundTruthReader
+from backend.knowledge_catalog import CatalogError, CatalogGovernor
+from backend.memory_bank import Memory, MemoryBankClient, MemoryBankError
+from backend.memory_eval import reconcile
+from backend.provenance import ProvenanceLedger, measured, reported, unmeasured
 
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+log = logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
-)
+SYNTHESIS_RULES = """\
+You are a consumer-card fraud desk assistant. You are given evidence gathered \
+from three systems and you answer the customer's question from that evidence \
+alone.
+
+The evidence has provenance, and you must respect it:
+
+- WAREHOUSE facts come from the bank's system of record. They are authoritative.
+- MEMORY facts are things this customer told us on previous contacts. They are \
+  authoritative about what was *said*, not about what is *true*.
+- GLOSSARY entries are the bank's agreed definitions of regulatory terms.
+
+Rules:
+
+1. If a MEMORY is marked CONTRADICTED, the warehouse disagrees with it. Use the \
+   warehouse figure. You may acknowledge what the customer previously said, but \
+   never repeat a contradicted figure as fact.
+2. Never state a number that does not appear in the evidence. If the evidence \
+   does not contain it, say it was not available. Do not estimate.
+3. If a value is marked n/r it was not measured. Say so. Never substitute a \
+   figure, and never write 0 in its place.
+4. Nothing in the catalog blocked any read. Where a source was not consulted, \
+   the agent declined on catalog guidance. Never tell the customer that a system \
+   prevented you from seeing something.
+5. Answer the question that was asked. Do not recite the whole case file.
+6. If the evidence does not answer the question, say that plainly and say what \
+   would be needed. A short honest answer is better than a long confident one.
+"""
 
 
-class MemoryBankSynthesizerAgent:
-    """
-    Enterprise Agent using Google Gen AI SDK on Vertex AI / Gemini Enterprise.
-    Consumes cross-system Memory Bank observations and Knowledge Catalog ground-truths,
-    providing direct, zero-question causal resolution.
-    """
+@dataclass
+class Evidence:
+    """Everything gathered for one turn, with its provenance."""
+
+    customer_id: str
+    question: str
+    memories: list[Memory] = field(default_factory=list)
+    contradicted_ids: set[str] = field(default_factory=set)
+    reconciliation: dict = field(default_factory=dict)
+    warehouse: dict = field(default_factory=dict)
+    glossary: list[dict] = field(default_factory=list)
+    governance: list[dict] = field(default_factory=list)
+    errors: list[dict] = field(default_factory=list)
+    ledger: ProvenanceLedger = field(default_factory=ProvenanceLedger)
+
+    def memory_block(self) -> str:
+        if not self.memories:
+            return "(no memories retrieved for this customer)"
+        lines = []
+        for memory in self.memories:
+            flag = " [CONTRADICTED BY WAREHOUSE]" if memory.memory_id in self.contradicted_ids else ""
+            topics = ",".join(memory.topics) or "untagged"
+            distance = f"{memory.distance:.3f}" if memory.distance is not None else "n/r"
+            lines.append(f"- ({topics}, distance {distance}){flag} {memory.fact}")
+        return "\n".join(lines)
+
+    def warehouse_block(self) -> str:
+        if not self.warehouse:
+            return "(no warehouse data available)"
+        return json.dumps(self.warehouse, indent=2, default=str)[:6000]
+
+    def glossary_block(self) -> str:
+        if not self.glossary:
+            return "(no glossary terms resolved)"
+        return "\n".join(f"- {t['display_name']}: {t['description']}" for t in self.glossary)
+
+    def to_dict(self) -> dict:
+        return {
+            "customer_id": self.customer_id,
+            "question": self.question,
+            "memories": [m.to_dict() for m in self.memories],
+            "contradicted_memory_ids": sorted(self.contradicted_ids),
+            "reconciliation": self.reconciliation,
+            "warehouse": self.warehouse,
+            "glossary": self.glossary,
+            "governance": self.governance,
+            "errors": self.errors,
+            "provenance": self.ledger.render(),
+            "provenance_summary": self.ledger.summarize(),
+        }
+
+
+@dataclass
+class TurnResult:
+    """What one turn produced."""
+
+    answer: Optional[str]
+    status: str  # ANSWERED / NO_EVIDENCE / FAILED
+    evidence: Evidence
+    memory_write: dict = field(default_factory=dict)
+    timings: dict = field(default_factory=dict)
+    failure: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "answer": self.answer,
+            "failure": self.failure,
+            "evidence": self.evidence.to_dict(),
+            "memory_write": self.memory_write,
+            "timings": self.timings,
+        }
+
+
+class FraudDeskAgent:
+    """Answers a customer question from Memory Bank, BigQuery and Dataplex."""
 
     def __init__(
         self,
-        project_id: Optional[str] = None,
-        location: Optional[str] = None,
-        model_name: str = "gemini-2.5-flash",
-    ):
-        self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-        self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.model_name = model_name
-        self._client: Optional[genai.Client] = None
+        cfg: Optional[Settings] = None,
+        memory: Optional[MemoryBankClient] = None,
+        governor: Optional[CatalogGovernor] = None,
+        reader: Optional[GroundTruthReader] = None,
+        model: str = "gemini-2.5-flash",
+        client: Optional[genai.Client] = None,
+    ) -> None:
+        self.cfg = cfg or load_settings()
+        self.memory = memory or MemoryBankClient(self.cfg)
+        self.governor = governor or CatalogGovernor(self.cfg)
+        self.reader = reader or GroundTruthReader(self.cfg, governor=self.governor)
+        self.model = model
+        self._client = client
 
     @property
     def client(self) -> genai.Client:
         if self._client is None:
-            os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
             self._client = genai.Client(
-                vertexai=True,
-                project=self.project_id,
-                location=self.location,
+                vertexai=True, project=self.cfg.project_id, location=self.cfg.location
             )
         return self._client
 
-    def _call_genai_synthesis(self, prompt: str, memory_context: str, kg_context: str) -> str:
-        """Invoke Gemini Enterprise model to synthesize Memory Bank & Knowledge Catalog notes."""
-        system_instruction = (
-            "You are the senior Consumer Credit Synthesizer Agent for JPMorgan Chase.\n"
-            "You have direct real-time access to the customer's shared enterprise Memory Bank and Knowledge Catalog, "
-            "containing timestamped observations from decoupled banking subsystems (Fraud Velocity Engine, Contact Center IVR, Mobile App) "
-            "and ground-truth policies (Reg E Zero Liability, Multi-Step SMS Y/N Consent Protocol).\n\n"
-            "CRITICAL MANDATORY RULES:\n"
-            "1. ZERO QUESTIONS: Never ask the customer 'Can you tell me what happened?' or 'What seems to be the problem?'.\n"
-            "2. DIRECT CAUSAL CHAIN: Explain the complete interconnected story from start to finish based on the Memory Bank & Knowledge Catalog:\n"
-            "   - Day 1 (09:15 UTC): Fraud Velocity System placed a security lock on credit card (*4821) after detecting simultaneous logins from New York (MacBook) and Chicago, accompanied by a $1,000.00 Chicago Luxury Electronics charge (where an SMS 'Y' step-up consent reply was intercepted via SIM-swap/eSIM clone in Chicago while you were in NY).\n"
-            "   - Day 1 (14:32 UTC): Your phone call inquiring about a declined $142.50 Target purchase disconnected before the SMS passcode verification completed, leaving the card locked.\n"
-            "   - Day 2 (11:20 UTC): While traveling in London, UK (under your verified Travel Notice trv-lon-2026), your Heathrow Duty Free ($310) swipe and Apple Pay setup were rejected with error CARD_STATUS_LOCKED_RESTRICTED because the root lock remained active.\n"
-            "3. EMPATHETIC & DEFINITIVE: Reassure the customer that their account is protected under JPMC Zero Liability Policy (POL-REG-E-001) for the $1,000 Chicago charge.\n"
-            "4. IMMEDIATE PROACTIVE RESOLUTION: Provide the immediate 1-click biometric FaceID resolution to lift the lock, issue an instant Virtual Card Number (VCN) to Apple Pay in London, and credit $1,000.00."
-        )
+    # -- evidence ----------------------------------------------------------
 
-        user_content = (
-            f"{memory_context}\n\n"
-            f"### KNOWLEDGE CATALOG & GROUND-TRUTH LEDGER:\n{kg_context}\n\n"
-            f"CUSTOMER CHAT MESSAGE: \"{prompt}\"\n\n"
-            f"Synthesize the complete story from the Memory Bank and Knowledge Catalog without asking any questions."
-        )
+    def gather(
+        self,
+        customer_id: str,
+        question: str,
+        top_k: int = 8,
+        warehouse_queries: tuple[str, ...] = (
+            "customer_360",
+            "open_disputes",
+            "travel_notices",
+            "cards_for_customer",
+        ),
+        glossary_terms: tuple[str, ...] = (),
+    ) -> Evidence:
+        """Collect evidence. Each source fails on its own and says so."""
+        evidence = Evidence(customer_id=customer_id, question=question)
+        scope = {"customer_id": customer_id}
 
+        # 1. Memory Bank -- the read that did not exist before.
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=user_content,
-                config=dict(
-                    system_instruction=system_instruction,
-                    temperature=0.2,
+            started = time.perf_counter()
+            retrieval = self.memory.retrieve(scope, query=question, top_k=top_k)
+            evidence.memories = retrieval.memories
+            evidence.ledger.record("memory_retrieval_ms", retrieval.latency_ms)
+            evidence.ledger.record(
+                "memories_retrieved", measured(len(retrieval.memories), source="memories:retrieve")
+            )
+            log.info(
+                "retrieved %d memories for %s in %s",
+                len(retrieval.memories),
+                customer_id,
+                retrieval.latency_ms,
+            )
+        except MemoryBankError as exc:
+            evidence.errors.append({"source": "memory_bank", **exc.to_dict()})
+            evidence.ledger.record("memory_retrieval_ms", unmeasured(str(exc), unit="ms"))
+
+        # 2. Warehouse.
+        for query_id in warehouse_queries:
+            try:
+                result = self.reader.run(query_id, {"customer_id": customer_id})
+                evidence.warehouse[query_id] = result.rows
+                evidence.governance.extend(g.to_dict() for g in result.governance)
+                evidence.ledger.record(f"bq_{query_id}_ms", result.latency_ms)
+            except GroundTruthError as exc:
+                evidence.errors.append({"source": f"bigquery:{query_id}", "error": str(exc)})
+                evidence.ledger.record(f"bq_{query_id}_ms", unmeasured(str(exc), unit="ms"))
+
+        # 3. Reconcile memory against the warehouse. Only meaningful if both arrived.
+        if evidence.memories and "open_disputes" in evidence.warehouse:
+            try:
+                amounts = reconcile.reconcile_amounts(evidence.memories, self.reader, customer_id)
+                travel = reconcile.reconcile_travel(evidence.memories, self.reader, customer_id)
+                evidence.contradicted_ids = {
+                    f.memory_id for f in (*amounts.contradicted, *travel.contradicted)
+                }
+                evidence.reconciliation = {
+                    "amounts": amounts.to_dict(),
+                    "travel": travel.to_dict(),
+                }
+            except Exception as exc:  # noqa: BLE001
+                evidence.errors.append({"source": "reconcile", "error": str(exc)})
+
+        # 4. Glossary. Terms are resolved from the question when not named.
+        terms = glossary_terms or self._relevant_terms(question)
+        for term_id in terms:
+            try:
+                term = self.governor.get_term(term_id)
+                evidence.glossary.append(term.to_dict())
+            except CatalogError as exc:
+                evidence.errors.append({"source": f"glossary:{term_id}", **exc.to_dict()})
+
+        return evidence
+
+    def _relevant_terms(self, question: str, top_k: int = 4) -> tuple[str, ...]:
+        """Pick glossary terms to resolve, by searching the live glossary."""
+        try:
+            return tuple(t.term_id for t in self.governor.search_terms(question, top_k=top_k))
+        except CatalogError as exc:
+            log.warning("glossary search failed: %s", exc)
+            return ()
+
+    # -- answering ---------------------------------------------------------
+
+    def answer(
+        self,
+        customer_id: str,
+        question: str,
+        top_k: int = 8,
+        write_back: bool = True,
+    ) -> TurnResult:
+        """One full turn."""
+        timings: dict = {}
+        started = time.perf_counter()
+        evidence = self.gather(customer_id, question, top_k=top_k)
+        timings["gather_ms"] = round((time.perf_counter() - started) * 1000, 1)
+
+        if not evidence.memories and not evidence.warehouse:
+            return TurnResult(
+                answer=None,
+                status="NO_EVIDENCE",
+                evidence=evidence,
+                timings=timings,
+                failure=(
+                    "No evidence could be gathered from Memory Bank or BigQuery. "
+                    "Refusing to answer rather than producing a narrative unsupported "
+                    "by any source. See evidence.errors."
                 ),
             )
-            return response.text or ""
-        except Exception as exc:
-            logging.warning(f"Live Gemini API invocation encountered fallback condition: {exc}")
-            return (
-                "I see exactly what happened across your accounts over the last two days from our Memory Bank and Knowledge Catalog, and I'll explain the complete situation right away:\n\n"
-                "1. **The Root Cause (Fraud Security Lock & $1,000 Chicago Step-Up Audit - Day 1, 09:15 UTC)**: Our Fraud Velocity Engine detected concurrent logins from New York (your trusted MacBook) and Chicago within 9 minutes, alongside a **$1,000.00 charge at Chicago Luxury Electronics**. Although our step-up system declined the first attempt and received an SMS `'Y'` reply from a Chicago tower, our multi-avenue audit confirms that consent was intercepted via an unauthorized eSIM/SIM-swap while you were in New York preparing for your trip. To protect your account, card **4821** was placed on `SECURITY_LOCKED` status.\n\n"
-                "2. **The Incomplete Phone Call (Day 1, 14:32 UTC)**: When your in-store purchase of $142.50 at Target was declined, you called our automated phone support. However, the call disconnected before the SMS identity verification passcode could be confirmed, keeping the protective lock active.\n\n"
-                "3. **The London Travel & Apple Pay Failure (Day 2, 11:20 UTC)**: We see your verified Travel Notice (`trv-lon-2026`) for **London, United Kingdom**. When you attempted a $310.00 purchase at Heathrow Duty Free and tried to add card *4821 to Apple Pay on your iPhone 16 Pro, both were rejected with error `CARD_STATUS_LOCKED_RESTRICTED` due to the unresolved Day 1 lock.\n\n"
-                "**Immediate 1-Click Resolution**: Under **Policy POL-REG-E-001 (Zero Liability)**, we have flagged the $1,000.00 Chicago charge for an immediate provisional credit refund. Tap **'Verify Identity & Unlock Card *4821'** below to authenticate via FaceID on your iPhone 16 Pro—this will instantly unlock your account for your London trip and provision a Digital Virtual Card Number (VCN) directly into your Apple Pay wallet."
+
+        prompt = (
+            f"CUSTOMER: {customer_id}\n"
+            f"QUESTION: {question}\n\n"
+            f"MEMORY (what this customer has told us):\n{evidence.memory_block()}\n\n"
+            f"WAREHOUSE (system of record):\n{evidence.warehouse_block()}\n\n"
+            f"GLOSSARY (the bank's agreed definitions):\n{evidence.glossary_block()}\n"
+        )
+
+        started = time.perf_counter()
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYNTHESIS_RULES,
+                    temperature=0.1,
+                ),
             )
+        except Exception as exc:  # noqa: BLE001
+            # Deliberately no canned narrative here. The previous implementation
+            # returned invented prose at this exact point and marked it 0.99
+            # confident.
+            timings["synthesis_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            return TurnResult(
+                answer=None,
+                status="FAILED",
+                evidence=evidence,
+                timings=timings,
+                failure=f"Synthesis call failed: {type(exc).__name__}: {exc}",
+            )
+        timings["synthesis_ms"] = round((time.perf_counter() - started) * 1000, 1)
 
-    def synthesize_customer_issue(
-        self,
-        customer_id: str,
-        user_prompt: str,
-        memory_bank: CustomerMemoryBank,
-    ) -> SynthesisResult:
-        """Execute end-to-end memory retrieval, Knowledge Catalog grounding, and causal synthesis."""
-        memory_context = memory_bank.get_formatted_context()
-        statement = GroundTruthTelemetryStore.fetch_live_account_statement(customer_id)
-        risk_profile = KnowledgeCatalog.get_customer_risk_profile(customer_id)
-        kg_context = json.dumps(
-            {
-                "live_statement_balance_usd": statement.get("statement_summary", {}).get("current_posted_balance_usd"),
-                "verified_travel_notice": "London, UK (trv-lon-2026)",
-                "customer_risk_profile": risk_profile.get("historical_spending_baseline"),
-                "governing_policies": ["POL-REG-E-001 (Zero Liability)", "POL-STEP-UP-2FA-002 (Step-Up Y/N Audit)"],
-            },
-            indent=2,
+        usage = getattr(response, "usage_metadata", None)
+        evidence.ledger.record(
+            "prompt_tokens",
+            reported(usage.prompt_token_count, source="usage_metadata")
+            if usage and usage.prompt_token_count
+            else unmeasured("model did not report prompt token usage"),
         )
-        narrative = self._call_genai_synthesis(user_prompt, memory_context, kg_context)
+        evidence.ledger.record(
+            "response_tokens",
+            reported(usage.candidates_token_count, source="usage_metadata")
+            if usage and usage.candidates_token_count
+            else unmeasured("model did not report response token usage"),
+        )
 
-        causal_steps = [
-            CausalStep(
-                step_number=1,
-                system="Fraud Monitoring & Step-Up Engine",
-                day_time="Day 1 - 09:15 UTC",
-                event="Concurrent NY/Chicago logins + $1,000 Chicago Electronics charge (SIM-swap SMS 'Y' interception).",
-                impact="Card (*4821) placed on SECURITY_LOCKED restriction; $1,000 flagged for Reg E credit.",
-                status="TRIGGER_EVENT",
-            ),
-            CausalStep(
-                step_number=2,
-                system="Inbound Voice IVR",
-                day_time="Day 1 - 14:32 UTC",
-                event="Call regarding $142.50 Target decline dropped before 2FA completed.",
-                impact="Security lock remained unverified and active.",
-                status="UNRESOLVED_INTERMEDIARY",
-            ),
-            CausalStep(
-                step_number=3,
-                system="Mobile Banking App (London, UK)",
-                day_time="Day 2 - 11:20 UTC",
-                event="Heathrow Duty Free swipe & Apple Pay card provisioning rejected (CARD_STATUS_LOCKED_RESTRICTED).",
-                impact="Digital wallet setup blocked despite verified UK Travel Notice due to root card lock.",
-                status="DOWNSTREAM_FAILURE",
-            ),
-        ]
+        write_summary: dict = {}
+        if write_back:
+            write_summary = self._write_back(customer_id, question, response.text or "")
 
-        a2ui_payload = {
-            "type": "MemorySynthesisCard",
-            "title": "Cross-System Memory Bank & Knowledge Catalog Synthesis",
-            "customer_id": customer_id,
-            "root_cause": "Dual-City Geo-Velocity Anomaly & $1,000 Chicago SIM-Swap Interception",
-            "affected_instrument": "Chase Sapphire Preferred (*4821)",
-            "timeline": [
-                {
-                    "day": "Day 1",
-                    "time": "09:15 UTC",
-                    "system": "Fraud Velocity & Step-Up Engine",
-                    "title": "Card Restricted ($1,000 Chicago SIM-Swap Alert)",
-                    "detail": "NY MacBook login vs Chicago $1,000 POS charge (SMS 'Y' intercepted). Auto-locked card *4821.",
-                    "status_badge": "LOCKED • REG E COVERED",
-                    "badge_color": "danger",
-                },
-                {
-                    "day": "Day 1",
-                    "time": "14:32 UTC",
-                    "system": "Inbound Support IVR",
-                    "title": "Target $142.50 Decline & Dropped Call",
-                    "detail": "Inbound call disconnected before SMS 2FA completed.",
-                    "status_badge": "INCOMPLETE_AUTH",
-                    "badge_color": "warning",
-                },
-                {
-                    "day": "Day 2",
-                    "time": "11:20 UTC",
-                    "system": "Mobile Banking iOS (London, UK)",
-                    "title": "Heathrow & Apple Pay Setup Rejected",
-                    "detail": "Tokenization rejected in London (Travel Notice trv-lon-2026 verified) due to root lock.",
-                    "status_badge": "PROVISIONING_FAILED",
-                    "badge_color": "warning",
-                },
-            ],
-            "resolution": {
-                "action_id": "ONE_CLICK_IDENTITY_UNLOCK",
-                "label": "Verify FaceID, Unlock Card *4821 & Credit $1,000",
-                "description": "One-touch biometric verification lifts lock, provisions Apple Pay VCN, and credits $1,000 Chicago fraud.",
-            },
+        return TurnResult(
+            answer=response.text,
+            status="ANSWERED",
+            evidence=evidence,
+            memory_write=write_summary,
+            timings=timings,
+        )
+
+    def _write_back(self, customer_id: str, question: str, answer: str) -> dict:
+        """Hand the turn to `generateMemories` and let the service decide.
+
+        `wait=False`. On a user-facing turn the right trade is to return the
+        operation name immediately and let extraction happen server-side; waiting
+        would add seconds to every turn to learn something the user does not need.
+        The evaluation harness waits, because there it is the measurement.
+        """
+        try:
+            result = self.memory.generate_from_conversation(
+                turns=[
+                    {"role": "user", "text": question},
+                    {"role": "model", "text": answer},
+                ],
+                scope={"customer_id": customer_id},
+                wait=False,
+            )
+            return {
+                "submitted": True,
+                "operation": result.operation,
+                "note": (
+                    "Extraction is asynchronous and server-side. This process does not "
+                    "decide what is worth remembering -- that is the point of using Memory "
+                    "Bank rather than a table."
+                ),
+            }
+        except MemoryBankError as exc:
+            return {"submitted": False, **exc.to_dict()}
+
+    # -- streaming ---------------------------------------------------------
+
+    def stream(self, customer_id: str, question: str, top_k: int = 8) -> Iterator[dict]:
+        """Emit the turn as events, including the evidence the answer rests on.
+
+        The evidence is streamed before the answer deliberately. A reader can see
+        what the desk knew at the moment it spoke, which is the only way to tell a
+        grounded answer from a fluent one.
+        """
+        yield {"event": "started", "customer_id": customer_id, "question": question}
+
+        evidence = self.gather(customer_id, question, top_k=top_k)
+        yield {
+            "event": "memory_retrieved",
+            "count": len(evidence.memories),
+            "latency_ms": evidence.ledger.entries.get("memory_retrieval_ms", unmeasured("n/a")).render(),
+            "memories": [m.to_dict() for m in evidence.memories],
+            "contradicted": sorted(evidence.contradicted_ids),
         }
+        yield {
+            "event": "warehouse_read",
+            "queries": list(evidence.warehouse),
+            "row_counts": {k: len(v) for k, v in evidence.warehouse.items()},
+            "governance": evidence.governance,
+        }
+        yield {"event": "glossary_resolved", "terms": evidence.glossary}
+        if evidence.errors:
+            yield {"event": "partial", "errors": evidence.errors}
 
-        return SynthesisResult(
-            customer_id=customer_id,
-            narrative=narrative,
-            causal_steps=causal_steps,
-            asked_question=False,
-            resolution_action=a2ui_payload["resolution"],
-            a2ui_payload=a2ui_payload,
-            confidence_score=0.99,
-        )
+        result = self.answer(customer_id, question, top_k=top_k)
+        yield {
+            "event": "answer",
+            "status": result.status,
+            "text": result.answer,
+            "failure": result.failure,
+            "timings": result.timings,
+        }
+        yield {"event": "memory_write", **result.memory_write}
+        yield {"event": "done"}
 
-    def stream_synthesis_workflow(
-        self,
-        session_id: str,
-        customer_id: str,
-        user_prompt: str,
-        memory_bank: CustomerMemoryBank,
-    ) -> Generator[str, None, None]:
-        """
-        Yields JSON-RPC 2.0 formatted trace telemetry chunks for real-time SSE streaming.
-        """
-        logging.info(f"Session {session_id}: Initiating Memory Bank Synthesis for Customer {customer_id}.")
 
-        # 1. Thought Frame
-        yield self._encode_rpc_frame("onAgentThought", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "message": f"Analyzing user intent: '{user_prompt}'. Querying enterprise Memory Bank & Knowledge Catalog...",
-        })
-
-        # 2. Memory Bank Access Frame
-        fragments = memory_bank.get_fragments()
-        yield self._encode_rpc_frame("onMemoryBankAccess", {
-            "author": "CustomerMemoryBank",
-            "customer_id": customer_id,
-            "fragment_count": len(fragments),
-            "fragments": [f.to_display_dict() for f in fragments],
-            "message": f"Retrieved {len(fragments)} cross-channel observation fragments spanning 48 hours.",
-        })
-
-        # 3. Knowledge Catalog Grounding Frame
-        kg_subgraph = KnowledgeCatalog.get_entity_subgraph(customer_id)
-        yield self._encode_rpc_frame("onAgentThought", {
-            "author": "KnowledgeCatalogEngine",
-            "message": (
-                f"Grounded against Knowledge Catalog ({kg_subgraph['node_count']} graph entities, "
-                "Policies POL-REG-E-001 & POL-STEP-UP-2FA-002, Verified Travel Notice trv-lon-2026)."
-            ),
-        })
-
-        # 4. Agent Synthesis Frame
-        synthesis = self.synthesize_customer_issue(customer_id, user_prompt, memory_bank)
-        yield self._encode_rpc_frame("onAgentThought", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "message": "Reconstructed full causal chain across Fraud, Step-Up Consent, IVR, and London Mobile subsystems. Zero questions required.",
-        })
-
-        yield self._encode_rpc_frame("onAgentSynthesis", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "customer_id": customer_id,
-            "narrative": synthesis.narrative,
-            "causal_steps": [s.model_dump() for s in synthesis.causal_steps],
-        })
-
-        # 5. Dynamic A2UI Schema Delivery Frame
-        yield self._encode_rpc_frame("onUiComponentDelivery", {
-            "author": "ConsumerCreditSynthesizerAgent",
-            "ui_specification": "A2UI-0.9",
-            "payload": synthesis.a2ui_payload,
-        })
-
-    def _encode_rpc_frame(self, method: str, params: Dict[str, Any]) -> str:
-        """Format payload as JSON-RPC 2.0 block."""
-        return json.dumps({"jsonrpc": "2.0", "method": method, "params": params}, default=str)
+# Kept so existing imports do not break. The old name described what the class
+# was built around; the new one describes what it does.
+MemoryBankSynthesizerAgent = FraudDeskAgent

@@ -57,7 +57,7 @@ graph TD
 
 ### Key Memory Bank Capabilities
 
-1. **Entity-Scoped Persistence**: State is anchored strictly to the customer identifier (`customer_id = "cust_jpmc_88329"`), completely decoupled from individual user sessions or agent runtimes.
+1. **Entity-Scoped Persistence**: State is anchored strictly to the customer identifier (`customer_id = "CUST00001"`), completely decoupled from individual user sessions or agent runtimes.
 2. **Provenance-Aware Chronology**: Every observation fragment records its originating subsystem (`channel`), timestamp, severity, and veracity verification payload.
 3. **ADK Native Integration**: Works with `InMemoryMemoryService` for local deterministic testing and scales seamlessly to `VertexAiMemoryBankService` (`google.adk.memory.vertex_ai_memory_bank_service`) and `google.adk.tools.LoadMemoryTool` / `PreloadMemoryTool` for production.
 
@@ -161,8 +161,8 @@ The [`MemoryBankAuditAgent`](file:///Users/arsanjani/AntigravityRepo/jpmc-consum
 ```mermaid
 graph LR
     SWEEP[Consolidated Sweep Trigger<br/>POST /api/audit/sweep] --> SCAN[Scan All Customer Memory Banks]
-    SCAN --> C1[Customer cust_jpmc_88329]
-    SCAN --> C2[Customer cust_jpmc_77412]
+    SCAN --> C1[Customer CUST00001]
+    SCAN --> C2[Customer CUST00002]
     
     C1 --> DET1[Detect Cascade Friction<br/>Fraud Lock -> IVR Drop -> Apple Pay Fail]
     C1 --> DET2[Detect Contradicted Claims<br/>Flagged by Pre-Write Veracity Layer]

@@ -1,854 +1,664 @@
 """
-Gemini Enterprise Agent Platform - Customer Memory Bank (Shared Epistemic Layer).
-Reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank
-Backed by real Google Cloud Vertex AI Agent Engine Memory Bank (VertexAiMemoryBankService),
-real Vertex AI Vector Embeddings (text-embedding-005 cosine similarity), and
-live Gemini 2.5 Flash Asynchronous Memory Compaction (Dreaming Service).
+Vertex AI Agent Engine Memory Bank -- a real client.
+
+What was here before, on `main`, was a Python list. `CustomerMemoryBank` held
+`MemoryFragment` objects in process memory, called that a "shared epistemic
+layer", and synced a copy to Vertex through a *private* ADK method
+(`svc._add_memories_via_create`) that nothing ever read back. The demo wrote to
+the cloud and then answered every question from the local list. Restarting the
+process was indistinguishable from wiping the bank.
+
+This module talks to the service. Nothing is cached in a module-level dict,
+nothing is seeded on construction, and every method below corresponds to one
+documented REST call.
+
+The distinction that matters most here -- and the one the rest of this codebase
+is built to demonstrate -- is between the two ways to put something in the bank:
+
+    create_memory(...)              you decide. The fact is stored verbatim.
+    generate_from_conversation(...) the service decides. It reads the turns,
+                                    extracts what is durable, drops what is not,
+                                    consolidates against what it already holds,
+                                    and files the result under a topic.
+
+`generate` is the interesting one, because it *declines*. Feeding it a
+transcript and diffing the corpus before and after tells you what the service
+considered worth keeping -- which is a measurable property, not a claim. See
+`backend/memory_eval/write_policy.py`.
 """
 
-import asyncio
-import math
-import os
-import uuid
+from __future__ import annotations
+
+import json
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional
-import certifi
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
-from google.adk.memory import VertexAiMemoryBankService
-from google.adk.memory.memory_entry import MemoryEntry
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Optional, Sequence
 
-from backend.models import (
-    MemoryFragment,
-    BankChannel,
-    SeverityLevel,
-    ChannelSession,
-    ClaimVeracityEvaluation,
-    VeracityStatus,
-    CompactionReport,
-)
+import google.auth
+import google.auth.transport.requests
+import requests
 
-load_dotenv()
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+from backend.config import Settings, settings as load_settings
+from backend.provenance import Provenanced, measured, unmeasured
+
+log = logging.getLogger(__name__)
+
+API_VERSION = "v1beta1"
+"""Memory Bank is a v1beta1 surface. Pinned explicitly: silently following a
+default version is how a working integration breaks on someone else's release."""
+
+SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
 
 
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot_product / (norm_a * norm_b)
+class MemoryBankError(RuntimeError):
+    """A Memory Bank call failed.
 
-
-class DynamicCompactionSchema(BaseModel):
-    distilled_customer_insights: List[str] = Field(
-        ...,
-        description="List of 3 to 5 durable customer behavioral, travel, channel preference, and security insights distilled from raw fragments.",
-    )
-    compacted_summary_narrative: str = Field(
-        ...,
-        description="High-density executive synthesis of all cross-channel events, root lock causes, and recommended actions.",
-    )
-
-
-class GroundTruthTelemetryStore:
-    """
-    Authoritative system ground-truth telemetry (Account Statements, Live Balances, POS Ledger,
-    Multi-Step Y/N Consent Logs, Travel Notices, and IP/Device Telemetry) against which customer
-    claims are verified by the ClaimVeracityValidatorAgent prior to Memory Bank insertion.
+    Carries the HTTP status and the response body verbatim. The body is the
+    useful part -- Vertex explains refusals in prose -- and truncating it to a
+    tidy message is how "Method not visible to labels: {PUBLIC}" becomes an
+    unexplained 503.
     """
 
-    _telemetry_db: Dict[str, Dict[str, Any]] = {
-        "cust_jpmc_88329": {
-            "account_statement": {
-                "account_id": "acct-sapphire-88329",
-                "card_number_masked": "•••• •••• •••• 4821",
-                "product_name": "Chase Sapphire Preferred",
-                "currency": "USD",
-                "credit_limit_usd": 25000.00,
-                "current_posted_balance_usd": 4280.50,
-                "pending_charges_usd": 0.00,
-                "available_credit_usd": 20719.50,
-                "last_statement_closing_date": "2026-08-28",
-                "last_statement_balance_usd": 3138.00,
-                "account_status": "SECURITY_LOCKED",
-            },
-            "ip_logs": [
-                {
-                    "ip": "198.51.100.4",
-                    "timestamp": "2026-09-07T09:05:12Z",
-                    "city": "New York",
-                    "region": "NY",
-                    "asn": "AS7018 AT&T",
-                    "device": "MacBookPro M3 (Safari)",
-                    "auth_result": "SUCCESS",
-                },
-                {
-                    "ip": "203.0.113.19",
-                    "timestamp": "2026-09-07T09:14:48Z",
-                    "city": "Chicago",
-                    "region": "IL",
-                    "asn": "AS7922 Comcast",
-                    "device": "Windows 11 (Chrome)",
-                    "auth_result": "SUCCESS",
-                },
-            ],
-            "travel_notices": [
-                {
-                    "notice_id": "trv-lon-2026",
-                    "destination": "London, United Kingdom",
-                    "start_date": "2026-09-08",
-                    "end_date": "2026-09-15",
-                    "submitted_at": "2026-09-06T18:20:00Z",
-                    "channel": "MOBILE_APP",
-                    "verification_method": "BIOMETRIC_FACE_ID",
-                    "status": "ACTIVE_VERIFIED",
-                }
-            ],
-            "step_up_consent_logs": [
-                {
-                    "consent_id": "consent-chi-1000",
-                    "initial_tx_id": "tx-chi-1000-init",
-                    "retry_tx_id": "tx-chi-1000-retry",
-                    "merchant": "Chicago Luxury Electronics (POS #884)",
-                    "city": "Chicago, IL",
-                    "amount_usd": 1000.00,
-                    "initial_attempt_timestamp": "2026-09-07T09:16:05Z",
-                    "initial_decision": "DECLINED_FIRST_ATTEMPT_STEP_UP_TRIGGERED",
-                    "decline_reason": "Out-of-pattern $1,000.00 electronics spend in unregistered city (Chicago, IL)",
-                    "challenge_type": "SMS_AND_PUSH_YN_CONSENT",
-                    "challenge_sent_to": "+1-212-555-0198",
-                    "challenge_prompt": "Chase Fraud Alert: Did you attempt $1,000.00 at Chicago Luxury Electronics in Chicago, IL? Reply Y or N.",
-                    "challenge_sent_timestamp": "2026-09-07T09:16:08Z",
-                    "user_reply": "Y",
-                    "user_reply_timestamp": "2026-09-07T09:17:12Z",
-                    "reply_carrier_telemetry": {
-                        "origin_ip": "203.0.113.19",
-                        "cell_tower_region": "Chicago Metro (Cook County, IL)",
-                        "sim_swap_flag": "SUSPECTED_CONCURRENT_ESIM_CLONE",
-                        "simultaneous_ny_session_active": True,
-                    },
-                    "retry_timestamp": "2026-09-07T09:17:40Z",
-                    "retry_decision": "APPROVED_POST_STEP_UP_CONSENT",
-                    "post_retry_action": (
-                        "At 09:18:30Z, RiskOps Velocity Engine detected simultaneous NY MacBook session "
-                        "and Chicago Windows/SMS activity, placing full SECURITY_LOCKED restriction on card *4821."
-                    ),
-                }
-            ],
-            "telephony_ivr_logs": [
-                {
-                    "call_id": "call-ivr-9921",
-                    "timestamp": "2026-09-07T14:32:10Z",
-                    "duration_seconds": 48,
-                    "inbound_phone": "+1-212-555-0198",
-                    "merchant_inquired": "Target Store #1142 ($142.50)",
-                    "sms_otp_sent_timestamp": "2026-09-07T14:32:35Z",
-                    "otp_entered": False,
-                    "disconnection_reason": "CALLER_DISCONNECTED_PRE_AUTH",
-                }
-            ],
-            "mobile_app_logs": [
-                {
-                    "log_id": "mob-log-5541",
-                    "timestamp": "2026-09-08T11:20:15Z",
-                    "device_model": "iPhone 16 Pro (iOS 14.8.2)",
-                    "action": "APPLE_PAY_PROVISIONING",
-                    "gateway_response": "DECLINED_BY_ISSUER",
-                    "error_code": "CARD_STATUS_LOCKED_RESTRICTED",
-                    "biometric_enrolled": True,
-                    "gps_location": "London Heathrow Airport (LHR), UK",
-                }
-            ],
-            "transaction_ledger": [
-                {
-                    "tx_id": "tx-chi-1000-init",
-                    "timestamp": "2026-09-07T09:16:05Z",
-                    "merchant": "Chicago Luxury Electronics (POS #884)",
-                    "city": "Chicago, IL",
-                    "amount": 1000.00,
-                    "currency": "USD",
-                    "card_entry_mode": "FALLBACK_MAGSTRIPE_KEYED",
-                    "status": "DECLINED",
-                    "decline_code": "STEP_UP_YN_CONSENT_REQUIRED",
-                },
-                {
-                    "tx_id": "tx-chi-1000-retry",
-                    "timestamp": "2026-09-07T09:17:40Z",
-                    "merchant": "Chicago Luxury Electronics (POS #884)",
-                    "city": "Chicago, IL",
-                    "amount": 1000.00,
-                    "currency": "USD",
-                    "card_entry_mode": "FALLBACK_MAGSTRIPE_KEYED",
-                    "status": "APPROVED_POSTED",
-                    "auth_code": "AUTH-99821-Y",
-                    "step_up_consent_id": "consent-chi-1000",
-                    "ledger_impact_usd": 1000.00,
-                },
-                {
-                    "tx_id": "tx-pos-4401",
-                    "timestamp": "2026-09-07T14:30:22Z",
-                    "merchant": "Target Store #1142",
-                    "city": "New York, NY",
-                    "amount": 142.50,
-                    "currency": "USD",
-                    "card_entry_mode": "CONTACTLESS_EMV",
-                    "status": "DECLINED",
-                    "decline_code": "CARD_SECURITY_LOCKED",
-                },
-                {
-                    "tx_id": "tx-lon-dutyfree",
-                    "timestamp": "2026-09-08T08:15:00Z",
-                    "merchant": "London Heathrow World Duty Free",
-                    "city": "London, UK",
-                    "amount": 310.00,
-                    "currency": "USD",
-                    "card_entry_mode": "CHIP_AND_PIN",
-                    "status": "DECLINED",
-                    "decline_code": "CARD_SECURITY_LOCKED",
-                },
-            ],
-        },
-        "cust_jpmc_77412": {
-            "account_statement": {
-                "account_id": "acct-freedom-77412",
-                "card_number_masked": "•••• •••• •••• 9912",
-                "product_name": "Chase Freedom Unlimited",
-                "currency": "USD",
-                "credit_limit_usd": 12000.00,
-                "current_posted_balance_usd": 850.00,
-                "available_credit_usd": 11150.00,
-                "account_status": "ACTIVE",
-            },
-            "ip_logs": [
-                {
-                    "ip": "192.0.2.88",
-                    "timestamp": "2026-09-08T10:00:00Z",
-                    "city": "Dallas",
-                    "region": "TX",
-                    "device": "Android 15 (Pixel 9)",
-                    "auth_result": "SUCCESS",
-                }
-            ],
-            "travel_notices": [],
-            "step_up_consent_logs": [],
-            "telephony_ivr_logs": [],
-            "mobile_app_logs": [],
-            "transaction_ledger": [
-                {
-                    "tx_id": "tx-pos-9901",
-                    "timestamp": "2026-09-08T09:45:00Z",
-                    "merchant": "Delta Air Lines",
-                    "city": "Dallas, TX",
-                    "amount": 850.00,
-                    "status": "APPROVED",
-                }
-            ],
-        },
-    }
+    def __init__(self, message: str, *, status: Optional[int] = None, body: str = "", url: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+        self.url = url
 
-    @classmethod
-    def get_telemetry_for_customer(cls, customer_id: str) -> Dict[str, Any]:
-        return cls._telemetry_db.get(customer_id, {
-            "account_statement": {},
-            "ip_logs": [],
-            "travel_notices": [],
-            "step_up_consent_logs": [],
-            "telephony_ivr_logs": [],
-            "mobile_app_logs": [],
-            "transaction_ledger": [],
-        })
-
-    @classmethod
-    def fetch_live_account_statement(cls, customer_id: str) -> Dict[str, Any]:
-        telemetry = cls.get_telemetry_for_customer(customer_id)
+    def to_dict(self) -> dict:
         return {
-            "customer_id": customer_id,
-            "statement_summary": telemetry.get("account_statement", {}),
-            "recent_transactions": telemetry.get("transaction_ledger", []),
-            "api_source": "JPMC Core Banking Statement API (On-Prem zSeries CICS via Direct Interconnect)",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    @classmethod
-    def fetch_step_up_consent_audit(cls, customer_id: str) -> List[Dict[str, Any]]:
-        telemetry = cls.get_telemetry_for_customer(customer_id)
-        return telemetry.get("step_up_consent_logs", [])
-
-    @classmethod
-    def fetch_travel_and_geo_verification(cls, customer_id: str) -> Dict[str, Any]:
-        telemetry = cls.get_telemetry_for_customer(customer_id)
-        return {
-            "customer_id": customer_id,
-            "registered_travel_notices": telemetry.get("travel_notices", []),
-            "recent_ip_sessions": telemetry.get("ip_logs", []),
-            "mobile_gps_breadcrumbs": [
-                {
-                    "timestamp": log.get("timestamp"),
-                    "device": log.get("device_model"),
-                    "location": log.get("gps_location", "Unknown"),
-                }
-                for log in telemetry.get("mobile_app_logs", [])
-            ],
+            "error": str(self),
+            "http_status": self.status,
+            "response_body": self.body[:4000],
+            "url": self.url,
         }
 
 
-class CustomerMemoryBank:
+# --------------------------------------------------------------------------
+# Value types
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MemoryTopic:
+    """One entry in the engine's topic vocabulary.
+
+    A topic is not a tag applied after the fact. It is part of the engine
+    configuration that `generateMemories` consults when deciding whether a piece
+    of a conversation is worth keeping at all.
     """
-    Enterprise Memory Bank providing centralized cross-system state persistence,
-    chronological observation ingestion, real Vertex AI vector embedding search,
-    VertexAiMemoryBankService synchronization, and live Gemini asynchronous compaction.
-    """
 
-    _instances: Dict[str, "CustomerMemoryBank"] = {}
-    _sessions: Dict[str, ChannelSession] = {}
-    _embedding_cache: Dict[str, List[float]] = {}
-    _genai_client: Optional[genai.Client] = None
+    label: str
+    kind: str  # "CUSTOM" or "MANAGED"
+    description: str = ""
 
-    def __new__(cls, customer_id: str = "cust_jpmc_88329"):
-        if customer_id not in cls._instances:
-            instance = super().__new__(cls)
-            instance._initialized = False
-            cls._instances[customer_id] = instance
-        return cls._instances[customer_id]
+    @classmethod
+    def from_api(cls, payload: dict) -> "MemoryTopic":
+        """Normalise the two shapes the engine config uses into one.
 
-    def __init__(self, customer_id: str = "cust_jpmc_88329"):
-        if getattr(self, "_initialized", False):
-            return
-        self.customer_id = customer_id
-        self.project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-        self.location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        self.agent_engine_id = os.environ.get("VERTEX_AGENT_ENGINE_ID", "915213137995628544")
-        self._fragments: List[MemoryFragment] = []
-        self._last_compaction_report: Optional[CompactionReport] = None
-        self._vertex_mb_service: Optional[VertexAiMemoryBankService] = None
-        self._initialized = True
-        self.seed_default_scenario()
+        A custom topic is `{"customMemoryTopic": {"label": ..., "description": ...}}`;
+        a managed one is `{"managedMemoryTopic": {"managedTopicEnum": ...}}`. The
+        caller should not have to care which.
+        """
+        if "customMemoryTopic" in payload:
+            body = payload["customMemoryTopic"]
+            return cls(
+                label=body.get("label", ""),
+                kind="CUSTOM",
+                description=body.get("description", ""),
+            )
+        if "managedMemoryTopic" in payload:
+            body = payload["managedMemoryTopic"]
+            return cls(
+                label=body.get("managedTopicEnum", ""),
+                kind="MANAGED",
+                description=body.get("description", ""),
+            )
+        return cls(label=json.dumps(payload, sort_keys=True), kind="UNKNOWN")
+
+    def to_dict(self) -> dict:
+        return {"label": self.label, "kind": self.kind, "description": self.description}
+
+
+@dataclass(frozen=True)
+class Memory:
+    """One stored memory, as the service returns it."""
+
+    name: str
+    fact: str
+    scope: dict
+    topics: tuple[str, ...] = ()
+    memory_type: str = ""
+    create_time: str = ""
+    update_time: str = ""
+    distance: Optional[float] = None
+    """Similarity distance. Present only on `memories:retrieve` results, and
+    absent on scope-only retrieval and on `list`. It is a *distance*, so smaller
+    is closer -- reporting it as a similarity score without inverting it is an
+    easy and embarrassing mistake."""
 
     @property
-    def vertex_mb_service(self) -> Optional[VertexAiMemoryBankService]:
-        if self._vertex_mb_service is None and self.project_id != "your-gcp-project-id":
-            try:
-                self._vertex_mb_service = VertexAiMemoryBankService(
-                    project=self.project_id,
-                    location=self.location,
-                    agent_engine_id=self.agent_engine_id,
-                )
-            except Exception as e:
-                logging.debug("Could not initialize VertexAiMemoryBankService: %s", e)
-        return self._vertex_mb_service
+    def memory_id(self) -> str:
+        return self.name.rsplit("/", 1)[-1] if self.name else ""
+
+    @property
+    def short_id(self) -> str:
+        """Enough of the id to identify a memory in a table without filling it."""
+        mid = self.memory_id
+        return mid[-8:] if len(mid) > 8 else mid
 
     @classmethod
-    def _get_genai_client(cls) -> genai.Client:
-        if cls._genai_client is None:
-            os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
-            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-            cls._genai_client = genai.Client(
-                vertexai=True,
-                project=project_id,
-                location=location,
-            )
-        return cls._genai_client
-
-    @classmethod
-    def _get_embedding(cls, text: str) -> Optional[List[float]]:
-        if text in cls._embedding_cache:
-            return cls._embedding_cache[text]
-        try:
-            client = cls._get_genai_client()
-            res = client.models.embed_content(
-                model="text-embedding-005",
-                contents=text,
-            )
-            if res.embeddings and res.embeddings[0].values:
-                vec = list(res.embeddings[0].values)
-                cls._embedding_cache[text] = vec
-                return vec
-        except Exception as e:
-            logging.debug("Embedding fallback triggered: %s", e)
-        return None
-
-    def _sync_fragment_to_vertex_cloud(self, fragment: MemoryFragment) -> bool:
-        svc = self.vertex_mb_service
-        if svc is None:
-            return False
-        try:
-            fact_text = f"[{fragment.day_label} | {fragment.channel.value}] {fragment.summary}"
-            entry = MemoryEntry(
-                content=types.Content(parts=[types.Part(text=fact_text)], role="user"),
-                author=fragment.channel.value,
-            )
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(
-                    svc._add_memories_via_create(
-                        app_name="jpmc_consumer_credit",
-                        user_id=self.customer_id,
-                        memories=[entry],
-                    )
-                )
-            finally:
-                loop.close()
-            return True
-        except Exception as e:
-            logging.debug("Cloud memory sync skipped or deferred: %s", e)
-            return False
-
-    @classmethod
-    def get_all_customer_ids(cls) -> List[str]:
-        CustomerMemoryBank("cust_jpmc_88329")
-        CustomerMemoryBank("cust_jpmc_77412")
-        return list(cls._instances.keys())
-
-    @classmethod
-    def get_all_banks(cls) -> Dict[str, "CustomerMemoryBank"]:
-        return dict(cls._instances)
-
-    @classmethod
-    def open_channel_session(
-        cls,
-        customer_id: str,
-        channel: BankChannel,
-        agent_name: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> ChannelSession:
-        session_id = f"sess-{channel.value.lower()}-{uuid.uuid4().hex[:6]}"
-        session = ChannelSession(
-            session_id=session_id,
-            customer_id=customer_id,
-            channel=channel,
-            opened_at=datetime.now(timezone.utc),
-            status="OPEN",
-            agent_name=agent_name,
-            session_metadata=metadata or {},
+    def from_api(cls, payload: dict, distance: Optional[float] = None) -> "Memory":
+        return cls(
+            name=payload.get("name", ""),
+            fact=payload.get("fact", ""),
+            scope=dict(payload.get("scope", {})),
+            topics=tuple(_topic_labels(payload.get("topics", []))),
+            memory_type=payload.get("memoryType", ""),
+            create_time=payload.get("createTime", ""),
+            update_time=payload.get("updateTime", ""),
+            distance=distance,
         )
-        cls._sessions[session_id] = session
-        return session
 
-    @classmethod
-    def get_session(cls, session_id: str) -> Optional[ChannelSession]:
-        return cls._sessions.get(session_id)
+    def to_dict(self) -> dict:
+        out = {
+            "id": self.memory_id,
+            "short_id": self.short_id,
+            "fact": self.fact,
+            "scope": self.scope,
+            "topics": list(self.topics),
+            "memory_type": self.memory_type,
+            "create_time": self.create_time,
+            "update_time": self.update_time,
+        }
+        if self.distance is not None:
+            out["distance"] = self.distance
+        return out
 
-    @classmethod
-    def list_sessions(cls, customer_id: Optional[str] = None) -> List[ChannelSession]:
-        if customer_id:
-            return [s for s in cls._sessions.values() if s.customer_id == customer_id]
-        return list(cls._sessions.values())
 
-    def clear(self) -> None:
-        self._fragments = []
+def _topic_labels(raw_topics: Iterable[dict]) -> list[str]:
+    """Flatten the *on-memory* topic shape into plain labels.
 
-    def ingest_event(
-        self,
-        channel: BankChannel,
-        day_label: str,
-        summary: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        severity: SeverityLevel = SeverityLevel.MEDIUM,
-        timestamp: Optional[datetime] = None,
-        session_id: Optional[str] = None,
-        veracity_evaluation: Optional[ClaimVeracityEvaluation] = None,
-        is_compacted_summary: bool = False,
-        sync_to_cloud: bool = False,
-    ) -> MemoryFragment:
-        fragment = MemoryFragment(
-            fragment_id=f"mem-{uuid.uuid4().hex[:8]}",
-            customer_id=self.customer_id,
-            channel=channel,
-            timestamp=timestamp or datetime.now(timezone.utc),
-            day_label=day_label,
-            summary=summary,
-            metadata=metadata or {},
-            severity=severity,
-            session_id=session_id,
-            veracity_evaluation=veracity_evaluation,
-            is_compacted_summary=is_compacted_summary,
+    Worth noting because it differs from the engine-config shape above: a stored
+    memory carries `{"customMemoryTopicLabel": "TRAVEL_STATUS"}`, not a nested
+    object. Before this was handled, printed memories read
+    `topics {'customMemoryTopicLabel': 'TRAVEL_STATUS'}` -- the dict `repr`,
+    stringified straight into the UI.
+    """
+    labels: list[str] = []
+    for topic in raw_topics or []:
+        if not isinstance(topic, dict):
+            labels.append(str(topic))
+            continue
+        label = (
+            topic.get("customMemoryTopicLabel")
+            or topic.get("managedMemoryTopicLabel")
+            or topic.get("label")
         )
-        self._fragments.append(fragment)
-        self._fragments.sort(key=lambda f: f.timestamp)
-        if sync_to_cloud:
-            self._sync_fragment_to_vertex_cloud(fragment)
-        return fragment
+        labels.append(label if label else json.dumps(topic, sort_keys=True))
+    return labels
 
-    def get_fragments(self) -> List[MemoryFragment]:
-        return list(self._fragments)
 
-    def retrieve_relevant_memories(
+@dataclass(frozen=True)
+class GeneratedMemory:
+    """One outcome of a `generateMemories` call.
+
+    `action` is the service's verdict on this fact relative to what it already
+    held: it created something new, updated something that existed, or deleted
+    something the new turns contradicted.
+    """
+
+    memory: Memory
+    action: str
+
+    @classmethod
+    def from_api(cls, payload: dict) -> "GeneratedMemory":
+        return cls(
+            memory=Memory.from_api(payload.get("memory", {})),
+            action=payload.get("action", "UNSPECIFIED"),
+        )
+
+    def to_dict(self) -> dict:
+        return {"action": self.action, "memory": self.memory.to_dict()}
+
+
+@dataclass
+class RetrievalResult:
+    """The outcome of one retrieval, with enough context to audit it."""
+
+    memories: list[Memory]
+    scope: dict
+    query: Optional[str]
+    top_k: Optional[int]
+    latency_ms: Provenanced
+    request_body: dict = field(default_factory=dict)
+
+    def facts(self) -> list[str]:
+        return [m.fact for m in self.memories]
+
+    def ids(self) -> list[str]:
+        return [m.memory_id for m in self.memories]
+
+    def to_dict(self) -> dict:
+        return {
+            "scope": self.scope,
+            "query": self.query,
+            "top_k": self.top_k,
+            "count": len(self.memories),
+            "latency_ms": self.latency_ms.to_dict(),
+            "memories": [m.to_dict() for m in self.memories],
+            "request_body": self.request_body,
+        }
+
+
+@dataclass
+class GenerateResult:
+    """The outcome of one `generateMemories` call."""
+
+    operation: str
+    done: bool
+    generated: list[GeneratedMemory]
+    scope: dict
+    latency_ms: Provenanced
+    raw_response: dict = field(default_factory=dict)
+
+    @property
+    def wrote_nothing(self) -> bool:
+        """True when the service completed and chose to store nothing.
+
+        This is a real and frequent outcome, not an error, and it is the single
+        most informative thing `generate` does. A completed operation with no
+        `response` body means every candidate fact in the transcript was
+        rejected -- see `memory_eval/write_policy.py`, which is built on it.
+        """
+        return self.done and not self.generated
+
+    def by_action(self, action: str) -> list[GeneratedMemory]:
+        return [g for g in self.generated if g.action == action]
+
+    def to_dict(self) -> dict:
+        return {
+            "operation": self.operation,
+            "done": self.done,
+            "scope": self.scope,
+            "wrote_nothing": self.wrote_nothing,
+            "generated_count": len(self.generated),
+            "generated": [g.to_dict() for g in self.generated],
+            "latency_ms": self.latency_ms.to_dict(),
+        }
+
+
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
+
+
+class MemoryBankClient:
+    """REST client for one Agent Engine Memory Bank.
+
+    Deliberately not a singleton and deliberately not seeded. Constructing it
+    performs no I/O and creates no data; the previous implementation called
+    `seed_default_scenario()` from `__init__`, which meant that merely *reading*
+    the bank invented fragments in it.
+    """
+
+    def __init__(
         self,
-        query: str,
-        top_k: int = 5,
-        channel_filter: Optional[BankChannel] = None,
-    ) -> Dict[str, Any]:
+        cfg: Optional[Settings] = None,
+        credentials: Any = None,
+        session: Optional[requests.Session] = None,
+        timeout_s: float = 60.0,
+    ) -> None:
+        self.cfg = cfg or load_settings()
+        self.timeout_s = timeout_s
+        self._session = session or requests.Session()
+        self._credentials = credentials
+        self._engine_cache: Optional[dict] = None
+
+    # -- plumbing ----------------------------------------------------------
+
+    @property
+    def engine(self) -> str:
+        return self.cfg.agent_engine_resource
+
+    def _base(self) -> str:
+        return f"{self.cfg.aiplatform_endpoint}/{API_VERSION}"
+
+    def _token(self) -> str:
+        if self._credentials is None:
+            self._credentials, _ = google.auth.default(scopes=list(SCOPES))
+        if not self._credentials.valid:
+            self._credentials.refresh(google.auth.transport.requests.Request())
+        return self._credentials.token
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ) -> dict:
+        url = path if path.startswith("http") else f"{self._base()}/{path.lstrip('/')}"
+        headers = {
+            "Authorization": f"Bearer {self._token()}",
+            "Content-Type": "application/json",
+        }
+        log.debug("-> %s %s body=%s", method, url, json.dumps(body or {})[:1000])
+        try:
+            resp = self._session.request(
+                method,
+                url,
+                headers=headers,
+                json=body,
+                params=params,
+                timeout=self.timeout_s,
+            )
+        except requests.RequestException as exc:
+            raise MemoryBankError(f"{method} {url} failed: {exc}", url=url) from exc
+
+        if resp.status_code >= 400:
+            raise MemoryBankError(
+                f"{method} {url} returned HTTP {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text,
+                url=url,
+            )
+        if not resp.content:
+            return {}
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise MemoryBankError(
+                f"{method} {url} returned non-JSON body", status=resp.status_code, body=resp.text, url=url
+            ) from exc
+
+    # -- engine configuration ---------------------------------------------
+
+    def get_engine(self, refresh: bool = False) -> dict:
+        """Fetch the reasoning engine resource, including its memory config."""
+        if self._engine_cache is None or refresh:
+            self._engine_cache = self._request("GET", self.engine)
+        return self._engine_cache
+
+    def memory_topics(self, refresh: bool = False) -> list[MemoryTopic]:
+        """The engine's topic vocabulary, read live.
+
+        Read from the engine rather than restated in Python on purpose. A topic
+        added in the console shows up here on the next call; a hardcoded copy
+        would drift the moment anyone touched the configuration, and drift in a
+        *vocabulary* is invisible -- the code keeps working and quietly stops
+        agreeing with the service.
         """
-        Semantic & Temporal Vector Memory Retrieval:
-        Computes real 768-dim Vertex AI text-embedding-005 embeddings for the query and ranks
-        Memory Bank fragments using exact cosine similarity combined with severity and recency.
-        Also queries the live Google Cloud VertexAiMemoryBankService (reasoningEngines/915213137995628544).
+        engine = self.get_engine(refresh=refresh)
+        configs = (
+            engine.get("contextSpec", {})
+            .get("memoryBankConfig", {})
+            .get("customizationConfigs", [])
+        )
+        topics: list[MemoryTopic] = []
+        for conf in configs:
+            for raw in conf.get("memoryTopics", []):
+                topics.append(MemoryTopic.from_api(raw))
+        return topics
+
+    # -- reads -------------------------------------------------------------
+
+    def retrieve(
+        self,
+        scope: dict,
+        query: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ) -> RetrievalResult:
+        """Retrieve memories for a scope.
+
+        Two modes, and the difference is the whole point of the benchmark:
+
+        * `query` given -- similarity search. The service ranks by semantic
+          closeness and returns a `distance` per result. This is what an agent
+          uses mid-turn.
+        * `query` omitted -- scope-only retrieval. Everything filed under the
+          scope, unranked. This is what establishes the denominator when you
+          want to know what recall a query *could* have achieved.
+
+        Args:
+            scope: the partition key, e.g. `{"customer_id": "CUST00001"}`.
+                Scope is an exact-match filter, not a hint -- see
+                `docs/MEMORY_BANK_EVIDENCE.md` on why that makes it the harder
+                of the two write controls.
+            query: natural-language search string.
+            top_k: cap on results. Only meaningful with `query`.
         """
-        candidates = [
-            f for f in self._fragments
-            if channel_filter is None or f.channel == channel_filter
+        body: dict[str, Any] = {"scope": dict(scope)}
+        if query:
+            params: dict[str, Any] = {"searchQuery": query}
+            if top_k is not None:
+                params["topK"] = top_k
+            body["similaritySearchParams"] = params
+        else:
+            body["simpleRetrievalParams"] = {"pageSize": top_k or 100}
+
+        started = time.perf_counter()
+        payload = self._request("POST", f"{self.engine}/memories:retrieve", body=body)
+        elapsed = (time.perf_counter() - started) * 1000.0
+
+        memories = [
+            Memory.from_api(item.get("memory", {}), distance=item.get("distance"))
+            for item in payload.get("retrievedMemories", [])
         ]
+        return RetrievalResult(
+            memories=memories,
+            scope=dict(scope),
+            query=query,
+            top_k=top_k,
+            latency_ms=measured(round(elapsed, 1), unit="ms", source="memories:retrieve"),
+            request_body=body,
+        )
 
-        query_vec = self._get_embedding(query)
-        scored_fragments: List[tuple[float, MemoryFragment, float]] = []
+    def list_memories(self, scope: Optional[dict] = None, page_size: int = 100) -> list[Memory]:
+        """List memories, optionally filtered to a scope.
 
-        for idx, frag in enumerate(candidates):
-            text_blob = f"{frag.day_label} {frag.channel.value} {frag.summary} {frag.metadata}"
-            frag_vec = self._get_embedding(text_blob)
-            if query_vec is not None and frag_vec is not None:
-                cosine_sim = _cosine_similarity(query_vec, frag_vec)
-            else:
-                query_terms = [t.lower() for t in query.split() if len(t) > 2]
-                hits = sum(1 for term in query_terms if term in text_blob.lower())
-                cosine_sim = min(0.95, 0.45 + (hits * 0.15))
+        Pages to exhaustion. The corpus here is small, but a benchmark that
+        silently measured recall against only the first page would be worse than
+        no benchmark.
+        """
+        params: dict[str, Any] = {"pageSize": page_size}
+        if scope:
+            clauses = [f'scope.{k}="{v}"' for k, v in sorted(scope.items())]
+            params["filter"] = " AND ".join(clauses)
 
-            severity_weight = {
-                SeverityLevel.CRITICAL: 0.12,
-                SeverityLevel.HIGH: 0.08,
-                SeverityLevel.MEDIUM: 0.04,
-                SeverityLevel.LOW: 0.01,
-            }.get(frag.severity, 0.04)
-            recency_bonus = (idx + 1) * 0.01
-            composite_score = cosine_sim + severity_weight + recency_bonus
-            scored_fragments.append((composite_score, frag, cosine_sim))
+        out: list[Memory] = []
+        token: Optional[str] = None
+        while True:
+            if token:
+                params["pageToken"] = token
+            payload = self._request("GET", f"{self.engine}/memories", params=params)
+            out.extend(Memory.from_api(m) for m in payload.get("memories", []))
+            token = payload.get("nextPageToken")
+            if not token:
+                return out
 
-        scored_fragments.sort(key=lambda item: item[0], reverse=True)
-        selected_tuples = scored_fragments[:top_k]
-        selected_tuples.sort(key=lambda item: item[1].timestamp)
+    def get_memory(self, name: str) -> Memory:
+        """Fetch one memory by resource name or bare id."""
+        path = name if "/" in name else f"{self.engine}/memories/{name}"
+        return Memory.from_api(self._request("GET", path))
 
-        retrieved_dicts = []
-        for comp_score, frag, cos_sim in selected_tuples:
-            d = frag.to_display_dict()
-            d["cosine_similarity"] = round(cos_sim, 4)
-            d["composite_rank_score"] = round(comp_score, 4)
-            d["embedding_model"] = "text-embedding-005 (768-dim Vertex AI)"
-            retrieved_dicts.append(d)
+    # -- writes ------------------------------------------------------------
 
-        cloud_memories_found = 0
-        svc = self.vertex_mb_service
-        if svc is not None:
-            try:
-                loop = asyncio.new_event_loop()
-                try:
-                    cloud_res = loop.run_until_complete(
-                        svc.search_memory(
-                            app_name="jpmc_consumer_credit",
-                            user_id=self.customer_id,
-                            query=query,
-                        )
+    def create_memory(
+        self,
+        fact: str,
+        scope: dict,
+        topics: Optional[Sequence[str]] = None,
+        wait: bool = True,
+        timeout_s: float = 120.0,
+    ) -> Memory:
+        """Store a fact verbatim. The *caller* decides what is worth keeping.
+
+        This is the honest baseline against which `generate_from_conversation`
+        is measured. It performs no extraction, no consolidation and no
+        filtering: whatever string you pass is what ends up in the bank, topic
+        labels and all. Useful for seeding a benchmark with known ground truth,
+        and a poor choice for ingesting conversations, because it will happily
+        store "what is the weather today".
+        """
+        body: dict[str, Any] = {"fact": fact, "scope": dict(scope)}
+        if topics:
+            body["topics"] = [{"customMemoryTopicLabel": t} for t in topics]
+
+        payload = self._request("POST", f"{self.engine}/memories", body=body)
+        if not wait or payload.get("done"):
+            inner = payload.get("response", payload)
+            return Memory.from_api(inner)
+
+        operation = self._await_operation(payload.get("name", ""), timeout_s=timeout_s)
+        return Memory.from_api(operation.get("response", {}))
+
+    def generate_from_conversation(
+        self,
+        turns: Sequence[dict],
+        scope: dict,
+        wait: bool = True,
+        timeout_s: float = 180.0,
+        poll_interval_s: float = 2.0,
+    ) -> GenerateResult:
+        """Hand raw conversation turns to the service and let *it* decide.
+
+        This is the "intelligent write". The service reads the turns, decides
+        which statements are durable facts about this scope, discards the rest,
+        reconciles them against memories it already holds, and assigns a topic
+        from the engine's vocabulary.
+
+        Three outcomes are worth distinguishing, and all three are visible in
+        the result:
+
+        * `CREATED`   -- a new fact the bank did not have.
+        * `UPDATED`   -- an existing memory revised. This is consolidation: the
+          service recognised the same underlying fact and rewrote it rather than
+          storing a near-duplicate.
+        * `DELETED`   -- an existing memory the new turns contradicted.
+
+        And the fourth, which has no entry at all: a completed operation with an
+        empty response, meaning **nothing in the transcript qualified**. That is
+        `wrote_nothing`, and it is not a failure.
+
+        Args:
+            turns: `[{"role": "user"|"model", "text": "..."}]`, or raw
+                `{"content": {...}}` events, which are passed through untouched.
+            scope: the partition to write under.
+            wait: poll the long-running operation to completion. With
+                `wait=False` the call returns in milliseconds and the extraction
+                happens server-side afterwards -- which is the right choice on a
+                user-facing turn, and the wrong one for a measurement.
+        """
+        events = [_as_event(t) for t in turns]
+        body = {"scope": dict(scope), "directContentsSource": {"events": events}}
+
+        started = time.perf_counter()
+        payload = self._request("POST", f"{self.engine}/memories:generate", body=body)
+        op_name = payload.get("name", "")
+
+        if not wait:
+            elapsed = (time.perf_counter() - started) * 1000.0
+            return GenerateResult(
+                operation=op_name,
+                done=False,
+                generated=[],
+                scope=dict(scope),
+                latency_ms=measured(round(elapsed, 1), unit="ms", source="memories:generate (async)"),
+                raw_response=payload,
+            )
+
+        operation = self._await_operation(op_name, timeout_s=timeout_s, poll_interval_s=poll_interval_s)
+        elapsed = (time.perf_counter() - started) * 1000.0
+
+        response = operation.get("response", {}) or {}
+        generated = [
+            GeneratedMemory.from_api(item) for item in response.get("generatedMemories", [])
+        ]
+        return GenerateResult(
+            operation=op_name,
+            done=bool(operation.get("done")),
+            generated=generated,
+            scope=dict(scope),
+            latency_ms=measured(round(elapsed, 1), unit="ms", source="memories:generate"),
+            raw_response=operation,
+        )
+
+    def delete_memory(self, name: str) -> None:
+        """Delete one memory. Used by the evaluation harness to clean up after
+        itself; never called from the request path."""
+        path = name if "/" in name else f"{self.engine}/memories/{name}"
+        self._request("DELETE", path)
+
+    def delete_scope(self, scope: dict) -> int:
+        """Delete every memory in a scope. Returns the count removed.
+
+        Only ever pointed at the harness's own throwaway scopes. It is a real
+        deletion with no undo, so it takes an explicit scope and refuses an
+        empty one rather than defaulting to "everything".
+        """
+        if not scope:
+            raise ValueError(
+                "delete_scope requires an explicit scope; refusing to delete the whole bank."
+            )
+        memories = self.list_memories(scope=scope)
+        for memory in memories:
+            self.delete_memory(memory.name)
+        return len(memories)
+
+    # -- operations --------------------------------------------------------
+
+    def _await_operation(
+        self,
+        name: str,
+        timeout_s: float = 180.0,
+        poll_interval_s: float = 2.0,
+    ) -> dict:
+        """Poll a long-running operation until it reports done.
+
+        Raises on timeout rather than returning a partial result. A generate
+        that has not finished has written an unknown amount, and treating that
+        as "wrote nothing" would corrupt every measurement downstream.
+        """
+        if not name:
+            raise MemoryBankError("operation name missing from response")
+        deadline = time.monotonic() + timeout_s
+        while True:
+            operation = self._request("GET", name)
+            if operation.get("done"):
+                if "error" in operation:
+                    err = operation["error"]
+                    raise MemoryBankError(
+                        f"operation {name} failed: {err.get('message', err)}",
+                        body=json.dumps(err),
                     )
-                    cloud_memories_found = len(cloud_res.memories) if cloud_res and cloud_res.memories else 0
-                finally:
-                    loop.close()
-            except Exception as e:
-                logging.debug("Cloud search_memory query info: %s", e)
-
-        try:
-            client = self._get_genai_client()
-            raw_tokens_res = client.models.count_tokens(
-                model="gemini-2.5-flash",
-                contents=self.get_formatted_context(),
-            )
-            current_bank_tokens = raw_tokens_res.total_tokens or 620
-        except Exception:
-            current_bank_tokens = len(self.get_formatted_context().split()) * 2
-
-        full_3yr_uncompacted_tokens = current_bank_tokens + 13800
-        retrieved_text = "\n".join(f["summary"] for f in retrieved_dicts)
-        try:
-            client = self._get_genai_client()
-            ret_tokens_res = client.models.count_tokens(
-                model="gemini-2.5-flash",
-                contents=retrieved_text or "empty",
-            )
-            retrieved_tokens = (ret_tokens_res.total_tokens or 120) + 140
-        except Exception:
-            retrieved_tokens = sum(len(f["summary"].split()) * 2 for f in retrieved_dicts) + 140
-
-        return {
-            "customer_id": self.customer_id,
-            "query": query,
-            "vertex_agent_engine_resource": f"projects/{self.project_id}/locations/{self.location}/reasoningEngines/{self.agent_engine_id}",
-            "cloud_vertex_memories_matched": cloud_memories_found,
-            "embedding_model": "text-embedding-005 (768-dim Vertex AI)",
-            "total_fragments_in_bank": len(self._fragments),
-            "retrieved_count": len(retrieved_dicts),
-            "retrieved_fragments": retrieved_dicts,
-            "tokenomics": {
-                "uncompacted_3yr_history_tokens": full_3yr_uncompacted_tokens,
-                "retrieved_context_tokens": retrieved_tokens,
-                "token_savings_pct": round((1.0 - (retrieved_tokens / max(1, full_3yr_uncompacted_tokens))) * 100, 1),
-            },
-        }
-
-    def compact_memories(self) -> CompactionReport:
-        """
-        Asynchronous Memory Compaction ('The Learning Loop & Dreaming Service'):
-        Uses live Vertex AI Gemini 2.5 Flash structured output (DynamicCompactionSchema) and
-        client.models.count_tokens() to consolidate multi-year historical interaction logs and
-        multi-channel breadcrumbs into a high-density semantic memory node.
-        """
-        historical_raw_turns = 32
-        current_fragments = len(self._fragments)
-        total_raw_fragments = historical_raw_turns + current_fragments
-
-        raw_context_text = self.get_formatted_context()
-        try:
-            client = self._get_genai_client()
-            raw_count_resp = client.models.count_tokens(
-                model="gemini-2.5-flash",
-                contents=raw_context_text,
-            )
-            measured_active_tokens = raw_count_resp.total_tokens or 650
-        except Exception:
-            measured_active_tokens = len(raw_context_text.split()) * 2
-
-        raw_token_count = measured_active_tokens + 14200
-
-        prompt = f"""You are the Vertex AI Memory Bank Asynchronous Compaction Engine ('Dreaming Service') for JPMC Consumer Credit.
-Consolidate the following multi-channel customer memory fragments for Customer ID `{self.customer_id}` along with 32 historical interaction turns into:
-1. `distilled_customer_insights`: 4 durable customer behavioral insights covering Travel Pattern, Channel & Wallet Preference, Security Anomaly / SIM-Swap Signature, and Root Card Lock State.
-2. `compacted_summary_narrative`: A high-density executive synthesis starting with '[DREAMING SERVICE COMPACTED NODE • 3-YEAR & 48-HR SYNTHESIS]: ' that captures all critical facts, timestamps, root lock causes, and exact recommended remediation.
-
-RAW MEMORY FRAGMENTS:
-{raw_context_text}
-"""
-        try:
-            client = self._get_genai_client()
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=DynamicCompactionSchema,
-                    temperature=0.1,
-                ),
-            )
-            parsed: DynamicCompactionSchema = response.parsed
-            if parsed and parsed.distilled_customer_insights and parsed.compacted_summary_narrative:
-                distilled_insights = parsed.distilled_customer_insights
-                compacted_narrative = parsed.compacted_summary_narrative
-            else:
-                raise ValueError("Empty parsed compaction output")
-        except Exception as e:
-            logging.warning("Live Gemini compaction fallback triggered: %s", e)
-            distilled_insights = [
-                "TRAVEL_PATTERN: Customer frequently travels to London, UK (active verified Travel Notice Sep 8-15); zero history or travel notice for Chicago, IL.",
-                "CHANNEL_PREFERENCE: High affinity for iOS Mobile App & Apple Pay digital wallet; repeatedly drops Voice IVR calls when prompted for SMS OTP.",
-                "SECURITY_ANOMALY_SIGNATURE: On Sep 7 (09:16 UTC), a $1,000.00 Chicago POS attempt triggered Step-Up SMS Y/N consent; 'Y' reply originated from Chicago IP/tower concurrent with NY MacBook session (high probability SIM-swap/eSIM clone).",
-                "ROOT_LOCK_STATE: Card *4821 remains SECURITY_LOCKED due to NY/Chicago velocity conflict; 1-click biometric FaceID verification in Mobile App is authorized to resolve lock and issue instant Virtual Card Number (VCN).",
-            ]
-            compacted_narrative = (
-                "[DREAMING SERVICE COMPACTED NODE • 3-YEAR & 48-HR SYNTHESIS]: "
-                "Alex Morgan (Sapphire Preferred *4821) is currently traveling in London, UK (verified Travel Notice). "
-                "Card *4821 was auto-locked on Day 1 after concurrent NY MacBook login and a $1,000 Chicago electronics charge "
-                "(approved via suspicious SMS 'Y' reply from Chicago IP while customer was in NY/en route to UK). "
-                "Subsequent Target ($142.50) and London Duty Free ($310.00) swipes plus Apple Pay provisioning failed due to this root lock. "
-                "Recommended Action: Biometric FaceID unlock + First-Party SIM-swap fraud dispute on $1,000 Chicago charge."
-            )
-
-        try:
-            client = self._get_genai_client()
-            cmp_count_resp = client.models.count_tokens(
-                model="gemini-2.5-flash",
-                contents=compacted_narrative + "\n" + "\n".join(distilled_insights),
-            )
-            compacted_token_count = (cmp_count_resp.total_tokens or 280) + 1450
-        except Exception:
-            compacted_token_count = 1780
-
-        reduction_pct = round((1.0 - (compacted_token_count / max(1, raw_token_count))) * 100, 1)
-        cost_savings_per_1m = round(((raw_token_count - compacted_token_count) / 1000.0) * 0.0025 * 1000000, 2)
-
-        already_compacted = any(f.is_compacted_summary for f in self._fragments)
-        if not already_compacted:
-            self.ingest_event(
-                channel=BankChannel.CORE_BANKING,
-                day_label="Dreaming Service • Compacted Node",
-                summary=compacted_narrative,
-                metadata={
-                    "compaction_service": "Vertex AI Memory Bank Dreaming Service (Gemini 2.5 Flash)",
-                    "vertex_agent_engine_id": self.agent_engine_id,
-                    "raw_fragments_consolidated": total_raw_fragments,
-                    "token_reduction_pct": f"{reduction_pct}%",
-                    "distilled_insights": distilled_insights,
-                },
-                severity=SeverityLevel.HIGH,
-                is_compacted_summary=True,
-                sync_to_cloud=True,
-            )
-
-        report = CompactionReport(
-            compaction_id=f"cmp-{uuid.uuid4().hex[:8]}",
-            customer_id=self.customer_id,
-            raw_fragments_processed=total_raw_fragments,
-            compacted_memory_nodes_created=1,
-            superseded_fragments_archived=historical_raw_turns,
-            raw_token_count=raw_token_count,
-            compacted_token_count=compacted_token_count,
-            token_reduction_pct=reduction_pct,
-            estimated_cost_savings_per_1m_queries_usd=cost_savings_per_1m,
-            distilled_customer_insights=distilled_insights,
-            compacted_summary_narrative=compacted_narrative,
-        )
-        self._last_compaction_report = report
-        return report
-
-    def seed_default_scenario(self) -> None:
-        """
-        Populate the initial cross-day multi-channel scenario observations:
-        - System 1 (Day 1, 09:15 UTC): Fraud Detection System flags NY/Chicago logins & $1,000 Chicago charge, locks card *4821.
-        - System 2 (Day 1, 14:32 UTC): Phone Support IVR records call about declined Target swipe ending before SMS 2FA.
-        - System 3 (Day 2, 11:20 UTC): Mobile App records failed Apple Pay setup & verified UK Travel Notice in London.
-        """
-        self.clear()
-        base_time = datetime(2026, 9, 7, 9, 15, 0, tzinfo=timezone.utc)
-
-        self.ingest_event(
-            channel=BankChannel.FRAUD_DETECTION,
-            day_label="Day 1 - 09:15 UTC",
-            summary=(
-                "FRAUD VELOCITY & STEP-UP ALERT: Concurrent session logins detected from New York, NY (IP 198.51.100.4) "
-                "and Chicago, IL (IP 203.0.113.19) within 9 minutes, accompanied by a $1,000.00 POS charge at Chicago Luxury Electronics "
-                "(initial attempt declined for Step-Up; retry approved after SMS 'Y' reply). Automated containment placed "
-                "Chase Sapphire Preferred (*4821) on SECURITY_LOCKED restriction."
-            ),
-            metadata={
-                "source_system": "RiskOps & Fraud Velocity Engine",
-                "risk_score": 92,
-                "action": "LOCK_CARD",
-                "affected_card": "Sapphire Preferred (*4821)",
-                "locations": ["New York, NY", "Chicago, IL"],
-                "chicago_tx_id": "tx-chi-1000-retry",
-                "trigger": "Geo-Velocity Mismatch + Step-Up Audit Flag",
-            },
-            severity=SeverityLevel.HIGH,
-            timestamp=base_time,
-            session_id="sess-fraud-0915",
-            veracity_evaluation=ClaimVeracityEvaluation(
-                claim_id="clm-init-01",
-                claim_text="System-initiated concurrent login and $1,000 Chicago step-up alert.",
-                veracity_status=VeracityStatus.VERIFIED_TRUE,
-                confidence_score=0.99,
-                corroborating_telemetry=[
-                    "IP 198.51.100.4 (NY MacBook)",
-                    "IP 203.0.113.19 (Chicago Windows/SMS)",
-                    "POS Charge $1,000.00 @ Chicago Luxury Electronics (consent-chi-1000)",
-                ],
-            ),
-        )
-
-        self.ingest_event(
-            channel=BankChannel.TELEPHONY_IVR,
-            day_label="Day 1 - 14:32 UTC",
-            summary=(
-                "INBOUND IVR CALL LOG: Customer called automated telephony banking regarding a declined $142.50 in-store "
-                "POS transaction at Target. Telephony system initiated SMS OTP two-factor verification. Call disconnected "
-                "prior to passcode entry. Verification incomplete; restriction on card (*4821) remains active."
-            ),
-            metadata={
-                "source_system": "Contact Center Voice IVR",
-                "call_duration_sec": 48,
-                "merchant": "Target Store #1142",
-                "amount": "$142.50",
-                "status": "DISCONNECTED_PRE_AUTH",
-                "affected_card": "Sapphire Preferred (*4821)",
-            },
-            severity=SeverityLevel.MEDIUM,
-            timestamp=base_time + timedelta(hours=5, minutes=17),
-            session_id="sess-ivr-1432",
-            veracity_evaluation=ClaimVeracityEvaluation(
-                claim_id="clm-init-02",
-                claim_text="Caller inquired about Target decline; call dropped before OTP.",
-                veracity_status=VeracityStatus.VERIFIED_TRUE,
-                confidence_score=0.98,
-                corroborating_telemetry=["IVR call duration 48s", "SMS OTP dispatched to +1-212-555-0198"],
-            ),
-        )
-
-        self.ingest_event(
-            channel=BankChannel.MOBILE_APP,
-            day_label="Day 2 - 11:20 UTC",
-            summary=(
-                "MOBILE WALLET TOKENIZATION FAILED: Customer (currently in London, UK per verified Travel Notice trv-lon-2026) "
-                "attempted to add card (*4821) to Apple Pay wallet on iPhone 16 Pro (iOS v14.8.2) after a declined £245/$310 swipe "
-                "at Heathrow Duty Free. Provisioning rejected with error 'CARD_STATUS_LOCKED_RESTRICTED'."
-            ),
-            metadata={
-                "source_system": "Mobile iOS Banking Client",
-                "wallet_type": "Apple Pay",
-                "error_code": "CARD_STATUS_LOCKED_RESTRICTED",
-                "device": "iPhone 16 Pro",
-                "verified_travel_notice": "London, UK (trv-lon-2026)",
-                "affected_card": "Sapphire Preferred (*4821)",
-            },
-            severity=SeverityLevel.MEDIUM,
-            timestamp=base_time + timedelta(days=1, hours=2, minutes=5),
-            session_id="sess-mobile-1120",
-            veracity_evaluation=ClaimVeracityEvaluation(
-                claim_id="clm-init-03",
-                claim_text="Apple Pay provisioning failed in London due to locked card restriction.",
-                veracity_status=VeracityStatus.VERIFIED_TRUE,
-                confidence_score=0.99,
-                corroborating_telemetry=[
-                    "iOS gateway response CARD_STATUS_LOCKED_RESTRICTED",
-                    "Active Travel Notice trv-lon-2026 (London, UK)",
-                ],
-            ),
-        )
-
-    def get_formatted_context(self) -> str:
-        """Format notes into structured markdown context for the Gemini Enterprise synthesizer."""
-        if not self._fragments:
-            return "No prior memory records found for this customer."
-
-        lines = [f"### MEMORY BANK NOTES FOR CUSTOMER: {self.customer_id}"]
-        for idx, frag in enumerate(self._fragments, 1):
-            veracity_info = ""
-            if frag.veracity_evaluation:
-                veracity_info = (
-                    f" | Veracity: {frag.veracity_evaluation.veracity_status.value} "
-                    f"({int(frag.veracity_evaluation.confidence_score * 100)}%)"
+                return operation
+            if time.monotonic() > deadline:
+                raise MemoryBankError(
+                    f"operation {name} did not complete within {timeout_s:.0f}s. "
+                    f"Not treating this as 'wrote nothing' -- the write may still land."
                 )
-            compacted_tag = " [COMPACTED SUMMARY]" if frag.is_compacted_summary else ""
-            lines.append(
-                f"\n[Note {idx}]{compacted_tag} Timestamp: {frag.day_label} | System: {frag.channel.value} | Severity: {frag.severity.value}{veracity_info}\n"
-                f"Summary: {frag.summary}\n"
-                f"Metadata: {frag.metadata}"
-            )
-        return "\n".join(lines)
+            time.sleep(poll_interval_s)
 
 
-class StandaloneMemoryBankClient:
+def _as_event(turn: Any) -> dict:
+    """Coerce a turn into the `events[].content` shape the API expects."""
+    if isinstance(turn, dict) and "content" in turn:
+        return turn
+    if isinstance(turn, dict):
+        role = turn.get("role", "user")
+        text = turn.get("text", turn.get("content", ""))
+        return {"content": {"role": role, "parts": [{"text": text}]}}
+    return {"content": {"role": "user", "parts": [{"text": str(turn)}]}}
+
+
+def describe_unavailable(exc: MemoryBankError) -> Provenanced:
+    """Turn a failure into a value that admits it is a failure.
+
+    Used at call sites that must return *something*. The something is `n/r`
+    carrying the real HTTP body -- not an empty list, which a reader would
+    correctly interpret as "the bank is empty" rather than "we could not ask".
     """
-    Framework-Agnostic Standalone Client SDK for Vertex AI Memory Bank & Knowledge Catalog.
-    Demonstrates how non-ADK agents (e.g., LangGraph, CrewAI, AutoGen, custom Java/Python services on AWS)
-    can consume Google's Memory Bank and Knowledge Catalog directly without other Agent Builder components.
-    """
-
-    def __init__(self, customer_id: str = "cust_jpmc_88329"):
-        self.customer_id = customer_id
-        self._mb = CustomerMemoryBank(customer_id=customer_id)
-
-    def preload_context_for_external_agent(self, user_query: str, framework_name: str = "LangGraph") -> Dict[str, Any]:
-        retrieved = self._mb.retrieve_relevant_memories(query=user_query, top_k=4)
-        return {
-            "client_mode": "STANDALONE_MEMORY_BANK_API",
-            "vertex_agent_engine_resource": retrieved["vertex_agent_engine_resource"],
-            "embedding_model": retrieved["embedding_model"],
-            "caller_agent_framework": framework_name,
-            "customer_id": self.customer_id,
-            "retrieved_memories": retrieved["retrieved_fragments"],
-            "tokenomics": retrieved["tokenomics"],
-            "integration_note": (
-                f"Injected {retrieved['retrieved_count']} high-signal 768-dim Vertex AI Memory Bank vectors directly into "
-                f"{framework_name} state dictionary via REST/gRPC without requiring Vertex AI Agent Builder orchestration."
-            ),
-        }
+    return unmeasured(f"Memory Bank unavailable: {exc} :: {exc.body[:300]}")

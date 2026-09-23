@@ -1,0 +1,156 @@
+{
+  "benchmark_id": "ccb_fraud_desk_v1",
+  "description": "Retrieval probes for the consumer-credit fraud desk. Each probe is a question a human agent would actually need answered mid-call. Probes are content, not code: edit this file to change the benchmark, and nothing in backend/ needs to change.",
+  "notes": [
+    "No memory ids appear here. Ids are assigned by the service and change whenever the corpus is re-seeded, so a benchmark keyed on them would measure nothing after the first re-seed. Relevance is established at run time by labelling the whole in-scope corpus -- see backend/memory_eval/labeller.py.",
+    "anchor_terms drive the deterministic cross-check labeller. They are entity strings that a genuinely relevant memory would have to mention. They are deliberately a blunt instrument: they will miss paraphrase, and that is the point -- where the model judge and the anchors agree, the label is solid; where they diverge, the report says so rather than picking a winner.",
+    "expected_topics names the engine topic whose description covers the question. It is not used to filter retrieval -- the service does not support topic filtering -- it is used to test whether phrasing a query in the vocabulary the memories were filed under improves recall."
+  ],
+  "scope_key": "customer_id",
+  "probes": [
+    {
+      "probe_id": "travel_return",
+      "question": "When did this customer get back from their trip, and where were they?",
+      "intent": "An agent needs the actual return date, not the declared end date, before assuming the customer is still abroad.",
+      "expected_topics": ["TRAVEL_STATUS"],
+      "anchor_terms": ["returned early", "return", "Lisbon", "New York", "September 10"],
+      "ground_truth_anchor": {
+        "golden_query": "travel_notices",
+        "fields": ["destination_city", "travel_end_date", "actual_return_date"],
+        "why": "travel_notices.actual_return_date is authoritative. A memory claiming a different return date is a reconciliation failure, not a retrieval failure."
+      }
+    },
+    {
+      "probe_id": "active_card",
+      "question": "Which card is active on this account right now, and what replaced what?",
+      "intent": "Before discussing a transaction the agent must know which instrument is live.",
+      "expected_topics": ["CARD_LIFECYCLE"],
+      "anchor_terms": ["7702", "4417", "replaced", "closed", "frozen"],
+      "ground_truth_anchor": {
+        "golden_query": "cards_for_customer",
+        "fields": ["card_id", "last_four", "status", "replaces_card_id", "replaced_by_card_id"],
+        "why": "cards.status and the replacement chain are authoritative for which card is live."
+      }
+    },
+    {
+      "probe_id": "contact_channel",
+      "question": "How does this customer want to be contacted, and about what?",
+      "intent": "Standing contact preference governs how the agent follows up.",
+      "expected_topics": ["CONTACT_PREFERENCE"],
+      "anchor_terms": ["SMS", "email", "notification", "alert", "mobile phone"],
+      "ground_truth_anchor": {
+        "golden_query": "standing_instructions",
+        "fields": ["preferred_channel", "standing_instructions"],
+        "why": "customers.preferred_channel is the system of record; the memory should not contradict it."
+      }
+    },
+    {
+      "probe_id": "bank_promises",
+      "question": "What has the bank already promised this customer, and by when?",
+      "intent": "An agent must not re-promise or contradict a commitment made on a previous contact.",
+      "expected_topics": ["AGENT_COMMITMENTS"],
+      "anchor_terms": ["agent added a note", "scheduled", "by the 9th", "callback", "provisional credit"],
+      "ground_truth_anchor": {
+        "golden_query": "dispute_timeline",
+        "fields": ["event_type", "event_detail", "event_timestamp"],
+        "why": "dispute_events records what the bank actually did, against which a promise can be checked."
+      }
+    },
+    {
+      "probe_id": "wallet_devices",
+      "question": "Which devices and wallets can currently spend on this customer's cards?",
+      "intent": "A revoked token on a stolen phone is the difference between a safe account and an open one.",
+      "expected_topics": ["DEVICE_WALLET_INVENTORY"],
+      "anchor_terms": ["Google Pay", "Apple Pay", "token", "revoked", "Android", "phone"],
+      "ground_truth_anchor": {
+        "golden_query": "wallet_tokens",
+        "fields": ["wallet_provider", "device_name", "token_status", "revoked_at"],
+        "why": "wallet_tokens.token_status is authoritative for whether a token can still spend."
+      }
+    },
+    {
+      "probe_id": "disputed_charges",
+      "question": "What charges has this customer disputed, and what happened to each?",
+      "intent": "The core of the call. Needs the merchant, the amount and the current state of each dispute.",
+      "expected_topics": ["DISPUTE_HISTORY"],
+      "anchor_terms": ["dispute", "412", "90", "Casa Verde", "pharmacy", "unauthorized"],
+      "ground_truth_anchor": {
+        "golden_query": "disputed_amounts",
+        "fields": ["dispute_id", "disputed_amount", "status"],
+        "why": "disputes.disputed_amount is authoritative for money. Memory is not a second source of truth for an amount."
+      }
+    },
+    {
+      "probe_id": "why_card_closed",
+      "question": "Why was the previous card closed?",
+      "intent": "Distinguishes a theft-driven closure from an expiry or a fraud-team freeze.",
+      "expected_topics": ["CARD_LIFECYCLE", "TRAVEL_STATUS"],
+      "anchor_terms": ["stolen", "theft", "cafe", "closed", "frozen", "4417"],
+      "ground_truth_anchor": {
+        "golden_query": "cards_for_customer",
+        "fields": ["status", "freeze_reason"],
+        "why": "cards.freeze_reason states the recorded cause."
+      }
+    },
+    {
+      "probe_id": "delivery_address",
+      "question": "Where was the replacement card being sent?",
+      "intent": "A card posted to a hotel the customer has already left is a live fraud exposure.",
+      "expected_topics": ["TRAVEL_STATUS"],
+      "anchor_terms": ["Alfama", "hotel", "courier", "delivered", "mail", "room 612"],
+      "ground_truth_anchor": {
+        "golden_query": "dispute_timeline",
+        "fields": ["shipment_destination_type", "shipment_destination_country", "shipment_tracking_id"],
+        "why": "dispute_events records the shipment destination actually used."
+      }
+    },
+    {
+      "probe_id": "provisional_credit_status",
+      "question": "Has provisional credit been issued, and when is it due?",
+      "intent": "A regulatory deadline question. The answer differs by regulation path.",
+      "expected_topics": ["DISPUTE_HISTORY", "AGENT_COMMITMENTS"],
+      "anchor_terms": ["provisional credit", "October 20", "by the 9th", "credit"],
+      "ground_truth_anchor": {
+        "golden_query": "open_disputes",
+        "fields": ["regulation_path", "provisional_credit_issued", "provisional_credit_date", "provisional_credit_due_date"],
+        "why": "disputes.provisional_credit_date is authoritative. Reg Z disputes have no provisional credit requirement at all, so an absent date is an answer, not a gap."
+      }
+    },
+    {
+      "probe_id": "london_distractor",
+      "question": "Did this customer travel to London?",
+      "intent": "A deliberate trap. One memory in the corpus says London; the travel_notices table says Lisbon. This probe tests whether retrieval surfaces the contradicted memory, and whether the reconciler then catches it. High retrieval recall here is correct behaviour; presenting the memory as fact is not.",
+      "expected_topics": ["TRAVEL_STATUS"],
+      "anchor_terms": ["London"],
+      "ground_truth_anchor": {
+        "golden_query": "travel_notices",
+        "fields": ["destination_city", "destination_country"],
+        "why": "There is no London travel notice. Retrieval should find the memory; the desk should not repeat it."
+      }
+    },
+    {
+      "probe_id": "credit_limit_negative",
+      "question": "What is this customer's credit limit and current statement balance?",
+      "intent": "A deliberate negative probe. Nothing in the memory corpus answers this, because a credit limit is warehouse data and does not belong in a memory bank. Retrieval will still return k results -- it always does -- so this probe measures how much irrelevant material a fixed top_k forces into the context window.",
+      "expected_topics": [],
+      "anchor_terms": ["credit limit", "statement balance", "available credit"],
+      "ground_truth_anchor": {
+        "golden_query": "customer_360",
+        "fields": ["approved_amount_usd_90d", "open_accounts"],
+        "why": "This lives in BigQuery. A memory bank that answered it would be storing something it has no business storing."
+      }
+    },
+    {
+      "probe_id": "blocked_attempt",
+      "question": "Was there an attempted charge that was blocked rather than completed?",
+      "intent": "Tests recall of a detail buried mid-sentence in a long consolidated memory rather than stated as its own fact.",
+      "expected_topics": ["DISPUTE_HISTORY"],
+      "anchor_terms": ["blocked", "210", "phone shop", "attempt"],
+      "ground_truth_anchor": {
+        "golden_query": "recent_authorizations",
+        "fields": ["decision", "decline_reason", "amount", "merchant_name"],
+        "why": "authorizations.decision distinguishes a blocked attempt from a posted charge."
+      }
+    }
+  ]
+}
