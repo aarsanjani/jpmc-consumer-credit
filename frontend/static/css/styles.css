@@ -160,12 +160,31 @@ code {
   background: var(--good);
   flex: none;
   animation: none;
+  font-size: 0;
+  line-height: 0;
 }
 
 .livebar .pulse.running,
 .pulse.running {
+  width: 7px;
+  height: 7px;
   background: var(--pink);
   animation: blink 1s steps(2) infinite;
+  font-size: 0;
+  line-height: 0;
+}
+
+.livebar .pulse.idle,
+.pulse.idle {
+  width: auto;
+  height: auto;
+  background: transparent;
+  color: var(--lime);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  animation: none;
 }
 
 @keyframes blink {

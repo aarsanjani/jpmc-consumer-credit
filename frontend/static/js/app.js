@@ -447,6 +447,32 @@ let LAST_TRACED_SPANS = [];
 let LAST_TRACED_RUN_ID = "";
 let ALL_DESK_AGENTS = [];
 
+const FALLBACK_DESK_AGENTS = [
+  { agent_id: "01_fraud_monitoring_agent", name: "fraud_monitoring_agent" },
+  { agent_id: "02_telephony_ivr_agent", name: "telephony_ivr_agent" },
+  { agent_id: "03_mobile_app_agent", name: "mobile_app_agent" },
+  { agent_id: "04_web_portal_agent", name: "web_portal_agent" },
+  { agent_id: "05_branch_support_agent", name: "branch_support_agent" },
+  { agent_id: "06_claim_veracity_validator_agent", name: "claim_veracity_validator_agent" },
+  { agent_id: "07_memory_bank_audit_agent", name: "memory_bank_audit_agent" },
+  { agent_id: "08_consumer_credit_synthesizer_agent", name: "consumer_credit_synthesizer_agent" },
+];
+
+function setLivePulseState(mode) {
+  const pulse = document.getElementById("livePulse") || document.querySelector(".livebar .pulse");
+  if (!pulse) return;
+  if (mode === "running") {
+    pulse.className = "pulse running";
+    pulse.textContent = "";
+  } else if (mode === "done") {
+    pulse.className = "pulse done";
+    pulse.textContent = "";
+  } else {
+    pulse.className = "pulse idle";
+    pulse.textContent = ">";
+  }
+}
+
 function syncTraceBarVisibility() {
   const pickwrap = $("pickwrap");
   const traceBtn = $("traceBtn");
@@ -458,6 +484,10 @@ function syncTraceBarVisibility() {
   if (traceBtn) traceBtn.hidden = !hasLogged;
   if (!hasLogged) {
     if (drop) drop.hidden = true;
+    const pulse = document.getElementById("livePulse") || document.querySelector(".livebar .pulse");
+    if (!pulse || !pulse.classList.contains("running")) {
+      setLivePulseState("idle");
+    }
     const kind = $("biKind");
     const text = $("biText");
     const metrics = $("biMetrics");
@@ -472,13 +502,22 @@ function syncTraceBarVisibility() {
     if (metrics) {
       metrics.innerHTML = "";
     }
-  } else if (menuTitle) {
-    menuTitle.textContent = `Run ${LAST_TRACED_RUN_ID || "live"} · ${AGENTS.length} logged agent(s)`;
+  } else {
+    const pulse = document.getElementById("livePulse") || document.querySelector(".livebar .pulse");
+    if (!pulse || !pulse.classList.contains("running")) {
+      setLivePulseState("done");
+    }
+    if (menuTitle) {
+      menuTitle.textContent = `Run ${LAST_TRACED_RUN_ID || "live"} · ${AGENTS.length} logged agent(s)`;
+    }
   }
 }
 
 function buildDeskAgentEntries(summary, rawSpans, runId) {
-  const deskAgents = (summary && Array.isArray(summary.agents)) ? summary.agents : [];
+  const deskAgents =
+    summary && Array.isArray(summary.agents) && summary.agents.length
+      ? summary.agents
+      : FALLBACK_DESK_AGENTS;
   const channelMap = {};
   if (summary && summary.snapshot && Array.isArray(summary.snapshot.channels)) {
     summary.snapshot.channels.forEach((ch) => {
@@ -652,6 +691,7 @@ async function fetchAndRenderTrace(runId) {
       { deny: 0, sql: 0, jobs: 0 }
     );
 
+    setLivePulseState("done");
     setAgentCountText(AGENTS.length + " / 8 active · " + spans.length + " spans");
     setRunMetaText(runMeta + " · " + AGENTS.length + " logged agent(s) · " + spans.length + " live spans · " + wall);
     setStampText(runMeta + " · " + wall + " · ad-hoc SQL " + totals.sql);
@@ -662,8 +702,10 @@ async function fetchAndRenderTrace(runId) {
     syncTraceBarVisibility();
     buildMenu();
     if (AGENTS.length) {
-      pick(0);
-      setTrace(true);
+      // Pick the synthesizer or first logged agent to display in the black bar readout,
+      // and pre-render #body inside #drop WITHOUT auto-expanding #drop!
+      const synthIdx = AGENTS.findIndex((a) => a.name === "consumer_credit_synthesizer_agent");
+      pick(synthIdx >= 0 ? synthIdx : 0);
     }
     renderRoster();
     renderGovernanceTraps(spans);
@@ -1071,7 +1113,7 @@ function renderGovernanceTraps(spans) {
         )
         .join("");
       applyScenario(STATE.scenario, { rerun: false });
-      sel.addEventListener("change", () => applyScenario(sel.value, { rerun: true }));
+      sel.addEventListener("change", () => applyScenario(sel.value, { rerun: false }));
     } catch (err) {
       console.error("loadScenarios failed", err);
       sel.innerHTML = "<option value=''>n/r — scenarios unavailable</option>";
@@ -1084,6 +1126,11 @@ function renderGovernanceTraps(spans) {
     const spec = (STATE.scenarios || []).filter((s) => s.id === scenarioId)[0];
     if (!spec) return;
     STATE.scenario = scenarioId;
+    STATE.lastQuestion = spec.suggested_question;
+
+    // Never auto-expand the trace drawer when switching scenario presets.
+    closeMenu();
+    setTrace(false);
 
     const lede = $("heroLede");
     if (lede) lede.textContent = spec.lede;
@@ -1095,13 +1142,18 @@ function renderGovernanceTraps(spans) {
       chips[0].textContent = spec.label;
     }
     const askInput = $("askInput");
-    if (askInput) askInput.placeholder = spec.suggested_question;
+    if (askInput) {
+      askInput.placeholder = spec.suggested_question;
+      askInput.value = spec.suggested_question;
+    }
 
     // Show the plan that will run, so the operator knows what to expect.
     const planned = (spec.avenues || [])
       .map((a) => a.probe_kind + " · " + a.probe_target)
       .join("  |  ");
-    setRunMetaText(spec.avenues.length + " avenues planned · " + planned);
+    setRunMetaText(
+      `Scenario selected: ${spec.label} · ${spec.avenues.length} avenues planned (${planned}) — click Replay run → or Send →`
+    );
 
     if (opts && opts.rerun) {
       submitAskQuestion(spec.suggested_question);
@@ -1179,15 +1231,11 @@ function renderGovernanceTraps(spans) {
     clearReplayTimers();
 
     const btn = $("btnReplayRun");
-    const livePulse = getLivePulseEl();
     if (btn) {
       btn.disabled = true;
       btn.textContent = "Running pipeline...";
     }
-    if (livePulse) {
-      livePulse.classList.remove("done");
-      livePulse.classList.add("running");
-    }
+    setLivePulseState("running");
     setRunMetaText("Running the desk against live GCP...");
     setStampText("in flight");
 
@@ -1216,19 +1264,19 @@ function renderGovernanceTraps(spans) {
         STATE.auditSweep = data.audit_sweep;
         renderAuditSweepState(data.audit_sweep);
       }
-      renderToolTrajectoryTags(data.tool_trajectory);
-      renderVeracityAudit(data.veracity_evaluation);
       await fetchAndRenderTrace(data.run_id);
+      renderToolTrajectoryTags(data.tool_trajectory, data.run_id);
+      renderVeracityAudit(data.veracity_evaluation);
       revealStepsInOrder();
       subscribeToSynthesisStream(DEFAULT_CUSTOMER_ID, question, data.run_id);
     } catch (err) {
       console.error("replay failed", err);
       setRunMetaText("Replay failed — " + err.message);
       setStampText("n/r");
+      setLivePulseState(AGENTS.length ? "done" : "idle");
     } finally {
-      if (livePulse) {
-        livePulse.classList.remove("running");
-        livePulse.classList.add("done");
+      if (AGENTS.length) {
+        setLivePulseState("done");
       }
       if (btn) {
         btn.disabled = false;
@@ -1446,10 +1494,10 @@ function renderGovernanceTraps(spans) {
     }
 
     openOpsDrawer();
-    // Was openTrace("1","policy") — a function that does not exist anywhere in
-    // this bundle. It threw a ReferenceError here, so the /api/chat fetch below
-    // never ran and the console appeared to hang on every single question.
-    setTrace(true);
+    // Switch top black trace bar indicator from '>' (idle) to bronze blinking square ('running')
+    // without auto-expanding the #drop trace drawer.
+    setLivePulseState("running");
+    setRunMetaText("Running governed response & claim audit against live GCP...");
     setStampText("WORKING");
 
     if ($("askAnswerTitle")) {
@@ -1463,9 +1511,9 @@ function renderGovernanceTraps(spans) {
       $("askAnswerBody").innerHTML =
         "Querying BigQuery golden queries, the Dataplex glossary, and Vertex AI " +
         "Memory Bank...";
-      // The engine id, dataset and glossary are deployment config. The page used
-      // to print one project's literals here, which read as status but was just
-      // a string. /api/session returns the live status if they need showing.
+    }
+    if ($("askToolTags")) {
+      $("askToolTags").innerHTML = `<span class="tag on">Streaming live trace to top black bar…</span>`;
     }
 
     try {
@@ -1483,7 +1531,6 @@ function renderGovernanceTraps(spans) {
       const data = await resp.json();
 
       if (!resp.ok) {
-        // 502 and 503 carry the real upstream reason. Show it.
         if ($("askAnswerTag")) {
           $("askAnswerTag").className = "tag no";
           $("askAnswerTag").textContent = String(data.status || resp.status);
@@ -1493,6 +1540,7 @@ function renderGovernanceTraps(spans) {
             data.error || "Request failed"
           )}</span>${data.needs ? ` <small>(needs ${escapeHtml(data.needs)})</small>` : ""}`;
         }
+        setLivePulseState(AGENTS.length ? "done" : "idle");
         return;
       }
 
@@ -1506,7 +1554,7 @@ function renderGovernanceTraps(spans) {
         renderAuditSweepState(data.audit_sweep);
       }
       if (data.run_id) {
-        fetchAndRenderTrace(data.run_id);
+        await fetchAndRenderTrace(data.run_id);
       }
 
       if ($("askAnswerTitle")) {
@@ -1517,8 +1565,6 @@ function renderGovernanceTraps(spans) {
         $("askAnswerTag").textContent = "CATALOG + MEMORY";
       }
       if ($("askAnswerBody")) {
-        // The narrative is streamed, not returned by /api/chat. This route's
-        // agent_resolution says so and carries its own provenance.
         const resolution = data.agent_resolution;
         $("askAnswerBody").innerHTML =
           pvValue(resolution) === NOT_RECORDED
@@ -1528,10 +1574,7 @@ function renderGovernanceTraps(spans) {
             : formatAgentReply(pvText(resolution));
       }
 
-      // Backend key is tool_trajectory. The old read of data.tool_sequence
-      // never matched, so the UI drew a hardcoded four-tool list on every
-      // answer whether or not the desk had said anything about tools.
-      renderToolTrajectoryTags(data.tool_trajectory);
+      renderToolTrajectoryTags(data.tool_trajectory, data.run_id);
       renderVeracityAudit(data.veracity_evaluation);
       subscribeToSynthesisStream(customerId, query, data.run_id);
     } catch (err) {
@@ -1540,6 +1583,7 @@ function renderGovernanceTraps(spans) {
           err.message
         )}</span>`;
       }
+      setLivePulseState(AGENTS.length ? "done" : "idle");
     } finally {
       if (askBtn) {
         askBtn.disabled = false;
@@ -1548,23 +1592,30 @@ function renderGovernanceTraps(spans) {
     }
   }
 
-  function renderToolTrajectoryTags(trajectory) {
+  function renderToolTrajectoryTags(trajectory, runId) {
     const steps = Array.isArray(trajectory) ? trajectory : [];
     const el = $("askToolTags");
     if (!el) return;
-    el.innerHTML = steps.length
-      ? steps
-          .map((s, idx) => {
-            const lat = pvText(s.latency);
-            const latSuffix = lat && lat !== NOT_RECORDED ? ` (${escapeHtml(lat)})` : "";
-            return `<span class="tag ${idx === steps.length - 1 ? "on" : "ok"}" title="status ${escapeHtml(
-              pvText(s.status)
-            )} · ${escapeHtml(pvSource(s.tool))}">${idx + 1}. ${escapeHtml(
-              pvText(s.tool)
-            )} · ${escapeHtml(pvText(s.status))}${latSuffix}</span>`;
-          })
-          .join("")
-      : `<span class="tag">${NOT_RECORDED}</span>`;
+    const rid = runId || LAST_TRACED_RUN_ID || "";
+    const spanCount = LAST_TRACED_SPANS.length || steps.length;
+    const agentCount = AGENTS.length;
+    if (!spanCount && !rid) {
+      el.innerHTML = `<span class="tag">Idle — trace logs in top black bar when run</span>`;
+      return;
+    }
+    el.innerHTML =
+      `<button type="button" class="tag ok" id="btnOpenTopTraceFromAsk" style="cursor:pointer;" ` +
+      `title="Click to toggle the full agent trace in the top black navigation bar">` +
+      `Trace logged in top bar · Run ${escapeHtml(rid || "live")} · ` +
+      `${agentCount ? agentCount + " active agent(s) · " : ""}${spanCount} spans — View in Trace bar ▴` +
+      `</button>`;
+    const btnOpen = $("btnOpenTopTraceFromAsk");
+    if (btnOpen) {
+      btnOpen.addEventListener("click", () => {
+        setTrace(true);
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      });
+    }
   }
 
   function formatAgentReply(rawText) {
@@ -1810,6 +1861,7 @@ function renderGovernanceTraps(spans) {
     const btnRestrict = $("btnAdminRestrict");
     if (btnUnlock) btnUnlock.disabled = true;
     if (btnRestrict) btnRestrict.disabled = true;
+    setLivePulseState("running");
 
     const notes =
       decision === "APPROVE_UNLOCK"
@@ -1823,8 +1875,6 @@ function renderGovernanceTraps(spans) {
         body: JSON.stringify({
           customer_id: DEFAULT_CUSTOMER_ID,
           decision: decision,
-          // The route reads admin_notes or reason. "supervisor_notes" was read
-          // by nothing, so the supervisor's reason never reached the case file.
           admin_notes: notes,
         }),
       });
@@ -1835,6 +1885,7 @@ function renderGovernanceTraps(spans) {
           badge.className = "tag no";
           badge.textContent = String(data.status || resp.status);
         }
+        setLivePulseState(AGENTS.length ? "done" : "idle");
         console.error("Card oversight decision failed:", data);
         return;
       }
@@ -1844,14 +1895,15 @@ function renderGovernanceTraps(spans) {
         STATE.channelsSummary.snapshot = data.snapshot;
         renderChannelEventStream(data.snapshot);
       }
-      if (data.tool_trajectory) {
-        renderToolTrajectoryTags(data.tool_trajectory);
-      }
       if (data.run_id) {
         await fetchAndRenderTrace(data.run_id);
       }
+      if (data.tool_trajectory) {
+        renderToolTrajectoryTags(data.tool_trajectory, data.run_id);
+      }
       setStampText("SUPERVISOR LOGGED · " + (data.run_id || ""));
     } catch (err) {
+      setLivePulseState(AGENTS.length ? "done" : "idle");
       console.error("Card oversight decision error:", err);
     } finally {
       if (btnUnlock) btnUnlock.disabled = false;
@@ -1865,6 +1917,7 @@ function renderGovernanceTraps(spans) {
       btn.disabled = true;
       btn.textContent = "Triggering consolidation...";
     }
+    setLivePulseState("running");
 
     try {
       const resp = await fetch("/api/compaction/run", {
@@ -1876,13 +1929,11 @@ function renderGovernanceTraps(spans) {
 
       if (!resp.ok) {
         if (btn) btn.textContent = `✗ ${data.status || resp.status}`;
+        setLivePulseState(AGENTS.length ? "done" : "idle");
         console.error("Compaction failed:", data);
         return;
       }
 
-      // Consolidation runs inside Memory Bank. It does not report a token count,
-      // so the button shows "n/r" rather than the 68.8% this used to invent on
-      // every click, success or failure.
       const report = data.compaction_report || {};
       const pct = pvText(report.token_reduction_pct);
       const before = pvText(report.memories_in_scope_before);
@@ -1890,14 +1941,15 @@ function renderGovernanceTraps(spans) {
         btn.textContent = `Consolidation requested · ${before} in scope · saved ${pct}`;
         btn.title = `${pvTag(report.token_reduction_pct)} · ${pvSource(report.token_reduction_pct)}`;
       }
-      if (data.tool_trajectory) {
-        renderToolTrajectoryTags(data.tool_trajectory);
-      }
       if (data.run_id) {
         await fetchAndRenderTrace(data.run_id);
       }
+      if (data.tool_trajectory) {
+        renderToolTrajectoryTags(data.tool_trajectory, data.run_id);
+      }
       await loadLiveTestbed(DEFAULT_CUSTOMER_ID);
     } catch (err) {
+      setLivePulseState(AGENTS.length ? "done" : "idle");
       console.error("Compaction error:", err);
       if (btn) btn.textContent = `✗ ${err.message}`;
     } finally {
@@ -1970,15 +2022,12 @@ function renderGovernanceTraps(spans) {
   function init() {
     ensureLiveBarDom();
 
-    // 1. Trace will be fetched on load.
-    const livePulse = getLivePulseEl();
-    if (livePulse) {
-      livePulse.classList.add("done");
-    }
+    // 1. Start in IDLE caret '>' state until an action runs.
+    setLivePulseState("idle");
 
-    // 2. Build 6-Agent Menu & Wire Livebar / Drop Trace Controls
+    // 2. Build Menu & Wire Livebar / Drop Trace Controls
     buildMenu();
-    pick(0);
+    syncTraceBarVisibility();
     setTrace(false);
 
     const tok = $("tok");
@@ -2317,6 +2366,7 @@ function renderGovernanceTraps(spans) {
     const text = (txt && txt.value.trim()) || "";
 
     if (btn) btn.disabled = true;
+    setLivePulseState("running");
     if (statusEl) statusEl.textContent = `Writing multi-turn ${channel} session to Vertex AI Memory Bank…`;
     try {
       const resp = await fetch(`/api/channel/${encodeURIComponent(channel)}/event`, {
@@ -2346,6 +2396,7 @@ function renderGovernanceTraps(spans) {
         statusEl.textContent = `Ingested ${channel} session ${sid} (${tCount} turns) into Memory Bank · producer now holds ${data.snapshot ? data.snapshot.total_sessions : "n/r"} total sessions.`;
       }
     } catch (err) {
+      setLivePulseState(AGENTS.length ? "done" : "idle");
       if (statusEl) statusEl.textContent = `Channel ingest failed: ${err.message}`;
     } finally {
       if (btn) btn.disabled = false;
@@ -2359,6 +2410,7 @@ function renderGovernanceTraps(spans) {
     const reason = (txt && txt.value.trim()) || "Velocity + impossible-travel anomaly across channels";
 
     if (btn) btn.disabled = true;
+    setLivePulseState("running");
     if (statusEl) statusEl.textContent = "Running fraud_monitoring_agent (Golden 03 + 04 + FRAUD_OPS_OUTBOUND action)…";
     try {
       const resp = await fetch("/api/fraud/card-control", {
@@ -2387,6 +2439,7 @@ function renderGovernanceTraps(spans) {
         statusEl.textContent = `fraud_monitoring_agent staged CARD_BLOCK_AND_ESCALATE (suspicious=${susp}, geo=${geo}) → consumer_credit_synthesizer_agent.`;
       }
     } catch (err) {
+      setLivePulseState(AGENTS.length ? "done" : "idle");
       if (statusEl) statusEl.textContent = `Fraud card control failed: ${err.message}`;
     } finally {
       if (btn) btn.disabled = false;
