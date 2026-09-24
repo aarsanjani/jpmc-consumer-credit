@@ -1081,6 +1081,10 @@ code {
   margin: 0;
 }
 
+.tl:empty {
+  display: none;
+}
+
 .tl li {
   list-style: none;
   position: relative;

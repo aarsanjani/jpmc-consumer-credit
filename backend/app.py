@@ -340,6 +340,8 @@ def run_single_adk_agent_live(agent_key: str):
         # channel agents (02..05) do not get mixed into this agent's trace.
         with obs.run_context(kind="probe"):
             snapshot = _adk.produce_all_channels_snapshot(customer_id=customer_id)
+    except _adk.UnknownAgentError as exc:
+        return jsonify({"status": "NOT_FOUND", "error": str(exc)}), 404
     except Exception as exc:  # noqa: BLE001
         return _upstream_error(exc, f"InMemoryRunner({agent_key})")
     return jsonify({

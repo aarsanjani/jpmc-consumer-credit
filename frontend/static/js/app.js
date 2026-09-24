@@ -1615,6 +1615,7 @@ function renderGovernanceTraps(spans) {
     setLivePulseState("running");
     setRunMetaText("Running the desk against live GCP...");
     setStampText("in flight");
+    clearSynthesisCard();
 
     const question =
       (STATE.lastQuestion && String(STATE.lastQuestion)) ||
@@ -1892,6 +1893,7 @@ function renderGovernanceTraps(spans) {
     if ($("askToolTags")) {
       $("askToolTags").innerHTML = `<span class="tag on">Streaming live trace to top black bar…</span>`;
     }
+    clearSynthesisCard();
 
     try {
       const resp = await fetch("/api/chat", {
@@ -2150,26 +2152,32 @@ function renderGovernanceTraps(spans) {
 
   function renderSynthesisCard(card) {
     if (!card) return;
-    if ($("caseCard1Title")) {
-      $("caseCard1Title").textContent = card.title || NOT_RECORDED;
+    const meta = $("askSynthesisMeta");
+    const list = $("askSynthesisTimeline");
+    if (meta) {
+      meta.innerHTML =
+        `<b>${escapeHtml(card.title || NOT_RECORDED)}</b> · ` +
+        `${escapeHtml(pvText(card.memory_count))} memory(ies) ${pvChip(card.memory_count)} · ` +
+        `confidence ${escapeHtml(pvText(card.confidence_score))} ${pvChip(card.confidence_score)}`;
     }
-    if ($("caseCard1Sub")) {
-      $("caseCard1Sub").innerHTML =
-        `${escapeHtml(pvText(card.memory_count))} memory(ies) · confidence ` +
-        `${escapeHtml(pvText(card.confidence_score))} ${pvChip(card.confidence_score)}`;
-    }
-    if ($("caseCard1Kv")) {
+    if (list) {
       const timeline = Array.isArray(card.timeline) ? card.timeline : [];
-      $("caseCard1Kv").innerHTML = timeline.length
+      list.innerHTML = timeline.length
         ? timeline
             .map(
               (t) =>
-                `<div class="kv"><span>${escapeHtml(t.timestamp || NOT_RECORDED)}</span>` +
-                `<b>${escapeHtml(t.title || NOT_RECORDED)}</b></div>`
+                `<li><span class="t">${escapeHtml(t.timestamp || NOT_RECORDED)} · ` +
+                `${escapeHtml(t.channel || NOT_RECORDED)}</span>` +
+                `<span class="e">${escapeHtml(t.title || NOT_RECORDED)}</span></li>`
             )
             .join("")
-        : `<div class="kv"><span>${NOT_RECORDED}</span><b>no causal steps</b></div>`;
+        : `<li><span class="t">${NOT_RECORDED}</span><span class="e">no causal steps</span></li>`;
     }
+  }
+
+  function clearSynthesisCard() {
+    if ($("askSynthesisMeta")) $("askSynthesisMeta").innerHTML = "";
+    if ($("askSynthesisTimeline")) $("askSynthesisTimeline").innerHTML = "";
   }
 
   // =========================================================================

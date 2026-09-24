@@ -2143,17 +2143,35 @@ def list_all_agents() -> List[AgentDescriptor]:
     return descriptors
 
 
+class UnknownAgentError(LookupError):
+    """The key does not name one of the 8 desk agents."""
+
+
 def get_adk_agent_by_id_or_name(agent_id_or_name: str) -> LlmAgent:
-    """Resolves any of the 8 desk agents (`01`..`08`) from `create_consumer_credit_synthesizer_agent()`."""
+    """Resolves one of the 8 desk agents by name, AgentId value, or two-digit number.
+
+    Raises UnknownAgentError for anything else, so a typo is a 404 rather than
+    a run of the wrong agent.
+    """
     key = str(agent_id_or_name or "").strip()
-    clean = key.split("_", 1)[1] if len(key) > 3 and key[:2].isdigit() and key[2] == "_" else key
+    by_key: Dict[str, str] = {}
+    for member in AgentId.__members__.values():
+        number, name = member.value.split("_", 1)
+        by_key[member.value] = by_key[number] = by_key[name] = name
+
+    wanted = by_key.get(key)
+    if wanted is None:
+        raise UnknownAgentError(
+            "unknown agent %r; expected one of %s" % (key, sorted(set(by_key.values())))
+        )
+
     hub = create_consumer_credit_synthesizer_agent()
-    if clean in ("consumer_credit_synthesizer_agent", "synthesizer", "08", ""):
+    if hub.name == wanted:
         return hub
-    for spoke in getattr(hub, "sub_agents", []) or []:
-        if spoke.name == clean or spoke.name == key:
+    for spoke in hub.sub_agents or []:
+        if spoke.name == wanted:
             return spoke
-    return hub
+    raise UnknownAgentError("agent %r is in AgentId but not wired under %s" % (wanted, hub.name))
 
 
 def run_adk_agent_live(
@@ -2195,9 +2213,6 @@ def run_adk_agent_live(
         customer_id=customer_id,
     ) as runner_span:
         runner = InMemoryRunner(agent=target_agent, app_name="ccb_fraud_desk")
-        session = asyncio.run(
-            runner.session_service.create_session(app_name="ccb_fraud_desk", user_id=customer_id)
-        )
         user_msg = types.Content(
             role="user",
             parts=[types.Part.from_text(text=effective_prompt)],
@@ -2208,25 +2223,35 @@ def run_adk_agent_live(
         text_parts: List[str] = []
         event_count = 0
 
-        for event in runner.run(user_id=customer_id, session_id=session.id, new_message=user_msg):
-            event_count += 1
-            for fc in event.get_function_calls() or []:
-                tool_calls.append({
-                    "name": fc.name,
-                    "args": dict(fc.args) if getattr(fc, "args", None) else {},
-                })
-            for fr in event.get_function_responses() or []:
-                tool_responses.append({
-                    "name": fr.name,
-                })
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if getattr(part, "text", None):
-                        text_parts.append(part.text)
+        async def _drive() -> str:
+            nonlocal event_count
+            session = await runner.session_service.create_session(
+                app_name="ccb_fraud_desk", user_id=customer_id
+            )
+            async for event in runner.run_async(
+                user_id=customer_id, session_id=session.id, new_message=user_msg
+            ):
+                event_count += 1
+                for fc in event.get_function_calls() or []:
+                    tool_calls.append({
+                        "name": fc.name,
+                        "args": dict(fc.args) if getattr(fc, "args", None) else {},
+                    })
+                for fr in event.get_function_responses() or []:
+                    tool_responses.append({
+                        "name": fr.name,
+                    })
+                if event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if getattr(part, "text", None):
+                            text_parts.append(part.text)
+            return session.id
+
+        session_id = asyncio.run(_drive())
 
         final_text = "\n".join(t.strip() for t in text_parts if t and t.strip())
         runner_span.detail(
-            session_id=session.id,
+            session_id=session_id,
             events=event_count,
             tool_calls=len(tool_calls),
             status="COMPLETED",
@@ -2239,7 +2264,7 @@ def run_adk_agent_live(
         "agent_name": target_agent.name,
         "role": desc.role if desc else target_agent.description,
         "model": str(getattr(target_agent, "model", "gemini-2.5-flash")),
-        "session_id": live(session.id, "InMemoryRunner.session_service.create_session"),
+        "session_id": live(session_id, "InMemoryRunner.session_service.create_session"),
         "prompt": effective_prompt,
         "events_count": computed(event_count, "InMemoryRunner.run"),
         "tool_calls": live(tool_calls, "InMemoryRunner.run.get_function_calls"),

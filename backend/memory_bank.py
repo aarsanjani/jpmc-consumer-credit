@@ -58,6 +58,11 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+try:
+    from backend.gcp_auth import BearerTokenSource
+except ImportError:  # run as a script: python memory_bank.py ...
+    from gcp_auth import BearerTokenSource
+
 # The string we print when the service did not give us a value. Never a zero,
 # never an invented id, never a plausible-looking timestamp.
 NOT_RECORDED = "n/r"
@@ -154,10 +159,12 @@ class MemoryBankClient:
         self.api_version = api_version
         self.timeout = timeout
         self.verbose = verbose
-        self._explicit_token = access_token
-        self._token = access_token
-        self._token_fetched_at: float = 0.0
-        self._creds: Any = None
+        # Token source: backend/gcp_auth.py:BearerTokenSource
+        self._auth = BearerTokenSource(
+            explicit_token=access_token,
+            env_vars=("MEMORY_BANK_TOKEN",),
+            on_error=lambda msg: MemoryBankError(401, "(token)", msg),
+        )
         self.calls: List[str] = []   # every request made, for the demo narrative
         # The engine resource holds the topic vocabulary. It is deployment
         # configuration rather than per-request data, so it is fetched once and
@@ -183,42 +190,7 @@ class MemoryBankClient:
         return "https://%s/%s/%s" % (self.host, self.api_version, self.parent)
 
     def token(self, force_refresh: bool = False) -> str:
-        """Bearer token: explicit arg, then env var, then google.auth with auto-refresh."""
-        if self._explicit_token:
-            return self._explicit_token
-        env = os.environ.get("MEMORY_BANK_TOKEN")
-        if env and not force_refresh:
-            self._token = env
-            return env
-        now = time.time()
-        is_expired = bool(self._creds and getattr(self._creds, "expired", False))
-        if (
-            not force_refresh
-            and self._token
-            and not is_expired
-            and (now - self._token_fetched_at) < 2700.0
-        ):
-            return self._token
-        try:
-            import google.auth
-            from google.auth.transport.requests import Request
-
-            if self._creds is None or force_refresh:
-                self._creds, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                )
-            self._creds.refresh(Request())
-            self._token = self._creds.token
-            self._token_fetched_at = time.time()
-            return self._token
-        except Exception as exc:  # noqa: BLE001 - we want the real reason surfaced
-            raise MemoryBankError(
-                401,
-                "(token)",
-                "No credential available. Pass access_token=, set "
-                "MEMORY_BANK_TOKEN, or install google-auth and run "
-                "`gcloud auth application-default login`. Underlying cause: %s" % exc,
-            )
+        return self._auth.get(force_refresh)
 
     def _request(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = json.dumps(body).encode("utf-8") if body is not None else None
@@ -235,8 +207,9 @@ class MemoryBankClient:
                     text = response.read().decode("utf-8")
                 return json.loads(text) if text.strip() else {}
             except urllib.error.HTTPError as exc:
-                if exc.code == 401 and attempt == 1 and not self._explicit_token:
-                    self._token = None
+                # A 401 means the server did not act on the request, so one
+                # resend with a fresh token is safe even for POST.
+                if exc.code == 401 and attempt == 1 and self._auth.refreshable:
                     continue
                 raise MemoryBankError(exc.code, url, exc.read().decode("utf-8", "replace"))
             except urllib.error.URLError as exc:

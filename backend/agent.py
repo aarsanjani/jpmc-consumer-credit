@@ -248,8 +248,10 @@ class MemoryBankSynthesizerAgent:
         user_prompt: str,
         memory_client: MemoryBankClient,
         channel: BankChannel = BankChannel.WEB_PORTAL,
+        grounding: Optional[Dict[str, Any]] = None,
     ) -> SynthesisResult:
-        grounding = self.gather_grounding(customer_id, user_prompt, memory_client)
+        if grounding is None:
+            grounding = self.gather_grounding(customer_id, user_prompt, memory_client)
         narrative = self._call_genai_synthesis(user_prompt, grounding)
 
         return SynthesisResult(
@@ -368,7 +370,9 @@ class MemoryBankSynthesizerAgent:
 
         with obs.turn("synthesizer.generate_answer", LOG, agent="consumer_credit_synthesizer_agent",
                       model=self.model_name, scope=customer_id) as _s_span:
-            result = self.synthesize_customer_issue(customer_id, user_prompt, memory_client, channel)
+            result = self.synthesize_customer_issue(
+                customer_id, user_prompt, memory_client, channel, grounding=grounding
+            )
             _s_span.detail(causal_steps=len(result.causal_chain))
 
         yield self._encode_rpc_frame(

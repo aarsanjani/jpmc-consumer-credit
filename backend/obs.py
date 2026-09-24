@@ -359,13 +359,8 @@ def get_run_kind(run_id: str) -> str:
     return _TRACE_BUFFER.get_run_kind(run_id)
 
 
-_ACTIVE_RUN_ID_FALLBACK: Optional[str] = None
-_ACTIVE_RUN_KIND_FALLBACK: str = ""
-
-
 def current_run_kind() -> str:
-    val = _RUN_KIND.get()
-    return val if val else _ACTIVE_RUN_KIND_FALLBACK
+    return _RUN_KIND.get()
 
 
 # ---------------------------------------------------------------------------
@@ -378,13 +373,13 @@ def new_run_id() -> str:
 
 @contextlib.contextmanager
 def run_context(run_id: Optional[str] = None, kind: str = "") -> Iterator[str]:
-    """Stamps every record inside the block with one run id, including worker threads spawned by InMemoryRunner."""
-    global _ACTIVE_RUN_ID_FALLBACK, _ACTIVE_RUN_KIND_FALLBACK
+    """Stamps every record inside the block with one run id.
+
+    Contextvars do not follow plain `threading.Thread`s. Code that fans out to
+    threads must use `asyncio` tasks, `asyncio.to_thread`, or
+    `contextvars.copy_context().run` so the id comes along.
+    """
     rid = run_id or new_run_id()
-    prev_id = _ACTIVE_RUN_ID_FALLBACK
-    prev_kind = _ACTIVE_RUN_KIND_FALLBACK
-    _ACTIVE_RUN_ID_FALLBACK = rid
-    _ACTIVE_RUN_KIND_FALLBACK = kind
     token = _RUN_ID.set(rid)
     kind_token = _RUN_KIND.set(kind)
     try:
@@ -392,15 +387,10 @@ def run_context(run_id: Optional[str] = None, kind: str = "") -> Iterator[str]:
     finally:
         _RUN_KIND.reset(kind_token)
         _RUN_ID.reset(token)
-        _ACTIVE_RUN_ID_FALLBACK = prev_id
-        _ACTIVE_RUN_KIND_FALLBACK = prev_kind
 
 
 def current_run_id() -> str:
-    val = _RUN_ID.get()
-    if val and val != "-":
-        return val
-    return _ACTIVE_RUN_ID_FALLBACK or "-"
+    return _RUN_ID.get()
 
 
 # ---------------------------------------------------------------------------
