@@ -60,19 +60,21 @@ Reference:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Dict, List, Optional, Sequence
 
 try:
-    from backend.gcp_auth import BearerTokenSource
+    from backend.gcp_auth import BearerTokenSource, CredentialsUnavailableError
 except ImportError:  # run as a script: python knowledge_catalog.py ...
-    from gcp_auth import BearerTokenSource
+    from gcp_auth import BearerTokenSource, CredentialsUnavailableError
 
 # Printed when the catalog did not return a value. Never a default, never a
 # guess, never a zero. Same rule as memory_bank.py.
@@ -82,6 +84,7 @@ DATAPLEX_HOST = "dataplex.googleapis.com"
 DEFAULT_LOCATION = "us-central1"
 DEFAULT_ENTRY_GROUP = "@bigquery"
 DEFAULT_TIMEOUT = 30
+CALL_HISTORY = 200
 
 
 def require_env(name: str) -> str:
@@ -105,11 +108,21 @@ def require_env(name: str) -> str:
 class CatalogError(RuntimeError):
     """An API call failed. Status and body, unedited."""
 
-    def __init__(self, status: int, url: str, body: str):
+    def __init__(self, status: Optional[int], url: str, body: str):
         self.status = status
         self.url = url
         self.body = body
         super().__init__("HTTP %s from %s\n%s" % (status, url, body))
+
+
+class CatalogCredentialsError(CatalogError, CredentialsUnavailableError):
+    """No local credential, so nothing was sent. `status` is None, not 401."""
+
+    def __init__(self, message: str):
+        self.status = None
+        self.url = "(no request sent)"
+        self.body = message
+        RuntimeError.__init__(self, message)
 
 
 def field(obj: Optional[Dict[str, Any]], *path: str, default: Any = NOT_RECORDED) -> Any:
@@ -161,11 +174,9 @@ class DataplexCatalogClient:
         self.verbose = verbose
         # Token source: backend/gcp_auth.py:BearerTokenSource
         self._auth = BearerTokenSource(
-            explicit_token=access_token,
-            env_vars=("CATALOG_TOKEN", "MEMORY_BANK_TOKEN"),
-            on_error=lambda msg: CatalogError(401, "(token)", msg),
+            explicit_token=access_token, env_vars=("CATALOG_TOKEN", "MEMORY_BANK_TOKEN")
         )
-        self.calls: List[str] = []
+        self.calls: deque[str] = deque(maxlen=CALL_HISTORY)
 
     # -- names, mirroring scripts/setup_catalog.py -------------------------
 
@@ -197,7 +208,10 @@ class DataplexCatalogClient:
     # -- plumbing ----------------------------------------------------------
 
     def token(self, force_refresh: bool = False) -> str:
-        return self._auth.get(force_refresh)
+        try:
+            return self._auth.get(force_refresh)
+        except CredentialsUnavailableError as exc:
+            raise CatalogCredentialsError(*exc.args) from exc
 
     def _request(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = json.dumps(body).encode("utf-8") if body is not None else None
@@ -218,9 +232,9 @@ class DataplexCatalogClient:
                 # resend with a fresh token is safe even for POST.
                 if exc.code == 401 and attempt == 1 and self._auth.refreshable:
                     continue
-                raise CatalogError(exc.code, url, exc.read().decode("utf-8", "replace"))
+                raise CatalogError(exc.code, url, exc.read().decode("utf-8", "replace")) from exc
             except urllib.error.URLError as exc:
-                raise CatalogError(0, url, "Network error: %s" % exc.reason)
+                raise CatalogError(0, url, "Network error: %s" % exc.reason) from exc
         return {}
 
     # -- reads -------------------------------------------------------------
@@ -350,11 +364,19 @@ class CatalogGovernor:
         # strict: an entry with no governing aspect is refused rather than
         # allowed. Fail closed. Flip it only to show what the other choice costs.
         self.strict = strict
-        self.decisions: List[Decision] = []
+        self.decisions: deque[Decision] = deque(maxlen=CALL_HISTORY)
 
     def _record(self, decision: Decision) -> Decision:
         self.decisions.append(decision)
         return decision
+
+    @staticmethod
+    def _lookup_failure_reason(error: CatalogError) -> str:
+        if isinstance(error, CatalogCredentialsError):
+            return "Catalog not checked: no local credential. Refused until it can be checked."
+        if error.status == 404:
+            return "Not in the catalog, so it is not governed data (HTTP 404)."
+        return "Catalog lookup failed (HTTP %s), so this was not verified. Refused." % error.status
 
     # -- table level -------------------------------------------------------
 
@@ -366,7 +388,7 @@ class CatalogGovernor:
         except CatalogError as error:
             return self._record(Decision(
                 allowed=False, action="REFUSE", subject=table,
-                reason="Not in the catalog, so it is not governed data (HTTP %s)." % error.status,
+                reason=self._lookup_failure_reason(error),
                 evidence="lookupEntry failed",
             ))
 
@@ -413,7 +435,7 @@ class CatalogGovernor:
         except CatalogError as error:
             return self._record(Decision(
                 allowed=False, action="REFUSE", subject=subject,
-                reason="Entry not readable (HTTP %s)." % error.status,
+                reason=self._lookup_failure_reason(error),
                 evidence="lookupEntry failed",
             ))
 
@@ -607,6 +629,12 @@ def create_default_catalog_governor(strict: bool = True, verbose: bool = False) 
         verbose=verbose,
     )
     return CatalogGovernor(client=client, strict=strict)
+
+
+@functools.cache
+def shared_catalog_governor() -> CatalogGovernor:
+    """The one strict governor the server shares, so there is one token cache."""
+    return create_default_catalog_governor(strict=True, verbose=False)
 
 
 # ---------------------------------------------------------------------------

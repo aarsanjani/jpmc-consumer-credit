@@ -48,8 +48,8 @@ from backend.models import (
     VerificationCheckItem,
 )
 from backend import obs
-from backend.knowledge_catalog import CatalogGovernor, create_default_catalog_governor
-from backend.memory_bank import MemoryBankClient, create_default_memory_bank_client
+from backend.knowledge_catalog import CatalogGovernor, shared_catalog_governor
+from backend.memory_bank import MemoryBankClient, shared_memory_bank_client
 
 LOG = obs.get_logger(__name__)
 from backend.provenance import (
@@ -422,13 +422,13 @@ class ClaimVeracityValidatorAgent:
     @property
     def governor(self) -> CatalogGovernor:
         if self._governor is None:
-            self._governor = create_default_catalog_governor(strict=True, verbose=False)
+            self._governor = shared_catalog_governor()
         return self._governor
 
     @property
     def memory(self) -> MemoryBankClient:
         if self._memory is None:
-            self._memory = create_default_memory_bank_client(verbose=False)
+            self._memory = shared_memory_bank_client()
         return self._memory
 
     # -- catalog gate --------------------------------------------------------
@@ -819,7 +819,7 @@ class MemoryBankAuditAgent:
     @property
     def memory(self) -> MemoryBankClient:
         if self._memory is None:
-            self._memory = create_default_memory_bank_client(verbose=False)
+            self._memory = shared_memory_bank_client()
         return self._memory
 
     @property

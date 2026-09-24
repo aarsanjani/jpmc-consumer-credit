@@ -56,11 +56,12 @@ from backend.memory_bank import (
     MemoryBankError,
     StandaloneMemoryBankClient,
     field as mb_field,
+    shared_memory_bank_client,
 )
 from backend.knowledge_catalog import (
     CatalogError,
     CatalogGovernor,
-    create_default_catalog_governor,
+    shared_catalog_governor,
 )
 from backend.agent import MemoryBankSynthesizerAgent
 from backend.custom_agent_comparison import AgentComparisonEngine
@@ -191,31 +192,17 @@ def _upstream_error(exc: Exception, source: str) -> Tuple[Response, int]:
 
 
 # ---------------------------------------------------------------------------
-# Service singletons. Built lazily so an unreachable service fails on the route
-# that needed it, with a message, instead of at import time.
+# Service singletons, shared with backend/adk_agents.py so the process has one
+# token cache per service. Built on first use.
 # ---------------------------------------------------------------------------
-
-_memory: Optional[MemoryBankClient] = None
-_governor: Optional[CatalogGovernor] = None
 
 
 def memory_client() -> MemoryBankClient:
-    global _memory
-    if _memory is None:
-        _memory = MemoryBankClient(
-            project=PROJECT_ID,
-            engine_id=AGENT_ENGINE_ID,
-            location=LOCATION,
-            verbose=False,
-        )
-    return _memory
+    return shared_memory_bank_client()
 
 
 def catalog_governor() -> CatalogGovernor:
-    global _governor
-    if _governor is None:
-        _governor = create_default_catalog_governor(strict=True, verbose=False)
-    return _governor
+    return shared_catalog_governor()
 
 
 def scope_for(customer_id: str) -> Dict[str, str]:

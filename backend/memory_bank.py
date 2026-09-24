@@ -49,19 +49,24 @@ Reference:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
+import functools
 import json
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 try:
-    from backend.gcp_auth import BearerTokenSource
+    from backend.gcp_auth import BearerTokenSource, CredentialsUnavailableError
 except ImportError:  # run as a script: python memory_bank.py ...
-    from gcp_auth import BearerTokenSource
+    from gcp_auth import BearerTokenSource, CredentialsUnavailableError
 
 # The string we print when the service did not give us a value. Never a zero,
 # never an invented id, never a plausible-looking timestamp.
@@ -70,16 +75,33 @@ NOT_RECORDED = "n/r"
 DEFAULT_API_VERSION = "v1beta1"   # memories:* live here today
 DEFAULT_LOCATION = "us-central1"
 DEFAULT_TIMEOUT = 60
+CALL_HISTORY = 200
+
+# Set by MemoryBankClient.recording(). A contextvar, not client state, because
+# one client is shared by concurrent Flask requests.
+_RECORDING: contextvars.ContextVar[Optional[List[str]]] = contextvars.ContextVar(
+    "memory_bank_recording", default=None
+)
 
 
 class MemoryBankError(RuntimeError):
     """An API call failed. Carries the status and the body, unedited."""
 
-    def __init__(self, status: int, url: str, body: str):
+    def __init__(self, status: Optional[int], url: str, body: str):
         self.status = status
         self.url = url
         self.body = body
         super().__init__("HTTP %s from %s\n%s" % (status, url, body))
+
+
+class MemoryBankCredentialsError(MemoryBankError, CredentialsUnavailableError):
+    """No local credential, so nothing was sent. `status` is None, not 401."""
+
+    def __init__(self, message: str):
+        self.status = None
+        self.url = "(no request sent)"
+        self.body = message
+        RuntimeError.__init__(self, message)
 
 
 def field(obj: Optional[Dict[str, Any]], *path: str, default: str = NOT_RECORDED) -> Any:
@@ -160,12 +182,10 @@ class MemoryBankClient:
         self.timeout = timeout
         self.verbose = verbose
         # Token source: backend/gcp_auth.py:BearerTokenSource
-        self._auth = BearerTokenSource(
-            explicit_token=access_token,
-            env_vars=("MEMORY_BANK_TOKEN",),
-            on_error=lambda msg: MemoryBankError(401, "(token)", msg),
-        )
-        self.calls: List[str] = []   # every request made, for the demo narrative
+        self._auth = BearerTokenSource(explicit_token=access_token, env_vars=("MEMORY_BANK_TOKEN",))
+        # Last CALL_HISTORY requests, for debugging. Use recording() to get the
+        # calls of one operation.
+        self.calls: deque[str] = deque(maxlen=CALL_HISTORY)
         # The engine resource holds the topic vocabulary. It is deployment
         # configuration rather than per-request data, so it is fetched once and
         # kept; `memory_topics(refresh=True)` re-reads it.
@@ -190,11 +210,27 @@ class MemoryBankClient:
         return "https://%s/%s/%s" % (self.host, self.api_version, self.parent)
 
     def token(self, force_refresh: bool = False) -> str:
-        return self._auth.get(force_refresh)
+        try:
+            return self._auth.get(force_refresh)
+        except CredentialsUnavailableError as exc:
+            raise MemoryBankCredentialsError(*exc.args) from exc
+
+    @contextlib.contextmanager
+    def recording(self) -> Iterator[List[str]]:
+        """Collects the HTTP calls made inside the block, by this context only."""
+        calls: List[str] = []
+        token = _RECORDING.set(calls)
+        try:
+            yield calls
+        finally:
+            _RECORDING.reset(token)
 
     def _request(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = json.dumps(body).encode("utf-8") if body is not None else None
-        self.calls.append("%s %s" % (method, url.split(self.api_version + "/")[-1]))
+        line = "%s %s" % (method, url.split(self.api_version + "/")[-1])
+        self.calls.append(line)
+        if (recorded := _RECORDING.get()) is not None:
+            recorded.append(line)
         if self.verbose:
             print("  %-6s %s" % (method, url.replace("https://" + self.host, "")))
 
@@ -211,9 +247,9 @@ class MemoryBankClient:
                 # resend with a fresh token is safe even for POST.
                 if exc.code == 401 and attempt == 1 and self._auth.refreshable:
                     continue
-                raise MemoryBankError(exc.code, url, exc.read().decode("utf-8", "replace"))
+                raise MemoryBankError(exc.code, url, exc.read().decode("utf-8", "replace")) from exc
             except urllib.error.URLError as exc:
-                raise MemoryBankError(0, url, "Network error: %s" % exc.reason)
+                raise MemoryBankError(0, url, "Network error: %s" % exc.reason) from exc
         return {}
 
     def wait_for_operation(self, operation: Dict[str, Any], poll_seconds: float = 1.0,
@@ -571,7 +607,7 @@ class StandaloneMemoryBankClient:
     def __init__(self, client: Optional[MemoryBankClient] = None,
                  customer_id: str = "CUST00001",
                  framework_name: str = "LangGraph"):
-        self.client = client or create_default_memory_bank_client()
+        self.client = client or shared_memory_bank_client()
         self.customer_id = customer_id
         self.framework_name = framework_name
 
@@ -585,8 +621,8 @@ class StandaloneMemoryBankClient:
         Returns a dict, not an object. Whatever framework you are in can drop
         `prompt_block` straight into a system message.
         """
-        before = len(self.client.calls)
-        memories = self.client.retrieve(self.scope, query=user_query, top_k=top_k)
+        with self.client.recording() as http_calls:
+            memories = self.client.retrieve(self.scope, query=user_query, top_k=top_k)
 
         facts = [field(m.get("memory", m), "fact") for m in memories]
         known = [f for f in facts if f != NOT_RECORDED]
@@ -604,7 +640,7 @@ class StandaloneMemoryBankClient:
             "facts": facts or [NOT_RECORDED],
             "prompt_block": prompt_block,
             # Proof of what actually crossed the wire.
-            "http_calls": self.client.calls[before:],
+            "http_calls": http_calls,
             "sdk_used": "none - urllib over HTTPS",
             "adk_used": False,
         }
@@ -615,14 +651,14 @@ class StandaloneMemoryBankClient:
         Uses directContentsSource, so the external framework keeps owning its
         own conversation history and never has to store a Vertex session.
         """
-        before = len(self.client.calls)
-        operation = self.client.generate_from_contents(turns, self.scope)
+        with self.client.recording() as http_calls:
+            operation = self.client.generate_from_contents(turns, self.scope)
         return {
             "framework": self.framework_name,
             "turns_sent": len(turns),
             "operation": field(operation, "name"),
             "done": operation.get("done", False),
-            "http_calls": self.client.calls[before:],
+            "http_calls": http_calls,
             "note": "Extraction is asynchronous. Retrieve again shortly to see the result.",
         }
 
@@ -787,6 +823,12 @@ def create_default_memory_bank_client(verbose: bool = False) -> MemoryBankClient
         location=location,
         verbose=verbose,
     )
+
+
+@functools.cache
+def shared_memory_bank_client() -> MemoryBankClient:
+    """The one engine-level client the server shares, so there is one token cache."""
+    return create_default_memory_bank_client(verbose=False)
 
 
 # ---------------------------------------------------------------------------

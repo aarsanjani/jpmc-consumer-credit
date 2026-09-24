@@ -5,13 +5,20 @@ Used by `backend/memory_bank.py:MemoryBankClient` and
 with urllib and so do not get google-auth's automatic refresh for free.
 """
 
-from __future__ import annotations
-
 import os
 import threading
-from typing import Any, Callable, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+
+class CredentialsUnavailableError(RuntimeError):
+    """No usable local credential, so no request was sent.
+
+    Kept apart from HTTP 401/403 on purpose: a 401 means the server rejected a
+    credential, this means we never had one to send.
+    """
 
 
 class BearerTokenSource:
@@ -26,35 +33,24 @@ class BearerTokenSource:
     are never swapped for ADC behind the caller's back. Only ADC tokens refresh.
     """
 
-    def __init__(
-        self,
-        explicit_token: Optional[str],
-        env_vars: Sequence[str],
-        on_error: Callable[[str], Exception],
-    ):
+    def __init__(self, explicit_token: str | None, env_vars: Sequence[str]):
         self._explicit_token = explicit_token
         self._env_vars = tuple(env_vars)
-        self._on_error = on_error
         self._creds: Any = None
         # Flask serves requests on several threads that share one client.
         self._lock = threading.Lock()
 
-    def _static_token(self) -> Optional[str]:
+    def _static_token(self) -> str | None:
         if self._explicit_token:
             return self._explicit_token
-        for name in self._env_vars:
-            value = os.environ.get(name)
-            if value:
-                return value
-        return None
+        return next((os.environ[name] for name in self._env_vars if os.environ.get(name)), None)
 
     @property
     def refreshable(self) -> bool:
         return self._static_token() is None
 
     def get(self, force_refresh: bool = False) -> str:
-        static = self._static_token()
-        if static:
+        if static := self._static_token():
             return static
         with self._lock:
             try:
@@ -68,9 +64,8 @@ class BearerTokenSource:
                 if force_refresh or not self._creds.valid:
                     self._creds.refresh(Request())
                 return self._creds.token
-            except Exception as exc:  # noqa: BLE001 - the real cause must reach the caller
-                raise self._on_error(
+            except Exception as exc:
+                raise CredentialsUnavailableError(
                     "No credential available. Pass access_token=, set %s, or run "
-                    "`gcloud auth application-default login`. Cause: %s"
-                    % (" or ".join(self._env_vars), exc)
-                )
+                    "`gcloud auth application-default login`." % " or ".join(self._env_vars)
+                ) from exc

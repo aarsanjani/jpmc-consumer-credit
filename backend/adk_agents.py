@@ -57,11 +57,11 @@ from google.adk.tools import FunctionTool
 
 from backend.knowledge_catalog import (
     CatalogGovernor,
-    create_default_catalog_governor,
+    shared_catalog_governor,
 )
 from backend.memory_bank import (
     MemoryBankClient,
-    create_default_memory_bank_client,
+    shared_memory_bank_client,
     field as mb_field,
     topic_labels,
 )
@@ -101,11 +101,11 @@ LOG = obs.get_logger(__name__)
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
-# Shared engine-level clients (customer_id is passed per call, not at startup):
-# - MemoryBankClient (`backend/memory_bank.py:create_default_memory_bank_client`, L439)
-# - CatalogGovernor  (`backend/knowledge_catalog.py:create_default_catalog_governor`, L608)
-GLOBAL_MEMORY_BANK_CLIENT: MemoryBankClient = create_default_memory_bank_client(verbose=False)
-GLOBAL_CATALOG_GOVERNOR: CatalogGovernor = create_default_catalog_governor(strict=True, verbose=False)
+# Process-wide clients shared with app.py and veracity_and_audit.py (customer_id is per call):
+# - MemoryBankClient (`backend/memory_bank.py:shared_memory_bank_client`)
+# - CatalogGovernor  (`backend/knowledge_catalog.py:shared_catalog_governor`)
+GLOBAL_MEMORY_BANK_CLIENT: MemoryBankClient = shared_memory_bank_client()
+GLOBAL_CATALOG_GOVERNOR: CatalogGovernor = shared_catalog_governor()
 
 LOG.debug(
     "singletons ready memory_bank_parent=%s catalog_project=%s dataset=%s strict=%s",

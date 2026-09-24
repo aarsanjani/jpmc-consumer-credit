@@ -1,3 +1,7 @@
+import io
+import json
+import urllib.request
+
 import pytest
 from backend.memory_bank import (
     MemoryBankClient,
@@ -133,25 +137,28 @@ def test_client_generate_from_contents_request(monkeypatch):
     assert events[1]["content"]["role"] == "model"  # mapped from agent
     assert events[1]["content"]["parts"][0]["text"] == "hi"
 
+class _FakeHttpResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+
 def test_standalone_preload_context_for_external_agent(monkeypatch):
     """Verify the standalone client builds a prompt block and claims no ADK usage."""
+    body = {"retrievedMemories": [{"memory": {"fact": "fact A"}}, {"memory": {"fact": "fact B"}}]}
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda request, timeout=None: _FakeHttpResponse(json.dumps(body).encode()),
+    )
     client = MemoryBankClient(project="p", engine_id="e", access_token="fake")
-    client.calls = []
-    
-    def mock_retrieve(scope, query=None, top_k=5, memory_filter=None):
-        client.calls.append("POST /memories:retrieve")
-        return [
-            {"memory": {"fact": "fact A"}},
-            {"memory": {"fact": "fact B"}},
-        ]
-    
-    monkeypatch.setattr(client, "retrieve", mock_retrieve)
-    
     standalone = StandaloneMemoryBankClient(client, customer_id="CUST1", framework_name="TestFrame")
+
     context = standalone.preload_context_for_external_agent("query")
-    
+
     assert context["adk_used"] is False
     assert "fact A" in context["prompt_block"]
     assert "fact B" in context["prompt_block"]
-    assert context["http_calls"] == ["POST /memories:retrieve"]
+    assert context["http_calls"] == ["POST projects/p/locations/us-central1/reasoningEngines/e/memories:retrieve"]
     assert context["memory_count"] == 2
