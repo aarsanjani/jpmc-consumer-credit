@@ -1106,14 +1106,13 @@ def read_customer_memory_bank(
     customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
     query: str = "",
     top_k: int = DEFAULT_CHANNEL_TOP_K,
-    client: Optional[MemoryBankClient] = None,
 ) -> Dict[str, Any]:
     """Synthesizer read path: scoped memories straight from Memory Bank.
 
     An empty `query` means simple retrieval of everything in scope; a non-empty
     one is a similarity search the service runs - this process does no ranking.
     """
-    bank = _memory_bank(client)
+    bank = _memory_bank(None)
     scope = {"customer_id": customer_id}
     memories = _memory_rows(bank, scope, query, top_k)
     return {
@@ -1134,7 +1133,6 @@ def execute_one_click_card_unlock(
     card_id: str = DEFAULT_CARD_ID,
     reason: str = "",
     record_to_memory_bank: bool = True,
-    client: Optional[MemoryBankClient] = None,
 ) -> Dict[str, Any]:
     """Stages the card unlock and writes the decision trail into Memory Bank.
 
@@ -1143,7 +1141,7 @@ def execute_one_click_card_unlock(
     record it actually wrote, and leaves the downstream confirmation
     `unmeasured` rather than asserting a success nobody observed.
     """
-    bank = _memory_bank(client)
+    bank = _memory_bank(None)
     token_evidence = golden_10_wallet_tokens_active_on_card(card_id=card_id)
 
     audit_session = unmeasured("audit trail not written: record_to_memory_bank=False")
@@ -1190,7 +1188,6 @@ def execute_fraud_card_control_or_escalate(
     action: str = "CARD_BLOCK_AND_ESCALATE",
     reason: str = "",
     record_to_memory_bank: bool = True,
-    client: Optional[MemoryBankClient] = None,
 ) -> Dict[str, Any]:
     """FRAUD_OPS_OUTBOUND action tool for `fraud_monitoring_agent`.
 
@@ -1199,7 +1196,7 @@ def execute_fraud_card_control_or_escalate(
     escalates the case to `consumer_credit_synthesizer_agent` by writing the
     decision into Vertex AI Memory Bank under channel `FRAUD_OPS_OUTBOUND`.
     """
-    bank = _memory_bank(client)
+    bank = _memory_bank(None)
     with obs.turn(
         "fraud.card_control_or_escalate",
         LOG,
