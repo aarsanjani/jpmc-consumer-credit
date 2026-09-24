@@ -99,7 +99,7 @@ When you click any agent in the `Pipeline` column and click **`▶ Run Agent Liv
 **Contact Center IVR & Inbound Call Specialist (`CHANNEL_PRODUCER · TELEPHONY_IVR`)**
 - **Starts / Triggered By**: Parallel Stage 1 channel read or `▶ Run Agent Live`.
 - **Routes Output To**: `08 · consumer_credit_synthesizer_agent` and `06 · claim_veracity_validator_agent`.
-- **🧠 Memory Bank Topics Scoped**: `STEP_UP_AUTH` · `TRAVEL_STATUS` · `CALL_TRANSCRIPT_FACTS`
+- **🧠 Memory Bank Topics Scoped**: `CONTACT_PREFERENCE` · `AGENT_COMMITMENTS` · `TRAVEL_STATUS`
 - **🛡️ Dataplex Catalog Governance**: `authorizations (ACTIVE)` · `cards (ACTIVE)` · `merchants (ACTIVE)` · `authorizations_deprecated_v1 (REFUSE · DEPRECATED)` · `cards.pan_full (REFUSE · PII)` · `cards.pan_masked (ALLOW_TO_OWNER_ONLY)`
 - **🏛️ Authorized BigQuery Golden Queries (`1`)**: `02_recent_authorizations_for_card`
 - **🔧 Bound ADK Tools (`2`)**: `query_ivr_call_records` · `golden_02_recent_authorizations_for_card`
@@ -108,7 +108,7 @@ When you click any agent in the `Pipeline` column and click **`▶ Run Agent Liv
 **Mobile Banking & Digital Wallet Token Specialist (`CHANNEL_PRODUCER · MOBILE_APP`)**
 - **Starts / Triggered By**: Parallel Stage 1 channel read, Stage 2 token evidence probe (`AV-TOKENS`), or `▶ Run Agent Live`.
 - **Routes Output To**: `08 · consumer_credit_synthesizer_agent`.
-- **🧠 Memory Bank Topics Scoped**: `DEVICE_WALLET_TOKENS` · `RECURRING_MERCHANT_RULES` · `MOBILE_GEO_CHECKIN`
+- **🧠 Memory Bank Topics Scoped**: `DEVICE_WALLET_INVENTORY` · `CARD_LIFECYCLE`
 - **🛡️ Dataplex Catalog Governance**: `wallet_tokens (ACTIVE)` · `devices (ACTIVE)` · `cards (ACTIVE)` · `cards.pan_full (REFUSE · PII)` · `cards.pan_masked (ALLOW_TO_OWNER_ONLY)`
 - **🏛️ Authorized BigQuery Golden Queries (`2`)**: `10_wallet_tokens_active_on_card` · `11_dispute_event_timeline`
 - **🔧 Bound ADK Tools (`2`)**: `query_mobile_wallet_events` · `golden_10_wallet_tokens_active_on_card`
@@ -117,7 +117,7 @@ When you click any agent in the `Pipeline` column and click **`▶ Run Agent Liv
 **Online Banking & Statutory Dispute Policy Specialist (`CHANNEL_PRODUCER · WEB_PORTAL`)**
 - **Starts / Triggered By**: Parallel Stage 1 channel read, Stage 2 dispute ledger + Dataplex glossary lookup (`Reg E` vs `Reg Z`), or `▶ Run Agent Live`.
 - **Routes Output To**: `08 · consumer_credit_synthesizer_agent` and `06 · claim_veracity_validator_agent`.
-- **🧠 Memory Bank Topics Scoped**: `OPEN_DISPUTE_CLAIMS` · `HOTEL_COURIER_ADDRESS` · `STANDING_INSTRUCTIONS`
+- **🧠 Memory Bank Topics Scoped**: `DISPUTE_HISTORY` · `AGENT_COMMITMENTS`
 - **🛡️ Dataplex Catalog Governance**: `disputes (ACTIVE)` · `accounts (ACTIVE)` · `cards (ACTIVE)` · `glossary:regulation-e (VERIFIED)` · `glossary:regulation-z (VERIFIED)` · `cards.pan_full (REFUSE · PII)`
 - **🏛️ Authorized BigQuery Golden Queries (`3`)**: `07_open_disputes_for_customer` · `08_dispute_filing_window_check` · `09_provisional_credit_due`
 - **🔧 Bound ADK Tools (`2`)**: `query_web_portal_activity` · `golden_07_open_disputes_for_customer`
@@ -126,7 +126,7 @@ When you click any agent in the `Pipeline` column and click **`▶ Run Agent Liv
 **In-Branch Banker & Identity Verification Specialist (`CHANNEL_PRODUCER · BRANCH_SUPPORT`)**
 - **Starts / Triggered By**: Parallel Stage 1 channel read, Stage 2 Customer 360 check, or `▶ Run Agent Live`.
 - **Routes Output To**: `08 · consumer_credit_synthesizer_agent` and `06 · claim_veracity_validator_agent`.
-- **🧠 Memory Bank Topics Scoped**: `IN_PERSON_KYC` · `RELATIONSHIP_TENURE` · `BRANCH_CASE_NOTES`
+- **🧠 Memory Bank Topics Scoped**: `CONTACT_PREFERENCE` · `AGENT_COMMITMENTS` · `CARD_LIFECYCLE`
 - **🛡️ Dataplex Catalog Governance**: `v_customer_360 (ACTIVE)` · `customers (ACTIVE)` · `accounts (ACTIVE)` · `cards (ACTIVE)` · `customers.ssn_last4 (REFUSE · PII)` · `customers.customer_id (ALLOW)`
 - **🏛️ Authorized BigQuery Golden Queries (`2`)**: `01_customer_360_snapshot` · `11_dispute_event_timeline`
 - **🔧 Bound ADK Tools (`2`)**: `query_branch_teller_interactions` · `golden_01_customer_360_snapshot`
@@ -135,7 +135,7 @@ When you click any agent in the `Pipeline` column and click **`▶ Run Agent Liv
 **Pre-Write Claim Veracity Gatekeeper (`PRE_WRITE_VALIDATOR`)**
 - **Starts / Triggered By**: Stage 3 (`phase.3_veracity`) after channel & BigQuery evidence is gathered, or `▶ Run Agent Live`.
 - **Routes Output To**: `08 · consumer_credit_synthesizer_agent` (gates whether `08` writes the session to Memory Bank).
-- **🧠 Memory Bank Topics Scoped**: `TRAVEL_STATUS` · `CARD_LIFECYCLE` · `OPEN_DISPUTE_CLAIMS` · `STEP_UP_AUTH`
+- **🧠 Memory Bank Topics Scoped**: none (checks claims against BigQuery, does not read Memory Bank)
 - **🛡️ Dataplex Catalog Governance**: `v_customer_360 (ACTIVE)` · `authorizations (ACTIVE)` · `disputes (ACTIVE)` · `authorizations_deprecated_v1 (REFUSE · DEPRECATED)` · `customers.ssn_last4 (REFUSE · PII)` · `cards.pan_full (REFUSE · PII)`
 - **🏛️ Authorized BigQuery Golden Queries (`5`)**: `01_customer_360_snapshot` · `02_recent_authorizations_for_card` · `03_suspicious_activity_on_card_window` · `04_geo_impossible_travel` · `07_open_disputes_for_customer`
 - **🔧 Bound ADK Tools (`1`)**: `validate_and_record_customer_claim`
@@ -153,7 +153,7 @@ When you click any agent in the `Pipeline` column and click **`▶ Run Agent Liv
 **Lead Synthesizer & Hub Orchestrator (`LEAD_SYNTHESIZER · CORE_BANKING`)**
 - **Starts / Triggered By**: Receives all spoke outputs (`01`–`06`) in Stage 4 (`phase.4_memory_write` + `/api/chat/stream`), Supervisor Card Control (`▶ Unlock card`), or `▶ Run Agent Live`.
 - **Routes Output To**: Customer / Operator Governed Response UI (`#askAnswerBody`), Supervisor Card Control (`#oversightCardStatusBadge`), and Vertex AI Memory Bank (`memories:generate`).
-- **🧠 Memory Bank Topics Scoped**: `TRAVEL_STATUS` · `CARD_LIFECYCLE` · `OPEN_DISPUTE_CLAIMS` · `DEVICE_WALLET_TOKENS` · `STANDING_INSTRUCTIONS` · `STEP_UP_AUTH`
+- **🧠 Memory Bank Topics Scoped**: all topics configured on the engine
 - **🛡️ Dataplex Catalog Governance**: `v_customer_360 (ACTIVE)` · `disputes (ACTIVE)` · `wallet_tokens (ACTIVE)` · `dispute_events (ACTIVE)` · `glossary:regulation-e (VERIFIED)` · `glossary:regulation-z (VERIFIED)` · `customers.ssn_last4 (REFUSE · PII)` · `cards.pan_full (REFUSE · PII)`
 - **🏛️ Authorized BigQuery Golden Queries (`6`)**: `01_customer_360_snapshot` · `07_open_disputes_for_customer` · `08_dispute_filing_window_check` · `09_provisional_credit_due` · `10_wallet_tokens_active_on_card` · `11_dispute_event_timeline`
 - **🔧 Bound ADK Tools (`3` direct + `7` sub-agent spokes)**: `list_memory_topics_tool` · `read_customer_memory_bank` · `execute_one_click_card_unlock`

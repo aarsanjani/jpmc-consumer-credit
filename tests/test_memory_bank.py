@@ -162,3 +162,17 @@ def test_standalone_preload_context_for_external_agent(monkeypatch):
     assert "fact B" in context["prompt_block"]
     assert context["http_calls"] == ["POST projects/p/locations/us-central1/reasoningEngines/e/memories:retrieve"]
     assert context["memory_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("author", "role"),
+    [("customer", "user"), ("user", "user"), ("telephony_ivr_agent", "model")],
+)
+def test_append_event_sends_customer_turns_as_user_role(monkeypatch, author, role):
+    client = MemoryBankClient(project="p", engine_id="e", access_token="fake")
+    sent = []
+    monkeypatch.setattr(client, "_request", lambda method, url, body=None: sent.append(body) or {})
+
+    client.append_event("projects/p/locations/l/reasoningEngines/e/sessions/s1", author=author, text="hi")
+
+    assert sent[0]["content"]["role"] == role

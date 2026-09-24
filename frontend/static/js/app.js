@@ -497,8 +497,8 @@ const FALLBACK_DESK_AGENTS = [
     name: "telephony_ivr_agent",
     role: "Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR)",
     description:
-      "02 · Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR): Reads inbound customer call transcripts and DTMF step-up authentication turns from Memory Bank (`STEP_UP_AUTH`, `CALL_TRANSCRIPT_FACTS`) and cross-checks reported declined charges against the BigQuery ledger via Golden Query 02.",
-    memory_topics_scoped: ["STEP_UP_AUTH", "TRAVEL_STATUS", "CALL_TRANSCRIPT_FACTS"],
+      "02 · Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR): Reads inbound customer call transcripts and DTMF step-up authentication turns from Memory Bank (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `TRAVEL_STATUS`) and cross-checks reported declined charges against the BigQuery ledger via Golden Query 02.",
+    memory_topics_scoped: ["CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "TRAVEL_STATUS"],
     catalog_governance: [
       "authorizations (ACTIVE)",
       "cards (ACTIVE)",
@@ -515,8 +515,8 @@ const FALLBACK_DESK_AGENTS = [
     name: "mobile_app_agent",
     role: "Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP)",
     description:
-      "03 · Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP): Tracks in-app push challenges, biometric logins, and Apple Pay / Google Pay device token provisioning (`DEVICE_WALLET_TOKENS`), verifying whether any device token can still spend on a frozen card via Golden Query 10.",
-    memory_topics_scoped: ["DEVICE_WALLET_TOKENS", "RECURRING_MERCHANT_RULES", "MOBILE_GEO_CHECKIN"],
+      "03 · Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP): Tracks in-app push challenges, biometric logins, and Apple Pay / Google Pay device token provisioning (`DEVICE_WALLET_INVENTORY`, `CARD_LIFECYCLE`), verifying whether any device token can still spend on a frozen card via Golden Query 10.",
+    memory_topics_scoped: ["DEVICE_WALLET_INVENTORY", "CARD_LIFECYCLE"],
     catalog_governance: [
       "wallet_tokens (ACTIVE)",
       "devices (ACTIVE)",
@@ -532,8 +532,8 @@ const FALLBACK_DESK_AGENTS = [
     name: "web_portal_agent",
     role: "Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL)",
     description:
-      "04 · Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL): Reads online dispute filings and courier delivery instructions (`OPEN_DISPUTE_CLAIMS`, `HOTEL_COURIER_ADDRESS`), and reconciles open disputes against BigQuery Golden Queries 07, 08, 09 and Dataplex Glossary (`Regulation E` debit vs `Regulation Z` credit).",
-    memory_topics_scoped: ["OPEN_DISPUTE_CLAIMS", "HOTEL_COURIER_ADDRESS", "STANDING_INSTRUCTIONS"],
+      "04 · Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL): Reads online dispute filings and agent commitments (`DISPUTE_HISTORY`, `AGENT_COMMITMENTS`), and reconciles open disputes against BigQuery Golden Queries 07, 08, 09 and Dataplex Glossary (`Regulation E` debit vs `Regulation Z` credit).",
+    memory_topics_scoped: ["DISPUTE_HISTORY", "AGENT_COMMITMENTS"],
     catalog_governance: [
       "disputes (ACTIVE)",
       "accounts (ACTIVE)",
@@ -554,8 +554,8 @@ const FALLBACK_DESK_AGENTS = [
     name: "branch_support_agent",
     role: "In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT)",
     description:
-      "05 · In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT): Reads in-person teller and branch banker KYC sessions (`IN_PERSON_KYC`, `BRANCH_CASE_NOTES`) from Memory Bank and verifies customer 360 identity and 90-day tenure via Golden Query 01.",
-    memory_topics_scoped: ["IN_PERSON_KYC", "RELATIONSHIP_TENURE", "BRANCH_CASE_NOTES"],
+      "05 · In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT): Reads in-person teller and branch banker sessions (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `CARD_LIFECYCLE`) from Memory Bank and verifies customer 360 identity and 90-day tenure via Golden Query 01.",
+    memory_topics_scoped: ["CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "CARD_LIFECYCLE"],
     catalog_governance: [
       "v_customer_360 (ACTIVE)",
       "customers (ACTIVE)",
@@ -572,8 +572,8 @@ const FALLBACK_DESK_AGENTS = [
     name: "claim_veracity_validator_agent",
     role: "Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR)",
     description:
-      "06 · Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR): Gates every incoming customer claim before Memory Bank consolidation by cross-checking BigQuery Golden Queries (01, 02, 03, 04, 07) and scoped memories to block contradicted travel timelines or mismatched dispute amounts.",
-    memory_topics_scoped: ["TRAVEL_STATUS", "CARD_LIFECYCLE", "OPEN_DISPUTE_CLAIMS", "STEP_UP_AUTH"],
+      "06 · Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR): Gates every incoming customer claim before Memory Bank consolidation by cross-checking BigQuery Golden Queries (01, 02, 03, 04, 07) to flag contradicted travel timelines or mismatched dispute amounts.",
+    memory_topics_scoped: ["NONE (checks claims against BigQuery, does not read Memory Bank)"],
     catalog_governance: [
       "v_customer_360 (ACTIVE)",
       "authorizations (ACTIVE)",
@@ -597,7 +597,7 @@ const FALLBACK_DESK_AGENTS = [
     role: "Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)",
     description:
       "07 · Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB): Runs an async / scheduled sweep across enterprise customer memory scopes (`CUST00001`..`CUST00010`) against BigQuery telemetry to detect stale travel notices and un-superseded contradictions.",
-    memory_topics_scoped: ["ALL_TOPICS (Enterprise Audit Scope: CUST00001 .. CUST00010)"],
+    memory_topics_scoped: ["ALL (every topic configured on the engine)"],
     catalog_governance: [
       "v_customer_360 (ACTIVE)",
       "authorizations (ACTIVE)",
@@ -614,14 +614,7 @@ const FALLBACK_DESK_AGENTS = [
     role: "Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING)",
     description:
       "08 · Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING): Hub of the 8-agent topology and the single agent that speaks to the customer/operator. Collects telemetry from all 7 spokes, queries `list_memory_topics_tool`, reconstructs the causal timeline via `read_customer_memory_bank`, and stages governed card unlocks.",
-    memory_topics_scoped: [
-      "TRAVEL_STATUS",
-      "CARD_LIFECYCLE",
-      "OPEN_DISPUTE_CLAIMS",
-      "DEVICE_WALLET_TOKENS",
-      "STANDING_INSTRUCTIONS",
-      "STEP_UP_AUTH",
-    ],
+    memory_topics_scoped: ["ALL (every topic configured on the engine)"],
     catalog_governance: [
       "v_customer_360 (ACTIVE)",
       "disputes (ACTIVE)",

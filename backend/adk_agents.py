@@ -44,10 +44,11 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import certifi
 from dotenv import load_dotenv
@@ -863,11 +864,44 @@ def _event_rows(bank: MemoryBankClient, session_name: str) -> List[Dict[str, Any
     return rows
 
 
+# Which Memory Bank topics each channel agent reads. The labels come from
+# memory/custom_topics.yaml and are checked against the live engine in
+# _topic_filter. The synthesizer and the auditor read the whole scope, and the
+# veracity validator doesn't read Memory Bank at all (it checks BigQuery).
+AGENT_MEMORY_TOPICS: Dict[str, Tuple[str, ...]] = {
+    "fraud_monitoring_agent": ("CARD_LIFECYCLE", "TRAVEL_STATUS", "SPENDING_CONTEXT"),
+    "telephony_ivr_agent": ("CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "TRAVEL_STATUS"),
+    "mobile_app_agent": ("DEVICE_WALLET_INVENTORY", "CARD_LIFECYCLE"),
+    "web_portal_agent": ("DISPUTE_HISTORY", "AGENT_COMMITMENTS"),
+    "branch_support_agent": ("CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "CARD_LIFECYCLE"),
+}
+ALL_TOPICS_LABEL = "ALL (every topic configured on the engine)"
+NO_MEMORY_READS_LABEL = "NONE (checks claims against BigQuery, does not read Memory Bank)"
+
+
+def _topic_filter(bank: MemoryBankClient, topics: Sequence[str]) -> Optional[str]:
+    """Builds the memories:retrieve filter for `topics`, or None for no filter.
+
+    A label the engine doesn't know would match nothing and quietly empty the
+    result, so it's left out and logged instead.
+    """
+    if not topics:
+        return None
+    configured = {topic["label"] for topic in bank.memory_topics()}
+    if unknown := [topic for topic in topics if topic not in configured]:
+        LOG.warning("topics %s are not configured on the Memory Bank engine; left out of the filter", unknown)
+    usable = [topic for topic in topics if topic in configured]
+    if not usable:
+        return None
+    return " OR ".join('topics.custom_memory_topic_label: "%s"' % topic for topic in usable)
+
+
 def _memory_rows(bank: MemoryBankClient, scope: Dict[str, str], query: str,
-                 top_k: int) -> List[Dict[str, Any]]:
+                 top_k: int, topics: Sequence[str] = ()) -> List[Dict[str, Any]]:
     """Retrieval and ranking run inside Google - `retrieve` is a service call."""
     rows: List[Dict[str, Any]] = []
-    for item in bank.retrieve(scope=scope, query=query or None, top_k=top_k):
+    memory_filter = _topic_filter(bank, topics)
+    for item in bank.retrieve(scope=scope, query=query or None, top_k=top_k, memory_filter=memory_filter):
         memory = item.get("memory", item)
         memory_name = mb_field(memory, "name")
         source = "memories.retrieve:%s" % (
@@ -877,7 +911,7 @@ def _memory_rows(bank: MemoryBankClient, scope: Dict[str, str], query: str,
             "memory_id": _tagged_value(
                 str(memory_name).split("/")[-1] if memory_name != NOT_RECORDED else NOT_RECORDED, source),
             "fact": _tagged_value(mb_field(memory, "fact"), source),
-            "topics": _tagged_value(mb_field(memory, "topics"), source),
+            "topics": _tagged_value(topic_labels(memory) or NOT_RECORDED, source),
             "update_time": _tagged_value(mb_field(memory, "updateTime"), source),
             "distance": _tagged_value(mb_field(item, "distance"), source),
         })
@@ -1003,18 +1037,21 @@ def _produce_channel_payload(
                 channel, considered, skipped_scope, skipped_channel, sorted(seen_labels),
             )
 
-        memories = _memory_rows(bank, scope, memory_query, top_k)
+        topics = AGENT_MEMORY_TOPICS.get(agent_name, ())
+        memories = _memory_rows(bank, scope, memory_query, top_k, topics)
 
         turn_handle.detail(
             sessions=len(matched),
             memories=len(memories),
             considered=considered,
+            topics=",".join(topics) or "all",
         )
         return {
             "channel": identity(channel, channel_source, "agent identity constant"),
             "customer_scope": computed(scope, "scope argument sent to sessions.list / memories.retrieve"),
             "memory_bank_parent": computed(bank.parent, "MemoryBankClient.parent"),
             "retrieval_query": computed(memory_query, "channel retrieval query issued by %s" % channel_source),
+            "retrieval_topics": computed(list(topics) or ALL_TOPICS_LABEL, "AGENT_MEMORY_TOPICS[%s]" % agent_name),
             "sessions": matched,
             "session_count": computed(len(matched), "count of sessions.list rows matching channel token + scope"),
             "memories": memories,
@@ -1106,15 +1143,18 @@ def read_customer_memory_bank(
     customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
     query: str = "",
     top_k: int = DEFAULT_CHANNEL_TOP_K,
+    topics: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Synthesizer read path: scoped memories straight from Memory Bank.
 
     An empty `query` means simple retrieval of everything in scope; a non-empty
     one is a similarity search the service runs - this process does no ranking.
+    `topics` narrows the read to those topic labels (see list_memory_topics_tool);
+    leave it empty to read across every topic.
     """
     bank = _memory_bank(None)
     scope = {"customer_id": customer_id}
-    memories = _memory_rows(bank, scope, query, top_k)
+    memories = _memory_rows(bank, scope, query, top_k, topics or ())
     return {
         "customer_scope": computed(scope, "scope argument sent to memories.retrieve"),
         "memory_bank_parent": computed(bank.parent, "MemoryBankClient.parent"),
@@ -1123,6 +1163,7 @@ def read_customer_memory_bank(
             "similaritySearchParams" if query else "simpleRetrievalParams",
             "MemoryBankClient.retrieve request body branch",
         ),
+        "retrieval_topics": computed(topics or ALL_TOPICS_LABEL, "topics argument passed to read_customer_memory_bank"),
         "memories": memories,
         "memory_count": computed(len(memories), "count of memories.retrieve rows"),
     }
@@ -1709,12 +1750,17 @@ def _log_agent_tree(root: LlmAgent, built_by: str) -> None:
 
 def _spoke_agent(name: str, model: str, description: str, instruction: str,
                  tools: List[Any]) -> LlmAgent:
-    """A spoke can only answer the hub.
+    """A spoke that can't transfer to a peer or back to the hub.
 
-    Both transfer flags are off so a spoke cannot hand the customer to a peer or
-    walk back up the tree: every hop goes through the synthesizer, which is what
-    makes the run auditable.
+    With transfer back to the parent disabled, a run that the hub hands to a
+    spoke ends inside that spoke. The hub can't collect several spokes'
+    results in one run; the planned fix is a SequentialAgent/ParallelAgent workflow.
     """
+    if topics := AGENT_MEMORY_TOPICS.get(name):
+        instruction += (
+            " Your Memory Bank reads are limited to these topics: %s. Treat anything "
+            "outside them as another channel's job." % ", ".join(topics)
+        )
     return LlmAgent(
         name=name,
         model=model,
@@ -1855,7 +1901,10 @@ def create_consumer_credit_synthesizer_agent(
             "the only agent that talks to the customer. Collect each channel's account from its "
             "producer spoke, read the consolidated view with read_customer_memory_bank, and "
             "use list_memory_topics_tool to know what the bank files and to say which topic a "
-            "fact came from when it matters, and "
+            "fact came from when it matters. When a question is clearly about one area (for "
+            "example where the customer is, or which card is live), pass the matching topic "
+            "labels from list_memory_topics_tool as `topics` and write `query` in the "
+            "customer's own words; leave `topics` empty for an open question, and "
             "state the causal chain in order. Run execute_one_click_card_unlock only after the "
             "veracity gate has passed the claim, and repeat its result as given: it stages the "
             "unlock and writes the audit trail, it does not confirm the card platform acted. "
@@ -1903,7 +1952,7 @@ def list_all_agents() -> List[AgentDescriptor]:
                 "`check_table`/`check_column` to refuse `authorizations_deprecated_v1` and `cards.pan_full`), "
                 "and BigQuery Golden Queries 03 & 04."
             ),
-            memory_topics_scoped=["TRAVEL_STATUS", "CARD_LIFECYCLE", "SPENDING_CONTEXT"],
+            memory_topics_scoped=list(AGENT_MEMORY_TOPICS["fraud_monitoring_agent"]),
             catalog_governance=[
                 "authorizations (ACTIVE)",
                 "agg_merchant_velocity_daily (ACTIVE)",
@@ -1934,10 +1983,10 @@ def list_all_agents() -> List[AgentDescriptor]:
             description=(
                 "02 · Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR): "
                 "Reads inbound customer call transcripts and DTMF step-up authentication turns from "
-                "Memory Bank (`STEP_UP_AUTH`, `CALL_TRANSCRIPT_FACTS`) and cross-checks reported "
+                "Memory Bank (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `TRAVEL_STATUS`) and cross-checks reported "
                 "declined charges against the BigQuery ledger via Golden Query 02."
             ),
-            memory_topics_scoped=["STEP_UP_AUTH", "TRAVEL_STATUS", "CALL_TRANSCRIPT_FACTS"],
+            memory_topics_scoped=list(AGENT_MEMORY_TOPICS["telephony_ivr_agent"]),
             catalog_governance=[
                 "authorizations (ACTIVE)",
                 "cards (ACTIVE)",
@@ -1962,10 +2011,10 @@ def list_all_agents() -> List[AgentDescriptor]:
             description=(
                 "03 · Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP): "
                 "Tracks in-app push challenges, biometric logins, and Apple Pay / Google Pay device token "
-                "provisioning (`DEVICE_WALLET_TOKENS`), verifying whether any device token can still spend "
+                "provisioning (`DEVICE_WALLET_INVENTORY`, `CARD_LIFECYCLE`), verifying whether any device token can still spend "
                 "on a frozen card via Golden Query 10."
             ),
-            memory_topics_scoped=["DEVICE_WALLET_TOKENS", "RECURRING_MERCHANT_RULES", "MOBILE_GEO_CHECKIN"],
+            memory_topics_scoped=list(AGENT_MEMORY_TOPICS["mobile_app_agent"]),
             catalog_governance=[
                 "wallet_tokens (ACTIVE)",
                 "devices (ACTIVE)",
@@ -1991,11 +2040,11 @@ def list_all_agents() -> List[AgentDescriptor]:
             ],
             description=(
                 "04 · Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL): "
-                "Reads online dispute filings and courier delivery instructions (`OPEN_DISPUTE_CLAIMS`, "
-                "`HOTEL_COURIER_ADDRESS`), and reconciles open disputes against BigQuery Golden Queries "
+                "Reads online dispute filings and agent commitments (`DISPUTE_HISTORY`, "
+                "`AGENT_COMMITMENTS`), and reconciles open disputes against BigQuery Golden Queries "
                 "07, 08, 09 and Dataplex Glossary (`Regulation E` debit vs `Regulation Z` credit)."
             ),
-            memory_topics_scoped=["OPEN_DISPUTE_CLAIMS", "HOTEL_COURIER_ADDRESS", "STANDING_INSTRUCTIONS"],
+            memory_topics_scoped=list(AGENT_MEMORY_TOPICS["web_portal_agent"]),
             catalog_governance=[
                 "disputes (ACTIVE)",
                 "accounts (ACTIVE)",
@@ -2023,10 +2072,10 @@ def list_all_agents() -> List[AgentDescriptor]:
             ],
             description=(
                 "05 · In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT): "
-                "Reads in-person teller and branch banker KYC sessions (`IN_PERSON_KYC`, `BRANCH_CASE_NOTES`) "
+                "Reads in-person teller and branch banker sessions (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `CARD_LIFECYCLE`) "
                 "from Memory Bank and verifies customer 360 identity and 90-day tenure via Golden Query 01."
             ),
-            memory_topics_scoped=["IN_PERSON_KYC", "RELATIONSHIP_TENURE", "BRANCH_CASE_NOTES"],
+            memory_topics_scoped=list(AGENT_MEMORY_TOPICS["branch_support_agent"]),
             catalog_governance=[
                 "v_customer_360 (ACTIVE)",
                 "customers (ACTIVE)",
@@ -2051,10 +2100,10 @@ def list_all_agents() -> List[AgentDescriptor]:
             description=(
                 "06 · Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR): "
                 "Gates every incoming customer claim before Memory Bank consolidation by cross-checking "
-                "BigQuery Golden Queries (01, 02, 03, 04, 07) and scoped memories to block contradicted "
+                "BigQuery Golden Queries (01, 02, 03, 04, 07) to flag contradicted "
                 "travel timelines or mismatched dispute amounts."
             ),
-            memory_topics_scoped=["TRAVEL_STATUS", "CARD_LIFECYCLE", "OPEN_DISPUTE_CLAIMS", "STEP_UP_AUTH"],
+            memory_topics_scoped=[NO_MEMORY_READS_LABEL],
             catalog_governance=[
                 "v_customer_360 (ACTIVE)",
                 "authorizations (ACTIVE)",
@@ -2084,7 +2133,7 @@ def list_all_agents() -> List[AgentDescriptor]:
                 "Runs an async / scheduled sweep across enterprise customer memory scopes (`CUST00001`..`CUST00010`) "
                 "against BigQuery telemetry to detect stale travel notices and un-superseded contradictions."
             ),
-            memory_topics_scoped=["ALL_TOPICS (Enterprise Audit Scope: CUST00001 .. CUST00010)"],
+            memory_topics_scoped=[ALL_TOPICS_LABEL],
             catalog_governance=[
                 "v_customer_360 (ACTIVE)",
                 "authorizations (ACTIVE)",
@@ -2111,14 +2160,7 @@ def list_all_agents() -> List[AgentDescriptor]:
                 "Collects telemetry from all 7 spokes, queries `list_memory_topics_tool`, reconstructs "
                 "the causal timeline via `read_customer_memory_bank`, and stages governed card unlocks."
             ),
-            memory_topics_scoped=[
-                "TRAVEL_STATUS",
-                "CARD_LIFECYCLE",
-                "OPEN_DISPUTE_CLAIMS",
-                "DEVICE_WALLET_TOKENS",
-                "STANDING_INSTRUCTIONS",
-                "STEP_UP_AUTH",
-            ],
+            memory_topics_scoped=[ALL_TOPICS_LABEL],
             catalog_governance=[
                 "v_customer_360 (ACTIVE)",
                 "disputes (ACTIVE)",

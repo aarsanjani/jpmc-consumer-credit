@@ -76,6 +76,9 @@ DEFAULT_API_VERSION = "v1beta1"   # memories:* live here today
 DEFAULT_LOCATION = "us-central1"
 DEFAULT_TIMEOUT = 60
 CALL_HISTORY = 200
+# Event authors that mean "the customer said this". Everything else is sent as
+# role "model", which tells Memory Bank the bank said it, not the customer.
+CUSTOMER_AUTHORS = frozenset({"user", "customer"})
 
 # Set by MemoryBankClient.recording(). A contextvar, not client state, because
 # one client is shared by concurrent Flask requests.
@@ -315,7 +318,7 @@ class MemoryBankClient:
         event: Dict[str, Any] = {
             "author": author,
             "content": {
-                "role": "user" if author == "user" else "model",
+                "role": "user" if author in CUSTOMER_AUTHORS else "model",
                 "parts": [{"text": text}],
             },
         }
