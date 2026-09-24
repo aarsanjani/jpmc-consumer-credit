@@ -293,9 +293,8 @@ class MemoryBankClient:
                 "parts": [{"text": text}],
             },
         }
-        if invocation_id:
-            event["invocationId"] = invocation_id
-        stamp = rfc3339(timestamp)
+        event["invocationId"] = invocation_id or ("inv-%d" % int(time.time() * 1000))
+        stamp = rfc3339(timestamp or datetime.now(timezone.utc))
         if stamp:
             event["timestamp"] = stamp
 
