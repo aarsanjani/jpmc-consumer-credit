@@ -154,7 +154,10 @@ class DataplexCatalogClient:
         self.entry_group = entry_group
         self.timeout = timeout
         self.verbose = verbose
+        self._explicit_token = access_token
         self._token = access_token
+        self._token_fetched_at: float = 0.0
+        self._creds: Any = None
         self.calls: List[str] = []
 
     # -- names, mirroring scripts/setup_catalog.py -------------------------
@@ -186,22 +189,33 @@ class DataplexCatalogClient:
 
     # -- plumbing ----------------------------------------------------------
 
-    def token(self) -> str:
-        if self._token:
-            return self._token
+    def token(self, force_refresh: bool = False) -> str:
+        if self._explicit_token:
+            return self._explicit_token
         env = os.environ.get("CATALOG_TOKEN") or os.environ.get("MEMORY_BANK_TOKEN")
-        if env:
+        if env and not force_refresh:
             self._token = env
             return env
+        now = time.time()
+        is_expired = bool(self._creds and getattr(self._creds, "expired", False))
+        if (
+            not force_refresh
+            and self._token
+            and not is_expired
+            and (now - self._token_fetched_at) < 2700.0
+        ):
+            return self._token
         try:
             import google.auth
             from google.auth.transport.requests import Request
 
-            creds, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-            creds.refresh(Request())
-            self._token = creds.token
+            if self._creds is None or force_refresh:
+                self._creds, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+            self._creds.refresh(Request())
+            self._token = self._creds.token
+            self._token_fetched_at = time.time()
             return self._token
         except Exception as exc:  # noqa: BLE001
             raise CatalogError(
@@ -213,23 +227,26 @@ class DataplexCatalogClient:
 
     def _request(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = json.dumps(body).encode("utf-8") if body is not None else None
-        request = urllib.request.Request(url=url, data=payload, method=method)
-        request.add_header("Authorization", "Bearer %s" % self.token())
-        request.add_header("Content-Type", "application/json")
-
         self.calls.append("%s %s" % (method, url.split("/v1/")[-1][:110]))
         if self.verbose:
             print("  %-5s %s" % (method, url.replace("https://" + DATAPLEX_HOST, "")[:120]))
 
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                text = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raise CatalogError(exc.code, url, exc.read().decode("utf-8", "replace"))
-        except urllib.error.URLError as exc:
-            raise CatalogError(0, url, "Network error: %s" % exc.reason)
-
-        return json.loads(text) if text.strip() else {}
+        for attempt in (1, 2):
+            request = urllib.request.Request(url=url, data=payload, method=method)
+            request.add_header("Authorization", "Bearer %s" % self.token(force_refresh=(attempt > 1)))
+            request.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    text = response.read().decode("utf-8")
+                return json.loads(text) if text.strip() else {}
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401 and attempt == 1 and not self._explicit_token:
+                    self._token = None
+                    continue
+                raise CatalogError(exc.code, url, exc.read().decode("utf-8", "replace"))
+            except urllib.error.URLError as exc:
+                raise CatalogError(0, url, "Network error: %s" % exc.reason)
+        return {}
 
     # -- reads -------------------------------------------------------------
 
