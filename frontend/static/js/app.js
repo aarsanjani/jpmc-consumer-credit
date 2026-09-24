@@ -353,6 +353,15 @@ function formatLiveSpanRow(span, t0) {
   } else if (span.label === "memory.list_topics") {
     kind = "tool";
     what = "memory.list_topics · " + (o.topics != null ? o.topics + " custom topics" : "vocabulary read");
+  } else if (span.label === "adk.in_memory_runner") {
+    kind = "out";
+    what =
+      "ADK InMemoryRunner [" +
+      (f.agent || "agent") +
+      "] · session=" +
+      (o.session_id || "live") +
+      " · tool_calls=" +
+      (o.tool_calls != null ? o.tool_calls : 0);
   } else if (/^phase\./.test(span.label)) {
     kind = "out";
     what =
@@ -391,6 +400,9 @@ function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
   const ch = (f.channel || "").toUpperCase();
   const tool = f.tool || activeGoldenTool || "";
 
+  if (lbl === "adk.in_memory_runner" && ag) {
+    return [ag];
+  }
   if (activePhase === "phase.3_veracity" || lbl === "phase.3_veracity" || /^veracity\./.test(lbl)) {
     return ["claim_veracity_validator_agent"];
   }
@@ -448,14 +460,185 @@ let LAST_TRACED_RUN_ID = "";
 let ALL_DESK_AGENTS = [];
 
 const FALLBACK_DESK_AGENTS = [
-  { agent_id: "01_fraud_monitoring_agent", name: "fraud_monitoring_agent" },
-  { agent_id: "02_telephony_ivr_agent", name: "telephony_ivr_agent" },
-  { agent_id: "03_mobile_app_agent", name: "mobile_app_agent" },
-  { agent_id: "04_web_portal_agent", name: "web_portal_agent" },
-  { agent_id: "05_branch_support_agent", name: "branch_support_agent" },
-  { agent_id: "06_claim_veracity_validator_agent", name: "claim_veracity_validator_agent" },
-  { agent_id: "07_memory_bank_audit_agent", name: "memory_bank_audit_agent" },
-  { agent_id: "08_consumer_credit_synthesizer_agent", name: "consumer_credit_synthesizer_agent" },
+  {
+    agent_id: "01_fraud_monitoring_agent",
+    name: "fraud_monitoring_agent",
+    role: "Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)",
+    description:
+      "01 · Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND): Monitors cross-border velocity anomalies and stolen-card POS attempts using Memory Bank (`TRAVEL_STATUS`, `CARD_LIFECYCLE`), Dataplex Catalog (`discover_sibling_tables` & `check_table`/`check_column` to refuse `authorizations_deprecated_v1` and `cards.pan_full`), and BigQuery Golden Queries 03 & 04.",
+    memory_topics_scoped: ["TRAVEL_STATUS", "CARD_LIFECYCLE", "SPENDING_CONTEXT"],
+    catalog_governance: [
+      "authorizations (ACTIVE)",
+      "agg_merchant_velocity_daily (ACTIVE)",
+      "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
+      "cards.pan_full (REFUSE · PII)",
+      "authorizations.is_fraud (REFUSE · Triage Label)",
+    ],
+    authorized_golden_queries: [
+      "02_recent_authorizations",
+      "03_suspicious_activity_window",
+      "04_geo_impossible_travel",
+      "05_merchant_velocity_spike",
+      "06_cnp_burst_detection",
+      "12_fraud_rate_by_mcc",
+    ],
+    tools: [
+      "query_fraud_velocity_alerts",
+      "golden_03_suspicious_activity_on_card_window",
+      "golden_04_geo_impossible_travel",
+      "execute_fraud_card_control_or_escalate",
+    ],
+  },
+  {
+    agent_id: "02_telephony_ivr_agent",
+    name: "telephony_ivr_agent",
+    role: "Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR)",
+    description:
+      "02 · Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR): Reads inbound customer call transcripts and DTMF step-up authentication turns from Memory Bank (`STEP_UP_AUTH`, `CALL_TRANSCRIPT_FACTS`) and cross-checks reported declined charges against the BigQuery ledger via Golden Query 02.",
+    memory_topics_scoped: ["STEP_UP_AUTH", "TRAVEL_STATUS", "CALL_TRANSCRIPT_FACTS"],
+    catalog_governance: [
+      "authorizations (ACTIVE)",
+      "cards (ACTIVE)",
+      "merchants (ACTIVE)",
+      "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
+      "cards.pan_full (REFUSE · PII)",
+      "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
+    ],
+    authorized_golden_queries: ["02_recent_authorizations_for_card"],
+    tools: ["query_ivr_call_records", "golden_02_recent_authorizations_for_card"],
+  },
+  {
+    agent_id: "03_mobile_app_agent",
+    name: "mobile_app_agent",
+    role: "Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP)",
+    description:
+      "03 · Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP): Tracks in-app push challenges, biometric logins, and Apple Pay / Google Pay device token provisioning (`DEVICE_WALLET_TOKENS`), verifying whether any device token can still spend on a frozen card via Golden Query 10.",
+    memory_topics_scoped: ["DEVICE_WALLET_TOKENS", "RECURRING_MERCHANT_RULES", "MOBILE_GEO_CHECKIN"],
+    catalog_governance: [
+      "wallet_tokens (ACTIVE)",
+      "devices (ACTIVE)",
+      "cards (ACTIVE)",
+      "cards.pan_full (REFUSE · PII)",
+      "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
+    ],
+    authorized_golden_queries: ["10_wallet_tokens_active_on_card", "11_dispute_event_timeline"],
+    tools: ["query_mobile_wallet_events", "golden_10_wallet_tokens_active_on_card"],
+  },
+  {
+    agent_id: "04_web_portal_agent",
+    name: "web_portal_agent",
+    role: "Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL)",
+    description:
+      "04 · Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL): Reads online dispute filings and courier delivery instructions (`OPEN_DISPUTE_CLAIMS`, `HOTEL_COURIER_ADDRESS`), and reconciles open disputes against BigQuery Golden Queries 07, 08, 09 and Dataplex Glossary (`Regulation E` debit vs `Regulation Z` credit).",
+    memory_topics_scoped: ["OPEN_DISPUTE_CLAIMS", "HOTEL_COURIER_ADDRESS", "STANDING_INSTRUCTIONS"],
+    catalog_governance: [
+      "disputes (ACTIVE)",
+      "accounts (ACTIVE)",
+      "cards (ACTIVE)",
+      "glossary:regulation-e (VERIFIED)",
+      "glossary:regulation-z (VERIFIED)",
+      "cards.pan_full (REFUSE · PII)",
+    ],
+    authorized_golden_queries: [
+      "07_open_disputes_for_customer",
+      "08_dispute_filing_window_check",
+      "09_provisional_credit_due",
+    ],
+    tools: ["query_web_portal_activity", "golden_07_open_disputes_for_customer"],
+  },
+  {
+    agent_id: "05_branch_support_agent",
+    name: "branch_support_agent",
+    role: "In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT)",
+    description:
+      "05 · In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT): Reads in-person teller and branch banker KYC sessions (`IN_PERSON_KYC`, `BRANCH_CASE_NOTES`) from Memory Bank and verifies customer 360 identity and 90-day tenure via Golden Query 01.",
+    memory_topics_scoped: ["IN_PERSON_KYC", "RELATIONSHIP_TENURE", "BRANCH_CASE_NOTES"],
+    catalog_governance: [
+      "v_customer_360 (ACTIVE)",
+      "customers (ACTIVE)",
+      "accounts (ACTIVE)",
+      "cards (ACTIVE)",
+      "customers.ssn_last4 (REFUSE · PII)",
+      "customers.customer_id (ALLOW)",
+    ],
+    authorized_golden_queries: ["01_customer_360_snapshot", "11_dispute_event_timeline"],
+    tools: ["query_branch_teller_interactions", "golden_01_customer_360_snapshot"],
+  },
+  {
+    agent_id: "06_claim_veracity_validator_agent",
+    name: "claim_veracity_validator_agent",
+    role: "Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR)",
+    description:
+      "06 · Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR): Gates every incoming customer claim before Memory Bank consolidation by cross-checking BigQuery Golden Queries (01, 02, 03, 04, 07) and scoped memories to block contradicted travel timelines or mismatched dispute amounts.",
+    memory_topics_scoped: ["TRAVEL_STATUS", "CARD_LIFECYCLE", "OPEN_DISPUTE_CLAIMS", "STEP_UP_AUTH"],
+    catalog_governance: [
+      "v_customer_360 (ACTIVE)",
+      "authorizations (ACTIVE)",
+      "disputes (ACTIVE)",
+      "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
+      "customers.ssn_last4 (REFUSE · PII)",
+      "cards.pan_full (REFUSE · PII)",
+    ],
+    authorized_golden_queries: [
+      "01_customer_360_snapshot",
+      "02_recent_authorizations_for_card",
+      "03_suspicious_activity_on_card_window",
+      "04_geo_impossible_travel",
+      "07_open_disputes_for_customer",
+    ],
+    tools: ["validate_and_record_customer_claim"],
+  },
+  {
+    agent_id: "07_memory_bank_audit_agent",
+    name: "memory_bank_audit_agent",
+    role: "Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)",
+    description:
+      "07 · Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB): Runs an async / scheduled sweep across enterprise customer memory scopes (`CUST00001`..`CUST00010`) against BigQuery telemetry to detect stale travel notices and un-superseded contradictions.",
+    memory_topics_scoped: ["ALL_TOPICS (Enterprise Audit Scope: CUST00001 .. CUST00010)"],
+    catalog_governance: [
+      "v_customer_360 (ACTIVE)",
+      "authorizations (ACTIVE)",
+      "disputes (ACTIVE)",
+      "customers.ssn_last4 (REFUSE · PII)",
+      "cards.pan_full (REFUSE · PII)",
+    ],
+    authorized_golden_queries: ["01_customer_360_snapshot", "04_geo_impossible_travel"],
+    tools: ["run_consolidated_memory_audit_sweep"],
+  },
+  {
+    agent_id: "08_consumer_credit_synthesizer_agent",
+    name: "consumer_credit_synthesizer_agent",
+    role: "Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING)",
+    description:
+      "08 · Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING): Hub of the 8-agent topology and the single agent that speaks to the customer/operator. Collects telemetry from all 7 spokes, queries `list_memory_topics_tool`, reconstructs the causal timeline via `read_customer_memory_bank`, and stages governed card unlocks.",
+    memory_topics_scoped: [
+      "TRAVEL_STATUS",
+      "CARD_LIFECYCLE",
+      "OPEN_DISPUTE_CLAIMS",
+      "DEVICE_WALLET_TOKENS",
+      "STANDING_INSTRUCTIONS",
+      "STEP_UP_AUTH",
+    ],
+    catalog_governance: [
+      "v_customer_360 (ACTIVE)",
+      "disputes (ACTIVE)",
+      "wallet_tokens (ACTIVE)",
+      "dispute_events (ACTIVE)",
+      "glossary:regulation-e (VERIFIED)",
+      "glossary:regulation-z (VERIFIED)",
+      "customers.ssn_last4 (REFUSE · PII)",
+      "cards.pan_full (REFUSE · PII)",
+    ],
+    authorized_golden_queries: [
+      "01_customer_360_snapshot",
+      "07_open_disputes_for_customer",
+      "08_dispute_filing_window_check",
+      "09_provisional_credit_due",
+      "10_wallet_tokens_active_on_card",
+      "11_dispute_event_timeline",
+    ],
+    tools: ["list_memory_topics_tool", "read_customer_memory_bank", "execute_one_click_card_unlock"],
+  },
 ];
 
 function setLivePulseState(mode) {
@@ -737,8 +920,7 @@ function renderRoster() {
     const sub = a.subline || "Idle";
     const hasSpans = a.spans && a.spans.length > 0;
     const badgeClass = hasSpans ? "tag ok" : "tag";
-    const cursorStyle = hasSpans ? "cursor:pointer" : "cursor:default";
-    return `<div class="item ${a.state}" style="${cursorStyle}" data-agent-key="${escapeHtml(a.k)}">
+    return `<div class="item ${a.state}" style="cursor:pointer;" title="Click to open Agent Spec Card &amp; run live via ADK InMemoryRunner" data-agent-key="${escapeHtml(a.k)}">
       <div class="item-top"><span class="dot"></span>
       <span class="nm">${escapeHtml(label)}</span><span class="${badgeClass}">${escapeHtml(a.ms)}</span></div>
       <p class="rd">${escapeHtml(sub)}</p></div>`;
@@ -747,13 +929,205 @@ function renderRoster() {
   rosterList.querySelectorAll("[data-agent-key]").forEach((el) => {
     el.addEventListener("click", () => {
       const key = el.getAttribute("data-agent-key");
-      const loggedIdx = AGENTS.findIndex((ag) => ag.k === key);
-      if (loggedIdx >= 0) {
-        pick(loggedIdx);
-        setTrace(true);
-      }
+      openAgentCardModal(key);
     });
   });
+}
+
+let CURRENT_MODAL_AGENT_KEY = "";
+
+function findAgentSpec(agentKey) {
+  const apiAgents = (STATE.channelsSummary && Array.isArray(STATE.channelsSummary.agents))
+    ? STATE.channelsSummary.agents
+    : [];
+  const clean = String(agentKey || "").replace(/^\d+_/, "");
+  const fromApi = apiAgents.find((a) => a.agent_id === agentKey || a.name === agentKey || a.name === clean);
+  const fromFallback = FALLBACK_DESK_AGENTS.find((a) => a.agent_id === agentKey || a.name === agentKey || a.name === clean);
+  return Object.assign({}, fromFallback || {}, fromApi || {});
+}
+
+function openAgentCardModal(agentKey) {
+  const modal = $("agentCardModal");
+  if (!modal) return;
+  CURRENT_MODAL_AGENT_KEY = agentKey;
+
+  const spec = findAgentSpec(agentKey);
+  const deskEntry = ALL_DESK_AGENTS.find((a) => a.k === agentKey || a.name === spec.name);
+  const numPrefix = deskEntry && deskEntry.i ? `${deskEntry.i} · ` : "";
+
+  if ($("agentModalBadge")) {
+    $("agentModalBadge").textContent = `ADK LlmAgent · google.adk.runners.InMemoryRunner · ${spec.model || "gemini-2.5-flash"}`;
+  }
+  if ($("agentModalTitle")) {
+    $("agentModalTitle").textContent = `${numPrefix}${spec.name || agentKey}`;
+  }
+  if ($("agentModalRole")) {
+    $("agentModalRole").textContent = spec.role || "CCB Fraud & Disputes Specialist";
+  }
+  if ($("agentModalDesc")) {
+    $("agentModalDesc").textContent = spec.description || "";
+  }
+
+  const topics = Array.isArray(spec.memory_topics_scoped) ? spec.memory_topics_scoped : [];
+  if ($("agentModalTopics")) {
+    $("agentModalTopics").innerHTML = topics.length
+      ? topics.map((t) => `<span class="tag on">${escapeHtml(t)}</span>`).join("")
+      : `<span class="tag">${NOT_RECORDED}</span>`;
+  }
+
+  const gov = Array.isArray(spec.catalog_governance) ? spec.catalog_governance : [];
+  if ($("agentModalGovernance")) {
+    $("agentModalGovernance").innerHTML = gov.length
+      ? gov.map((g) => {
+          const isRefuse = g.includes("REFUSE") || g.includes("DEPRECATED");
+          const isOwner = g.includes("OWNER_ONLY");
+          const cls = isRefuse ? "no" : isOwner ? "on" : "ok";
+          return `<span class="tag ${cls}">${escapeHtml(g)}</span>`;
+        }).join("")
+      : `<span class="tag">${NOT_RECORDED}</span>`;
+  }
+
+  const gq = Array.isArray(spec.authorized_golden_queries) ? spec.authorized_golden_queries : [];
+  if ($("agentModalGoldenQueries")) {
+    $("agentModalGoldenQueries").innerHTML = gq.length
+      ? gq.map((q) => `<span class="tag ok">${escapeHtml(q)}</span>`).join("")
+      : `<span class="tag">${NOT_RECORDED}</span>`;
+  }
+
+  const tools = Array.isArray(spec.tools) ? spec.tools : [];
+  if ($("agentModalToolsCount")) {
+    $("agentModalToolsCount").textContent = `(${tools.length})`;
+  }
+  if ($("agentModalBoundTools")) {
+    $("agentModalBoundTools").innerHTML = tools.length
+      ? tools.map((tl) => `<span class="tag">${escapeHtml(tl)}</span>`).join("")
+      : `<span class="tag">${NOT_RECORDED}</span>`;
+  }
+
+  const loggedIdx = AGENTS.findIndex((ag) => ag.k === agentKey || ag.name === spec.name);
+  const btnTrace = $("btnViewAgentTraceModal");
+  if (btnTrace) {
+    btnTrace.disabled = loggedIdx < 0;
+    btnTrace.textContent =
+      loggedIdx >= 0
+        ? `View ${AGENTS[loggedIdx].spans.length} Logged Spans in Trace Bar ▴`
+        : "No Spans Logged Yet (Run Agent Live)";
+  }
+
+  if ($("agentModalStatusTag")) {
+    $("agentModalStatusTag").className = loggedIdx >= 0 ? "tag ok" : "tag on";
+    $("agentModalStatusTag").textContent =
+      loggedIdx >= 0
+        ? `TRACED · ${AGENTS[loggedIdx].spans.length} SPANS (${AGENTS[loggedIdx].ms})`
+        : "READY · InMemoryRunner";
+  }
+
+  if ($("agentModalRunnerOutput")) {
+    if (loggedIdx >= 0) {
+      $("agentModalRunnerOutput").innerHTML =
+        `<div><b>Last recorded trace (${escapeHtml(AGENTS[loggedIdx].ms)}):</b> ` +
+        `${AGENTS[loggedIdx].spans.length} spans logged in top Black Trace Bar. ` +
+        `Click <b>▶ Run Agent Live</b> to execute a fresh turn of <code>${escapeHtml(spec.name)}</code> via <code>InMemoryRunner</code>.</div>`;
+    } else {
+      $("agentModalRunnerOutput").innerHTML =
+        `Idle — click <b>▶ Run Agent Live</b> above to construct <code>google.adk.runners.InMemoryRunner</code> for <code>${escapeHtml(spec.name)}</code>, invoke its bound ADK tools against BigQuery / Dataplex / Memory Bank, and stream its spans into the top Black Trace Bar.`;
+    }
+  }
+
+  modal.hidden = false;
+}
+
+function closeAgentCardModal() {
+  const modal = $("agentCardModal");
+  if (modal) modal.hidden = true;
+}
+
+async function runSingleAgentLiveFromModal() {
+  if (!CURRENT_MODAL_AGENT_KEY) return;
+  const spec = findAgentSpec(CURRENT_MODAL_AGENT_KEY);
+  const btnRun = $("btnRunAgentLiveModal");
+  const statusTag = $("agentModalStatusTag");
+  const outEl = $("agentModalRunnerOutput");
+  const metaEl = $("agentModalRunnerMeta");
+
+  if (btnRun) {
+    btnRun.disabled = true;
+    btnRun.textContent = "⏳ Running via InMemoryRunner...";
+  }
+  if (statusTag) {
+    statusTag.className = "tag on";
+    statusTag.textContent = "RUNNING · InMemoryRunner";
+  }
+  if (metaEl) {
+    metaEl.textContent = `Executing ${spec.name || CURRENT_MODAL_AGENT_KEY} on Vertex AI...`;
+  }
+  if (outEl) {
+    outEl.innerHTML =
+      `<div>Constructing <code>InMemoryRunner(agent=${escapeHtml(spec.name || CURRENT_MODAL_AGENT_KEY)}, app_name="ccb_fraud_desk")</code> and calling bound ADK tools against live BigQuery, Dataplex Catalog, and Vertex AI Memory Bank…</div>`;
+  }
+  setLivePulseState("running");
+
+  try {
+    const resp = await fetch(`/api/agents/${encodeURIComponent(CURRENT_MODAL_AGENT_KEY)}/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        customer_id: DEFAULT_CUSTOMER_ID,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    if (data.snapshot) {
+      STATE.channelsSummary = STATE.channelsSummary || {};
+      STATE.channelsSummary.snapshot = data.snapshot;
+      renderChannelEventStream(data.snapshot);
+    }
+    if (data.run_id) {
+      await fetchAndRenderTrace(data.run_id);
+    }
+    const res = data.runner_result || {};
+    const tCalls = pvValue(res.tool_calls);
+    const callNames = Array.isArray(tCalls) ? tCalls.map((c) => c.name).join(" → ") : "none";
+    const sessionStr = pvText(res.session_id);
+    const replyText = pvText(res.agent_response);
+
+    if (statusTag) {
+      statusTag.className = "tag ok";
+      statusTag.textContent = `COMPLETED · Run ${data.run_id || ""}`;
+    }
+    if (metaEl) {
+      metaEl.textContent = `Session ${sessionStr} · Tools called: ${callNames || "0"}`;
+    }
+    if (outEl) {
+      outEl.innerHTML =
+        `<div style="margin-bottom:6px;"><span class="tag ok">InMemoryRunner</span> ` +
+        `<b>Tools invoked:</b> <code>${escapeHtml(callNames || "none")}</code> · ` +
+        `<b>Run ID:</b> <code>${escapeHtml(data.run_id || "")}</code></div>` +
+        `<div style="white-space:pre-wrap;">${formatAgentReply(replyText)}</div>`;
+    }
+    const loggedIdx = AGENTS.findIndex((ag) => ag.k === CURRENT_MODAL_AGENT_KEY || ag.name === spec.name);
+    const btnTrace = $("btnViewAgentTraceModal");
+    if (btnTrace && loggedIdx >= 0) {
+      btnTrace.disabled = false;
+      btnTrace.textContent = `View ${AGENTS[loggedIdx].spans.length} Logged Spans in Trace Bar ▴`;
+    }
+  } catch (err) {
+    setLivePulseState(AGENTS.length ? "done" : "idle");
+    if (statusTag) {
+      statusTag.className = "tag no";
+      statusTag.textContent = "ERROR";
+    }
+    if (outEl) {
+      outEl.innerHTML = `<span style="color:var(--bad);">InMemoryRunner execution failed: ${escapeHtml(err.message)}</span>`;
+    }
+  } finally {
+    if (btnRun) {
+      btnRun.disabled = false;
+      btnRun.textContent = "▶ Run Agent Live";
+    }
+  }
 }
 
 /* Only non-ALLOW verdicts are traps. Each one names the aspect that decided it,
@@ -2171,10 +2545,39 @@ function renderGovernanceTraps(spans) {
     const btnSweep = $("btnTriggerAuditSweep");
     if (btnSweep) btnSweep.addEventListener("click", triggerAsyncAuditSweep);
 
+    // 10. Agent Spec & Live InMemoryRunner Popup Modal (#agentCardModal)
+    const btnCloseModal = $("btnCloseAgentModal");
+    if (btnCloseModal) btnCloseModal.addEventListener("click", closeAgentCardModal);
+    const btnRunModal = $("btnRunAgentLiveModal");
+    if (btnRunModal) btnRunModal.addEventListener("click", runSingleAgentLiveFromModal);
+    const btnTraceModal = $("btnViewAgentTraceModal");
+    if (btnTraceModal) {
+      btnTraceModal.addEventListener("click", () => {
+        const spec = findAgentSpec(CURRENT_MODAL_AGENT_KEY);
+        const loggedIdx = AGENTS.findIndex((ag) => ag.k === CURRENT_MODAL_AGENT_KEY || ag.name === spec.name);
+        if (loggedIdx >= 0) {
+          closeAgentCardModal();
+          pick(loggedIdx);
+          setTrace(true);
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        }
+      });
+    }
+    const agentModalBackdrop = $("agentCardModal");
+    if (agentModalBackdrop) {
+      agentModalBackdrop.addEventListener("click", (e) => {
+        if (e.target === agentModalBackdrop) closeAgentCardModal();
+      });
+    }
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeAgentCardModal();
+    });
+
+    // Hydrate the 8-agent Pipeline immediately at 0ms using FALLBACK_DESK_AGENTS
+    ALL_DESK_AGENTS = buildDeskAgentEntries({ agents: FALLBACK_DESK_AGENTS }, [], "");
+    renderRoster();
+
     // Initial background data hydration for canonical CUST00001
-    // Note: we intentionally do NOT call fetchAndRenderTrace('latest') on page
-    // load so every browser refresh starts with all 8 agents in clean IDLE state
-    // (0 spans) until the operator runs a scenario or injects a live event.
     loadScenarios();
     loadChannelsAndRosterSummary(DEFAULT_CUSTOMER_ID);
     loadDeploymentIdentity(DEFAULT_CUSTOMER_ID);

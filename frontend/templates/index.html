@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
-<link rel="stylesheet" href="/static/css/styles.css?v=20260923e">
+<link rel="stylesheet" href="/static/css/styles.css?v=20260924a">
 </head>
 <body>
 
@@ -338,6 +338,57 @@
   </div>
 </div>
 
-<script src="/static/js/app.js?v=20260923e"></script>
+<!-- ============ AGENT SPEC & LIVE RUNNER POPUP CARD ============ -->
+<div class="agent-modal-backdrop" id="agentCardModal" hidden role="dialog" aria-modal="true" aria-labelledby="agentModalTitle">
+  <div class="agent-modal-card">
+    <div class="agent-modal-hd">
+      <div>
+        <div class="eyebrow" id="agentModalBadge">ADK LlmAgent · InMemoryRunner</div>
+        <h2 id="agentModalTitle">01 · fraud_monitoring_agent</h2>
+        <p class="rd" id="agentModalRole" style="margin:4px 0 0;font-weight:700;"></p>
+      </div>
+      <button type="button" class="chip" id="btnCloseAgentModal" aria-label="Close agent card">Close ×</button>
+    </div>
+
+    <div class="agent-modal-actions">
+      <button type="button" class="cta" id="btnRunAgentLiveModal">▶ Run Agent Live</button>
+      <button type="button" class="chip" id="btnViewAgentTraceModal">View in Trace Bar ▴</button>
+      <span class="tag ok" id="agentModalStatusTag">READY · InMemoryRunner</span>
+    </div>
+
+    <p class="agent-modal-desc" id="agentModalDesc"></p>
+
+    <div class="agent-modal-grid">
+      <div class="agent-spec-row">
+        <div class="spec-label">🧠 Memory Bank Topics Scoped</div>
+        <div class="spec-pills" id="agentModalTopics"></div>
+      </div>
+      <div class="agent-spec-row">
+        <div class="spec-label">🛡️ Dataplex Catalog Governance</div>
+        <div class="spec-pills" id="agentModalGovernance"></div>
+      </div>
+      <div class="agent-spec-row">
+        <div class="spec-label">🏛️ Authorized BigQuery Golden Queries</div>
+        <div class="spec-pills" id="agentModalGoldenQueries"></div>
+      </div>
+      <div class="agent-spec-row">
+        <div class="spec-label">🔧 Bound ADK Tools <span id="agentModalToolsCount"></span></div>
+        <div class="spec-pills" id="agentModalBoundTools"></div>
+      </div>
+    </div>
+
+    <div class="agent-modal-runner" id="agentModalRunnerBox">
+      <div class="spec-label" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>⚡ Live ADK <code>InMemoryRunner</code> Execution</span>
+        <small id="agentModalRunnerMeta">Click ▶ Run Agent Live to execute this LlmAgent on Vertex AI</small>
+      </div>
+      <div id="agentModalRunnerOutput" class="runner-out">
+        Idle — click <b>▶ Run Agent Live</b> above to construct <code>google.adk.runners.InMemoryRunner</code> for this agent, invoke its bound ADK tools against BigQuery / Dataplex / Memory Bank, and stream its spans into the top Black Trace Bar.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/app.js?v=20260924a"></script>
 </body>
 </html>

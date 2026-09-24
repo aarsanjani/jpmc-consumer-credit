@@ -1884,19 +1884,13 @@ def create_consumer_credit_synthesizer_agent(
 
 
 def list_all_agents() -> List[AgentDescriptor]:
-    """The 8 CCB Fraud & Disputes Desk agents: 5 channel producers, the veracity
-    gate, the audit sweeper, and the synthesizer hub they all report to.
-
-    Order matches the roster table in README.md and the names asserted by
-    tests/test_backend.py. `name` is the ADK agent name, because that is what
-    /api/agents/list is checked against.
-    """
+    """The 8 CCB Fraud & Disputes Desk agents (`docs/EIGHT_AGENTS_ROSTER.md`)."""
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     descriptors = [
         AgentDescriptor(
             agent_id=AgentId.FRAUD_MONITORING.value,
             name="fraud_monitoring_agent",
-            role="Fraud Velocity Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)",
+            role="Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)",
             channel=BankChannel.FRAUD_DETECTION,
             model=model_name,
             tools=[
@@ -1905,82 +1899,353 @@ def list_all_agents() -> List[AgentDescriptor]:
                 "golden_04_geo_impossible_travel",
                 "execute_fraud_card_control_or_escalate",
             ],
-            description="Monitors FRAUD_DETECTION / FRAUD_OPS_OUTBOUND sessions, scores velocity and geography with Golden Queries 03 and 04, and stages card block/unblock or escalates to the synthesizer.",
+            description=(
+                "01 · Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND): "
+                "Monitors cross-border velocity anomalies and stolen-card POS attempts using Memory Bank "
+                "(`TRAVEL_STATUS`, `CARD_LIFECYCLE`), Dataplex Catalog (`discover_sibling_tables` & "
+                "`check_table`/`check_column` to refuse `authorizations_deprecated_v1` and `cards.pan_full`), "
+                "and BigQuery Golden Queries 03 & 04."
+            ),
+            memory_topics_scoped=["TRAVEL_STATUS", "CARD_LIFECYCLE", "SPENDING_CONTEXT"],
+            catalog_governance=[
+                "authorizations (ACTIVE)",
+                "agg_merchant_velocity_daily (ACTIVE)",
+                "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
+                "cards.pan_full (REFUSE · PII)",
+                "authorizations.is_fraud (REFUSE · Triage Label)",
+            ],
+            authorized_golden_queries=[
+                "02_recent_authorizations",
+                "03_suspicious_activity_window",
+                "04_geo_impossible_travel",
+                "05_merchant_velocity_spike",
+                "06_cnp_burst_detection",
+                "12_fraud_rate_by_mcc",
+            ],
+            default_live_prompt="For customer CUST00001 and card CARD00002, check fraud velocity alerts and run Golden Queries 03 and 04 for suspicious activity and impossible travel.",
         ),
         AgentDescriptor(
             agent_id=AgentId.TELEPHONY_IVR.value,
             name="telephony_ivr_agent",
-            role="Contact Center IVR Specialist (CHANNEL_PRODUCER)",
+            role="Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR)",
             channel=BankChannel.TELEPHONY_IVR,
             model=model_name,
             tools=[
                 "query_ivr_call_records",
                 "golden_02_recent_authorizations_for_card",
             ],
-            description="Reads the seeded TELEPHONY_IVR call sessions and their recorded turns; declined amounts come from Golden Query 02, not from the transcript.",
+            description=(
+                "02 · Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR): "
+                "Reads inbound customer call transcripts and DTMF step-up authentication turns from "
+                "Memory Bank (`STEP_UP_AUTH`, `CALL_TRANSCRIPT_FACTS`) and cross-checks reported "
+                "declined charges against the BigQuery ledger via Golden Query 02."
+            ),
+            memory_topics_scoped=["STEP_UP_AUTH", "TRAVEL_STATUS", "CALL_TRANSCRIPT_FACTS"],
+            catalog_governance=[
+                "authorizations (ACTIVE)",
+                "cards (ACTIVE)",
+                "merchants (ACTIVE)",
+                "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
+                "cards.pan_full (REFUSE · PII)",
+                "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
+            ],
+            authorized_golden_queries=["02_recent_authorizations_for_card"],
+            default_live_prompt="For customer CUST00001 and card CARD00002, retrieve TELEPHONY_IVR call transcripts and cross-check recent card authorizations with Golden Query 02.",
         ),
         AgentDescriptor(
             agent_id=AgentId.MOBILE_APP.value,
             name="mobile_app_agent",
-            role="Mobile & Digital Wallet Specialist (CHANNEL_PRODUCER)",
+            role="Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP)",
             channel=BankChannel.MOBILE_APP,
             model=model_name,
             tools=[
                 "query_mobile_wallet_events",
                 "golden_10_wallet_tokens_active_on_card",
             ],
-            description="Reads the seeded MOBILE_APP sessions covering wallet provisioning and tokenization outcomes, cross-checked against active tokens in Golden Query 10.",
+            description=(
+                "03 · Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP): "
+                "Tracks in-app push challenges, biometric logins, and Apple Pay / Google Pay device token "
+                "provisioning (`DEVICE_WALLET_TOKENS`), verifying whether any device token can still spend "
+                "on a frozen card via Golden Query 10."
+            ),
+            memory_topics_scoped=["DEVICE_WALLET_TOKENS", "RECURRING_MERCHANT_RULES", "MOBILE_GEO_CHECKIN"],
+            catalog_governance=[
+                "wallet_tokens (ACTIVE)",
+                "devices (ACTIVE)",
+                "cards (ACTIVE)",
+                "cards.pan_full (REFUSE · PII)",
+                "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
+            ],
+            authorized_golden_queries=[
+                "10_wallet_tokens_active_on_card",
+                "11_dispute_event_timeline",
+            ],
+            default_live_prompt="For customer CUST00001 and card CARD00002, inspect MOBILE_APP wallet events and check active digital wallet tokens via Golden Query 10.",
         ),
         AgentDescriptor(
             agent_id=AgentId.WEB_PORTAL.value,
             name="web_portal_agent",
-            role="Online Web Banking Specialist (CHANNEL_PRODUCER)",
+            role="Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL)",
             channel=BankChannel.WEB_PORTAL,
             model=model_name,
             tools=[
                 "query_web_portal_activity",
                 "golden_07_open_disputes_for_customer",
             ],
-            description="Reads the seeded WEB_PORTAL sessions - logins, dispute filings, card controls - and reconciles any dispute against the open-dispute ledger.",
+            description=(
+                "04 · Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL): "
+                "Reads online dispute filings and courier delivery instructions (`OPEN_DISPUTE_CLAIMS`, "
+                "`HOTEL_COURIER_ADDRESS`), and reconciles open disputes against BigQuery Golden Queries "
+                "07, 08, 09 and Dataplex Glossary (`Regulation E` debit vs `Regulation Z` credit)."
+            ),
+            memory_topics_scoped=["OPEN_DISPUTE_CLAIMS", "HOTEL_COURIER_ADDRESS", "STANDING_INSTRUCTIONS"],
+            catalog_governance=[
+                "disputes (ACTIVE)",
+                "accounts (ACTIVE)",
+                "cards (ACTIVE)",
+                "glossary:regulation-e (VERIFIED)",
+                "glossary:regulation-z (VERIFIED)",
+                "cards.pan_full (REFUSE · PII)",
+            ],
+            authorized_golden_queries=[
+                "07_open_disputes_for_customer",
+                "08_dispute_filing_window_check",
+                "09_provisional_credit_due",
+            ],
+            default_live_prompt="For customer CUST00001, inspect WEB_PORTAL sessions and reconcile open disputes across Regulation E and Regulation Z using Golden Query 07.",
         ),
         AgentDescriptor(
             agent_id=AgentId.BRANCH_SUPPORT.value,
             name="branch_support_agent",
-            role="Branch & Teller Specialist (CHANNEL_PRODUCER)",
+            role="In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT)",
             channel=BankChannel.BRANCH_SUPPORT,
             model=model_name,
             tools=[
                 "query_branch_teller_interactions",
                 "golden_01_customer_360_snapshot",
             ],
-            description="Reads the seeded BRANCH_SUPPORT sessions for banker consultations and in-person identity checks, with Golden Query 01 for customer identity only.",
+            description=(
+                "05 · In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT): "
+                "Reads in-person teller and branch banker KYC sessions (`IN_PERSON_KYC`, `BRANCH_CASE_NOTES`) "
+                "from Memory Bank and verifies customer 360 identity and 90-day tenure via Golden Query 01."
+            ),
+            memory_topics_scoped=["IN_PERSON_KYC", "RELATIONSHIP_TENURE", "BRANCH_CASE_NOTES"],
+            catalog_governance=[
+                "v_customer_360 (ACTIVE)",
+                "customers (ACTIVE)",
+                "accounts (ACTIVE)",
+                "cards (ACTIVE)",
+                "customers.ssn_last4 (REFUSE · PII)",
+                "customers.customer_id (ALLOW)",
+            ],
+            authorized_golden_queries=[
+                "01_customer_360_snapshot",
+                "11_dispute_event_timeline",
+            ],
+            default_live_prompt="For customer CUST00001, check BRANCH_SUPPORT banker consultation records and verify customer 360 identity via Golden Query 01.",
         ),
         AgentDescriptor(
             agent_id=AgentId.CLAIM_VERACITY_VALIDATOR.value,
             name="claim_veracity_validator_agent",
-            role="Pre-Write Veracity Gatekeeper (PRE_WRITE_VALIDATOR)",
+            role="Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR)",
             channel=None,
             model=model_name,
             tools=["validate_and_record_customer_claim"],
-            description="Checks a customer claim against ground-truth avenues before any write reaches Memory Bank. Implemented in backend/veracity_and_audit.py.",
+            description=(
+                "06 · Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR): "
+                "Gates every incoming customer claim before Memory Bank consolidation by cross-checking "
+                "BigQuery Golden Queries (01, 02, 03, 04, 07) and scoped memories to block contradicted "
+                "travel timelines or mismatched dispute amounts."
+            ),
+            memory_topics_scoped=["TRAVEL_STATUS", "CARD_LIFECYCLE", "OPEN_DISPUTE_CLAIMS", "STEP_UP_AUTH"],
+            catalog_governance=[
+                "v_customer_360 (ACTIVE)",
+                "authorizations (ACTIVE)",
+                "disputes (ACTIVE)",
+                "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
+                "customers.ssn_last4 (REFUSE · PII)",
+                "cards.pan_full (REFUSE · PII)",
+            ],
+            authorized_golden_queries=[
+                "01_customer_360_snapshot",
+                "02_recent_authorizations_for_card",
+                "03_suspicious_activity_on_card_window",
+                "04_geo_impossible_travel",
+                "07_open_disputes_for_customer",
+            ],
+            default_live_prompt="Validate claim for CUST00001 on WEB_PORTAL: 'My wallet was stolen in Lisbon on Sept 9 with debit card CARD00004 and credit card CARD00002, and I returned early to New York on Sept 10.'",
         ),
         AgentDescriptor(
             agent_id=AgentId.MEMORY_BANK_AUDIT.value,
             name="memory_bank_audit_agent",
-            role="Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)",
+            role="Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)",
             channel=None,
             model=model_name,
             tools=["run_consolidated_memory_audit_sweep"],
-            description="Async / scheduled enterprise-wide consolidated sweep across customer memory banks (kept off the synchronous chat path; triggerable on demand).",
+            description=(
+                "07 · Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB): "
+                "Runs an async / scheduled sweep across enterprise customer memory scopes (`CUST00001`..`CUST00010`) "
+                "against BigQuery telemetry to detect stale travel notices and un-superseded contradictions."
+            ),
+            memory_topics_scoped=["ALL_TOPICS (Enterprise Audit Scope: CUST00001 .. CUST00010)"],
+            catalog_governance=[
+                "v_customer_360 (ACTIVE)",
+                "authorizations (ACTIVE)",
+                "disputes (ACTIVE)",
+                "customers.ssn_last4 (REFUSE · PII)",
+                "cards.pan_full (REFUSE · PII)",
+            ],
+            authorized_golden_queries=[
+                "01_customer_360_snapshot",
+                "04_geo_impossible_travel",
+            ],
+            default_live_prompt="Audit customer CUST00001 Memory Bank facts against BigQuery telemetry and report any stale travel notices or contradictions.",
         ),
         AgentDescriptor(
             agent_id=AgentId.CONSUMER_CREDIT_SYNTHESIZER.value,
             name="consumer_credit_synthesizer_agent",
-            role="Lead Synthesizer Orchestrator (LEAD_SYNTHESIZER)",
+            role="Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING)",
             channel=BankChannel.CORE_BANKING,
             model=model_name,
             tools=["list_memory_topics_tool", "read_customer_memory_bank", "execute_one_click_card_unlock"],
-            description="Hub of the topology: collects every spoke's account, reconstructs the causal chain from Memory Bank, and stages the one-click unlock with its audit trail.",
+            description=(
+                "08 · Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING): "
+                "Hub of the 8-agent topology and the single agent that speaks to the customer/operator. "
+                "Collects telemetry from all 7 spokes, queries `list_memory_topics_tool`, reconstructs "
+                "the causal timeline via `read_customer_memory_bank`, and stages governed card unlocks."
+            ),
+            memory_topics_scoped=[
+                "TRAVEL_STATUS",
+                "CARD_LIFECYCLE",
+                "OPEN_DISPUTE_CLAIMS",
+                "DEVICE_WALLET_TOKENS",
+                "STANDING_INSTRUCTIONS",
+                "STEP_UP_AUTH",
+            ],
+            catalog_governance=[
+                "v_customer_360 (ACTIVE)",
+                "disputes (ACTIVE)",
+                "wallet_tokens (ACTIVE)",
+                "dispute_events (ACTIVE)",
+                "glossary:regulation-e (VERIFIED)",
+                "glossary:regulation-z (VERIFIED)",
+                "customers.ssn_last4 (REFUSE · PII)",
+                "cards.pan_full (REFUSE · PII)",
+            ],
+            authorized_golden_queries=[
+                "01_customer_360_snapshot",
+                "07_open_disputes_for_customer",
+                "08_dispute_filing_window_check",
+                "09_provisional_credit_due",
+                "10_wallet_tokens_active_on_card",
+                "11_dispute_event_timeline",
+            ],
+            default_live_prompt="For customer CUST00001, list the configured Memory Bank topics, read the consolidated customer memory bank, and synthesize the Lisbon stolen-wallet causal chain across Reg E and Reg Z.",
         ),
     ]
     return descriptors
+
+
+def get_adk_agent_by_id_or_name(agent_id_or_name: str) -> LlmAgent:
+    """Resolves any of the 8 desk agents (`01`..`08`) from `create_consumer_credit_synthesizer_agent()`."""
+    key = str(agent_id_or_name or "").strip()
+    clean = key.split("_", 1)[1] if len(key) > 3 and key[:2].isdigit() and key[2] == "_" else key
+    hub = create_consumer_credit_synthesizer_agent()
+    if clean in ("consumer_credit_synthesizer_agent", "synthesizer", "08", ""):
+        return hub
+    for spoke in getattr(hub, "sub_agents", []) or []:
+        if spoke.name == clean or spoke.name == key:
+            return spoke
+    return hub
+
+
+def run_adk_agent_live(
+    agent_id_or_name: str,
+    customer_id: str = "CUST00001",
+    card_id: str = "CARD00002",
+    prompt: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Executes one of the 8 ADK `LlmAgent`s live using `google.adk.runners.InMemoryRunner` (L55).
+
+    Constructs `InMemoryRunner(agent=target_agent, app_name="ccb_fraud_desk")`,
+    creates a session on `runner.session_service`, and runs the agent against
+    Vertex AI Gemini (`gemini-2.5-flash`) so the agent invokes its bound
+    `FunctionTool`s and logs every nested `obs.turn` span.
+    """
+    import asyncio
+    from google.genai import types
+
+    descriptors = {d.name: d for d in list_all_agents()}
+    descriptors.update({d.agent_id: d for d in list_all_agents()})
+    target_agent = get_adk_agent_by_id_or_name(agent_id_or_name)
+    desc = descriptors.get(target_agent.name) or descriptors.get(agent_id_or_name)
+
+    effective_prompt = (
+        str(prompt).strip()
+        if prompt and str(prompt).strip()
+        else (
+            desc.default_live_prompt
+            if desc and desc.default_live_prompt
+            else f"Execute your assigned tools for customer {customer_id} and card {card_id} and summarize findings."
+        )
+    )
+
+    with obs.turn(
+        "adk.in_memory_runner",
+        LOG,
+        agent=target_agent.name,
+        runner="InMemoryRunner",
+        customer_id=customer_id,
+    ) as runner_span:
+        runner = InMemoryRunner(agent=target_agent, app_name="ccb_fraud_desk")
+        session = asyncio.run(
+            runner.session_service.create_session(app_name="ccb_fraud_desk", user_id=customer_id)
+        )
+        user_msg = types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=effective_prompt)],
+        )
+
+        tool_calls: List[Dict[str, Any]] = []
+        tool_responses: List[Dict[str, Any]] = []
+        text_parts: List[str] = []
+        event_count = 0
+
+        for event in runner.run(user_id=customer_id, session_id=session.id, new_message=user_msg):
+            event_count += 1
+            for fc in event.get_function_calls() or []:
+                tool_calls.append({
+                    "name": fc.name,
+                    "args": dict(fc.args) if getattr(fc, "args", None) else {},
+                })
+            for fr in event.get_function_responses() or []:
+                tool_responses.append({
+                    "name": fr.name,
+                })
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if getattr(part, "text", None):
+                        text_parts.append(part.text)
+
+        final_text = "\n".join(t.strip() for t in text_parts if t and t.strip())
+        runner_span.detail(
+            session_id=session.id,
+            events=event_count,
+            tool_calls=len(tool_calls),
+            status="COMPLETED",
+        )
+
+    return {
+        "status": "SUCCESS",
+        "runner": live("google.adk.runners.InMemoryRunner", "backend/adk_agents.py:run_adk_agent_live"),
+        "agent_id": desc.agent_id if desc else target_agent.name,
+        "agent_name": target_agent.name,
+        "role": desc.role if desc else target_agent.description,
+        "model": str(getattr(target_agent, "model", "gemini-2.5-flash")),
+        "session_id": live(session.id, "InMemoryRunner.session_service.create_session"),
+        "prompt": effective_prompt,
+        "events_count": computed(event_count, "InMemoryRunner.run"),
+        "tool_calls": live(tool_calls, "InMemoryRunner.run.get_function_calls"),
+        "tool_responses": live(tool_responses, "InMemoryRunner.run.get_function_responses"),
+        "agent_response": live(final_text or NOT_RECORDED, "InMemoryRunner.run.content"),
+    }

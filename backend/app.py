@@ -315,7 +315,36 @@ def get_all_agents():
     if _adk is None:
         return _unavailable("backend.adk_agents", "the agent roster")
     agents = _adk.list_all_agents()
-    return jsonify({"count": len(agents), "agents": [a.model_dump() for a in agents]})
+    return jsonify({"count": len(agents), "agents": [a.model_dump(mode="json") for a in agents]})
+
+
+@app.route("/api/agents/<agent_key>/run", methods=["POST"])
+def run_single_adk_agent_live(agent_key: str):
+    """Executes one of the 8 ADK `LlmAgent`s live via `google.adk.runners.InMemoryRunner`."""
+    if _adk is None or not hasattr(_adk, "run_adk_agent_live"):
+        return _unavailable("backend.adk_agents", "live ADK InMemoryRunner execution")
+    with obs.run_context(kind="chat") as run_id:
+        body = payload()
+        customer_id = body_customer(body)
+        card_id = str(body.get("card_id") or DEFAULT_CREDIT_CARD_ID).strip()
+        prompt = str(body.get("prompt") or "").strip() or None
+        try:
+            runner_result = _adk.run_adk_agent_live(
+                agent_id_or_name=agent_key,
+                customer_id=customer_id,
+                card_id=card_id,
+                prompt=prompt,
+            )
+            snapshot = _adk.produce_all_channels_snapshot(customer_id=customer_id)
+        except Exception as exc:  # noqa: BLE001
+            return _upstream_error(exc, f"InMemoryRunner({agent_key})")
+        return jsonify({
+            "status": "SUCCESS",
+            "run_id": run_id,
+            "tool_trajectory": _measured_tool_trajectory(run_id),
+            "runner_result": runner_result,
+            "snapshot": snapshot,
+        })
 
 
 @app.route("/api/session", methods=["GET"])
