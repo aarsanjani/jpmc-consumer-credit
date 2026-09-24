@@ -71,8 +71,14 @@ refer to the following files for best-practices
 sequential_multi_agent_development_guide.md
 architecture.md
 
+## Communication, Comments, and Handoff Rules (`@rules:communication_and_code_style`)
 
-
-
-
+1. **Tone & Wording**: No jargon, no fluff. Keep responses concise, natural, conversational, simple, and precise in plain English.
+2. **Comments & Declarations**:
+   - Do not explain self-explanatory code. Let the code speak for itself and avoid verbose comments.
+   - Write necessary comments in the same plain, natural English.
+   - When declaring a new component or singleton, add a short description and a direct pointer (`file.py:SymbolName`) to its implementation.
+3. **Final Handoff**:
+   - Never assume. Clearly state what changed, why it was changed, the outcome (success or failure), and key learnings.
+   - Follow clean, idiomatic coding practices.
 

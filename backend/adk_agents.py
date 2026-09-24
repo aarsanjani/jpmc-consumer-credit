@@ -93,20 +93,20 @@ from backend import obs
 
 load_dotenv()
 
-# No handler is installed here. `obs.configure()` is an explicit call made by
-# app.py and by scripts/trace_adk_agents.py; importing this module must not
-# decide where anyone's log records go.
+# Trace recorder and structured logger (`backend/obs.py:get_logger`, L148).
 LOG = obs.get_logger(__name__)
 
+# Point Python HTTPS clients (`requests`, `google-auth`, `bigquery`) to certifi's
+# root CA bundle so TLS handshakes to `*.googleapis.com` never fail on local venvs.
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
-# Engine-level singletons (NOT bound to any single customer_id at initialization)
+# Shared engine-level clients (customer_id is passed per call, not at startup):
+# - MemoryBankClient (`backend/memory_bank.py:create_default_memory_bank_client`, L439)
+# - CatalogGovernor  (`backend/knowledge_catalog.py:create_default_catalog_governor`, L608)
 GLOBAL_MEMORY_BANK_CLIENT: MemoryBankClient = create_default_memory_bank_client(verbose=False)
 GLOBAL_CATALOG_GOVERNOR: CatalogGovernor = create_default_catalog_governor(strict=True, verbose=False)
 
-# Import-time, so it is the first thing in any log and answers "which engine and
-# which dataset was this run actually talking to" before anything else happens.
 LOG.debug(
     "singletons ready memory_bank_parent=%s catalog_project=%s dataset=%s strict=%s",
     GLOBAL_MEMORY_BANK_CLIENT.parent,
@@ -117,11 +117,16 @@ LOG.debug(
 
 
 # ==============================================================================
-# 1. GOLDEN QUERY CONTRACT REGISTRY (`queries/golden/INDEX.md` -> 12 `.sql` files)
+# 1. GOLDEN QUERY CONTRACT REGISTRY (`docs/GOLDEN_QUERIES_ARCHITECTURE.md`)
 # ==============================================================================
 
 def _resolve_golden_sql_dir() -> Path:
-    """Finds the directory containing `01_customer_360_snapshot.sql` .. `12_*.sql`."""
+    """Returns the folder holding the 12 reviewed `.sql` files (`01`..`12`).
+
+    Used by `load_golden_sql_text()` inside `execute_golden_query_contract()` (L331)
+    so agents only run parameterized SQL contracts rather than writing raw SQL.
+    See `docs/GOLDEN_QUERIES_ARCHITECTURE.md` for the full agent-to-query matrix.
+    """
     repo_root = Path(__file__).resolve().parent.parent
     tracked_dir = repo_root / "backend" / "queries" / "golden"
     if tracked_dir.exists():
@@ -130,6 +135,10 @@ def _resolve_golden_sql_dir() -> Path:
     return kit_dir
 
 
+# Maps each of the 12 SQL contracts (`01`..`12`) to:
+#   - Which agents are allowed to run it (`authorized_agents`)
+#   - Which BigQuery tables and sensitive columns Dataplex must check before execution
+# Enforced at runtime by `execute_golden_query_contract()` (`backend/adk_agents.py:331`).
 GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
     "01": GoldenQueryContract(
         query_id="01",
