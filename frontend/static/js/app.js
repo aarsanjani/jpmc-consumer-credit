@@ -409,7 +409,7 @@ function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
   if (lbl === "audit.consolidated_sweep" || ag === "memory_bank_audit_agent") {
     return ["memory_bank_audit_agent"];
   }
-  if (/^synthesizer\./.test(lbl) || lbl === "memory.consolidate" || lbl === "memory.list_topics") {
+  if (/^synthesizer\./.test(lbl) || lbl === "memory.consolidate" || lbl === "memory.list_topics" || lbl === "phase.4_memory_write") {
     return ["consumer_credit_synthesizer_agent"];
   }
   if (lbl === "oversight.card_decision") {
@@ -418,39 +418,42 @@ function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
       : ["consumer_credit_synthesizer_agent", "mobile_app_agent"];
   }
   if (lbl === "channel.produce") {
-    if (ag) return [ag, "consumer_credit_synthesizer_agent"];
+    if (ag) return [ag];
+    if (ch.indexOf("FRAUD") >= 0) return ["fraud_monitoring_agent"];
+    if (ch.indexOf("IVR") >= 0 || ch.indexOf("TELEPHONY") >= 0) return ["telephony_ivr_agent"];
+    if (ch.indexOf("MOBILE") >= 0) return ["mobile_app_agent"];
+    if (ch.indexOf("WEB") >= 0) return ["web_portal_agent"];
+    if (ch.indexOf("BRANCH") >= 0) return ["branch_support_agent"];
+  }
+  if (lbl === "channel.ingest") {
     if (ch.indexOf("FRAUD") >= 0) return ["fraud_monitoring_agent", "consumer_credit_synthesizer_agent"];
-    if (ch.indexOf("IVR") >= 0 || ch.indexOf("TELEPHONY") >= 0) return ["telephony_ivr_agent", "consumer_credit_synthesizer_agent"];
+    if (ch.indexOf("IVR") >= 0) return ["telephony_ivr_agent", "consumer_credit_synthesizer_agent"];
     if (ch.indexOf("MOBILE") >= 0) return ["mobile_app_agent", "consumer_credit_synthesizer_agent"];
     if (ch.indexOf("WEB") >= 0) return ["web_portal_agent", "consumer_credit_synthesizer_agent"];
     if (ch.indexOf("BRANCH") >= 0) return ["branch_support_agent", "consumer_credit_synthesizer_agent"];
-  }
-  if (lbl === "channel.ingest") {
-    const targets = ["consumer_credit_synthesizer_agent"];
-    if (ch.indexOf("FRAUD") >= 0) targets.unshift("fraud_monitoring_agent");
-    else if (ch.indexOf("IVR") >= 0) targets.unshift("telephony_ivr_agent");
-    else if (ch.indexOf("MOBILE") >= 0) targets.unshift("mobile_app_agent");
-    else if (ch.indexOf("WEB") >= 0) targets.unshift("web_portal_agent");
-    else if (ch.indexOf("BRANCH") >= 0) targets.unshift("branch_support_agent");
-    return targets;
+    return ["consumer_credit_synthesizer_agent"];
   }
   if (lbl === "fraud.card_control_or_escalate") {
+    // 01 stages the card block and explicitly escalates the event to 08 (A -> B handoff)
     return ["fraud_monitoring_agent", "consumer_credit_synthesizer_agent"];
   }
-  if (tool.indexOf("golden_03") >= 0 || tool.indexOf("golden_04") >= 0) {
+  if (tool.indexOf("golden_03") >= 0 || tool.indexOf("golden_04") >= 0 || tool.indexOf("golden_05") >= 0 || tool.indexOf("golden_06") >= 0 || tool.indexOf("golden_12") >= 0) {
     return ["fraud_monitoring_agent"];
   }
   if (tool.indexOf("golden_02") >= 0) {
     return ["telephony_ivr_agent"];
   }
   if (tool.indexOf("golden_10") >= 0) {
-    return ["mobile_app_agent", "consumer_credit_synthesizer_agent"];
+    return ["mobile_app_agent"];
   }
-  if (tool.indexOf("golden_07") >= 0 || lbl === "phase.2_glossary" || lbl === "catalog.lookup_term") {
-    return ["web_portal_agent", "consumer_credit_synthesizer_agent"];
+  if (tool.indexOf("golden_07") >= 0 || tool.indexOf("golden_08") >= 0 || tool.indexOf("golden_09") >= 0 || lbl === "phase.2_glossary" || lbl === "catalog.lookup_term") {
+    return ["web_portal_agent"];
   }
   if (tool.indexOf("golden_01") >= 0) {
-    return ["branch_support_agent", "consumer_credit_synthesizer_agent"];
+    return ["branch_support_agent"];
+  }
+  if (ag) {
+    return [ag];
   }
   return ["consumer_credit_synthesizer_agent"];
 }

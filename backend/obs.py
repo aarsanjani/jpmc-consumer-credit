@@ -359,8 +359,14 @@ def get_run_kind(run_id: str) -> str:
     return _TRACE_BUFFER.get_run_kind(run_id)
 
 
+_ACTIVE_RUN_ID_FALLBACK: Optional[str] = None
+_ACTIVE_RUN_KIND_FALLBACK: str = ""
+
+
 def current_run_kind() -> str:
-    return _RUN_KIND.get()
+    val = _RUN_KIND.get()
+    return val if val else _ACTIVE_RUN_KIND_FALLBACK
+
 
 # ---------------------------------------------------------------------------
 # Run correlation
@@ -372,24 +378,29 @@ def new_run_id() -> str:
 
 @contextlib.contextmanager
 def run_context(run_id: Optional[str] = None, kind: str = "") -> Iterator[str]:
-    """Stamps every record inside the block with one run id.
-
-    Wrap a request or a demo pass in this and the whole causal chain shares an
-    id, which is the only practical way to read two interleaved runs. `kind`
-    separates operator turns from background probes so the UI can ask for the
-    latest turn rather than the latest anything.
-    """
-    token = _RUN_ID.set(run_id or new_run_id())
+    """Stamps every record inside the block with one run id, including worker threads spawned by InMemoryRunner."""
+    global _ACTIVE_RUN_ID_FALLBACK, _ACTIVE_RUN_KIND_FALLBACK
+    rid = run_id or new_run_id()
+    prev_id = _ACTIVE_RUN_ID_FALLBACK
+    prev_kind = _ACTIVE_RUN_KIND_FALLBACK
+    _ACTIVE_RUN_ID_FALLBACK = rid
+    _ACTIVE_RUN_KIND_FALLBACK = kind
+    token = _RUN_ID.set(rid)
     kind_token = _RUN_KIND.set(kind)
     try:
-        yield _RUN_ID.get()
+        yield rid
     finally:
         _RUN_KIND.reset(kind_token)
         _RUN_ID.reset(token)
+        _ACTIVE_RUN_ID_FALLBACK = prev_id
+        _ACTIVE_RUN_KIND_FALLBACK = prev_kind
 
 
 def current_run_id() -> str:
-    return _RUN_ID.get()
+    val = _RUN_ID.get()
+    if val and val != "-":
+        return val
+    return _ACTIVE_RUN_ID_FALLBACK or "-"
 
 
 # ---------------------------------------------------------------------------
