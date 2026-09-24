@@ -90,7 +90,7 @@ from backend.models import (
     SeverityLevel,
 )
 from backend.veracity_and_audit import ClaimVeracityValidatorAgent, MemoryBankAuditAgent
-from backend import obs
+from backend import memory_write_path, obs
 
 load_dotenv()
 
@@ -1512,8 +1512,11 @@ def ingest_live_channel_event(
     preset_id: str = "",
     turns: Optional[List[Dict[str, str]]] = None,
     client: Optional[MemoryBankClient] = None,
+    verify: Optional[memory_write_path.Verifier] = None,
 ) -> Dict[str, Any]:
-    """Writes a live (single- or multi-turn) session into Vertex AI Memory Bank.
+    """Writes a live (single- or multi-turn) session into Vertex AI Memory Bank,
+    then generates memories from it through the verified write path
+    (backend/memory_write_path.py:verify_and_generate).
 
     Because `_produce_channel_payload` reads from the same engine and matches on
     `CHANNEL_SESSION_TOKENS`, the corresponding channel producer spoke picks up
@@ -1591,6 +1594,10 @@ def ingest_live_channel_event(
         invalidate_sessions_cache()
         session_id = str(session_name).split("/")[-1] if session_name else NOT_RECORDED
         span.detail(session_id=session_id, channel=canonical_label, turns=len(appended_turns))
+        lineage = memory_write_path.verify_and_generate(
+            bank, session_name, customer_id, resolved_turns,
+            verify or _claim_verifier(customer_id, canonical_label),
+        )
         return {
             "channel_label": live(canonical_label, "sessions.create"),
             "customer_id": computed(customer_id, "scope argument sent to sessions.create"),
@@ -1601,7 +1608,27 @@ def ingest_live_channel_event(
             "turns": computed(appended_turns, "sessions.appendEvent turns"),
             "text": computed(appended_turns[-1]["text"] if appended_turns else text, "sessions.appendEvent"),
             "timestamp": _tagged_value(mb_field(last_event, "timestamp"), "sessions.appendEvent"),
+            "memory_lineage": live(lineage, "memories:generate + sessions.appendEvent(stateDelta)"),
         }
+
+
+def _bank_channel_for(label: str) -> BankChannel:
+    for channel_value, tokens in CHANNEL_SESSION_TOKENS.items():
+        if label in tokens:
+            return BankChannel(channel_value)
+    return BankChannel.WEB_PORTAL
+
+
+def _claim_verifier(customer_id: str, channel_label: str) -> memory_write_path.Verifier:
+    bank_channel = _bank_channel_for(channel_label)
+
+    def verify(said: str) -> str:
+        evaluation = ClaimVeracityValidatorAgent().validate_claim_against_telemetry(
+            customer_id=customer_id, channel=bank_channel, claim_text=said,
+        )
+        return evaluation.veracity_status.value
+
+    return verify
 
 
 def produce_all_channels_snapshot(
@@ -1947,27 +1974,11 @@ def list_all_agents() -> List[AgentDescriptor]:
             ],
             description=(
                 "01 · Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND): "
-                "Monitors cross-border velocity anomalies and stolen-card POS attempts using Memory Bank "
-                "(`TRAVEL_STATUS`, `CARD_LIFECYCLE`), Dataplex Catalog (`discover_sibling_tables` & "
-                "`check_table`/`check_column` to refuse `authorizations_deprecated_v1` and `cards.pan_full`), "
-                "and BigQuery Golden Queries 03 & 04."
+                "Watches for cross-border velocity spikes and stolen-card attempts. Reads its Memory Bank "
+                "topics, asks the Dataplex catalog about every table and column before reading it, and runs "
+                "BigQuery Golden Queries 03 and 04."
             ),
             memory_topics_scoped=list(AGENT_MEMORY_TOPICS["fraud_monitoring_agent"]),
-            catalog_governance=[
-                "authorizations (ACTIVE)",
-                "agg_merchant_velocity_daily (ACTIVE)",
-                "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
-                "cards.pan_full (REFUSE · PII)",
-                "authorizations.is_fraud (REFUSE · Triage Label)",
-            ],
-            authorized_golden_queries=[
-                "02_recent_authorizations",
-                "03_suspicious_activity_window",
-                "04_geo_impossible_travel",
-                "05_merchant_velocity_spike",
-                "06_cnp_burst_detection",
-                "12_fraud_rate_by_mcc",
-            ],
             default_live_prompt="For customer CUST00001 and card CARD00002, check fraud velocity alerts and run Golden Queries 03 and 04 for suspicious activity and impossible travel.",
         ),
         AgentDescriptor(
@@ -1982,20 +1993,10 @@ def list_all_agents() -> List[AgentDescriptor]:
             ],
             description=(
                 "02 · Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR): "
-                "Reads inbound customer call transcripts and DTMF step-up authentication turns from "
-                "Memory Bank (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `TRAVEL_STATUS`) and cross-checks reported "
-                "declined charges against the BigQuery ledger via Golden Query 02."
+                "Reads inbound call transcripts and step-up authentication turns from Memory Bank and "
+                "checks reported declined charges against the BigQuery ledger with Golden Query 02."
             ),
             memory_topics_scoped=list(AGENT_MEMORY_TOPICS["telephony_ivr_agent"]),
-            catalog_governance=[
-                "authorizations (ACTIVE)",
-                "cards (ACTIVE)",
-                "merchants (ACTIVE)",
-                "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
-                "cards.pan_full (REFUSE · PII)",
-                "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
-            ],
-            authorized_golden_queries=["02_recent_authorizations_for_card"],
             default_live_prompt="For customer CUST00001 and card CARD00002, retrieve TELEPHONY_IVR call transcripts and cross-check recent card authorizations with Golden Query 02.",
         ),
         AgentDescriptor(
@@ -2010,22 +2011,10 @@ def list_all_agents() -> List[AgentDescriptor]:
             ],
             description=(
                 "03 · Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP): "
-                "Tracks in-app push challenges, biometric logins, and Apple Pay / Google Pay device token "
-                "provisioning (`DEVICE_WALLET_INVENTORY`, `CARD_LIFECYCLE`), verifying whether any device token can still spend "
-                "on a frozen card via Golden Query 10."
+                "Tracks in-app push challenges, biometric logins and wallet token provisioning, and checks "
+                "whether any device token can still spend on a frozen card with Golden Query 10."
             ),
             memory_topics_scoped=list(AGENT_MEMORY_TOPICS["mobile_app_agent"]),
-            catalog_governance=[
-                "wallet_tokens (ACTIVE)",
-                "devices (ACTIVE)",
-                "cards (ACTIVE)",
-                "cards.pan_full (REFUSE · PII)",
-                "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
-            ],
-            authorized_golden_queries=[
-                "10_wallet_tokens_active_on_card",
-                "11_dispute_event_timeline",
-            ],
             default_live_prompt="For customer CUST00001 and card CARD00002, inspect MOBILE_APP wallet events and check active digital wallet tokens via Golden Query 10.",
         ),
         AgentDescriptor(
@@ -2040,25 +2029,12 @@ def list_all_agents() -> List[AgentDescriptor]:
             ],
             description=(
                 "04 · Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL): "
-                "Reads online dispute filings and agent commitments (`DISPUTE_HISTORY`, "
-                "`AGENT_COMMITMENTS`), and reconciles open disputes against BigQuery Golden Queries "
-                "07, 08, 09 and Dataplex Glossary (`Regulation E` debit vs `Regulation Z` credit)."
+                "Reads online dispute filings and earlier promises from Memory Bank and reconciles open "
+                "disputes with Golden Query 07. Which dispute rules apply is looked up in the Dataplex "
+                "glossary at run time, not written here."
             ),
             memory_topics_scoped=list(AGENT_MEMORY_TOPICS["web_portal_agent"]),
-            catalog_governance=[
-                "disputes (ACTIVE)",
-                "accounts (ACTIVE)",
-                "cards (ACTIVE)",
-                "glossary:regulation-e (VERIFIED)",
-                "glossary:regulation-z (VERIFIED)",
-                "cards.pan_full (REFUSE · PII)",
-            ],
-            authorized_golden_queries=[
-                "07_open_disputes_for_customer",
-                "08_dispute_filing_window_check",
-                "09_provisional_credit_due",
-            ],
-            default_live_prompt="For customer CUST00001, inspect WEB_PORTAL sessions and reconcile open disputes across Regulation E and Regulation Z using Golden Query 07.",
+            default_live_prompt="For customer CUST00001, inspect WEB_PORTAL sessions and reconcile open disputes using Golden Query 07.",
         ),
         AgentDescriptor(
             agent_id=AgentId.BRANCH_SUPPORT.value,
@@ -2072,22 +2048,10 @@ def list_all_agents() -> List[AgentDescriptor]:
             ],
             description=(
                 "05 · In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT): "
-                "Reads in-person teller and branch banker sessions (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `CARD_LIFECYCLE`) "
-                "from Memory Bank and verifies customer 360 identity and 90-day tenure via Golden Query 01."
+                "Reads in-person teller and banker sessions from Memory Bank and verifies the customer's "
+                "identity and 90-day history with Golden Query 01."
             ),
             memory_topics_scoped=list(AGENT_MEMORY_TOPICS["branch_support_agent"]),
-            catalog_governance=[
-                "v_customer_360 (ACTIVE)",
-                "customers (ACTIVE)",
-                "accounts (ACTIVE)",
-                "cards (ACTIVE)",
-                "customers.ssn_last4 (REFUSE · PII)",
-                "customers.customer_id (ALLOW)",
-            ],
-            authorized_golden_queries=[
-                "01_customer_360_snapshot",
-                "11_dispute_event_timeline",
-            ],
             default_live_prompt="For customer CUST00001, check BRANCH_SUPPORT banker consultation records and verify customer 360 identity via Golden Query 01.",
         ),
         AgentDescriptor(
@@ -2104,21 +2068,6 @@ def list_all_agents() -> List[AgentDescriptor]:
                 "travel timelines or mismatched dispute amounts."
             ),
             memory_topics_scoped=[NO_MEMORY_READS_LABEL],
-            catalog_governance=[
-                "v_customer_360 (ACTIVE)",
-                "authorizations (ACTIVE)",
-                "disputes (ACTIVE)",
-                "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
-                "customers.ssn_last4 (REFUSE · PII)",
-                "cards.pan_full (REFUSE · PII)",
-            ],
-            authorized_golden_queries=[
-                "01_customer_360_snapshot",
-                "02_recent_authorizations_for_card",
-                "03_suspicious_activity_on_card_window",
-                "04_geo_impossible_travel",
-                "07_open_disputes_for_customer",
-            ],
             default_live_prompt="Validate claim for CUST00001 on WEB_PORTAL: 'My wallet was stolen in Lisbon on Sept 9 with debit card CARD00004 and credit card CARD00002, and I returned early to New York on Sept 10.'",
         ),
         AgentDescriptor(
@@ -2134,17 +2083,6 @@ def list_all_agents() -> List[AgentDescriptor]:
                 "against BigQuery telemetry to detect stale travel notices and un-superseded contradictions."
             ),
             memory_topics_scoped=[ALL_TOPICS_LABEL],
-            catalog_governance=[
-                "v_customer_360 (ACTIVE)",
-                "authorizations (ACTIVE)",
-                "disputes (ACTIVE)",
-                "customers.ssn_last4 (REFUSE · PII)",
-                "cards.pan_full (REFUSE · PII)",
-            ],
-            authorized_golden_queries=[
-                "01_customer_360_snapshot",
-                "04_geo_impossible_travel",
-            ],
             default_live_prompt="Audit customer CUST00001 Memory Bank facts against BigQuery telemetry and report any stale travel notices or contradictions.",
         ),
         AgentDescriptor(
@@ -2161,28 +2099,34 @@ def list_all_agents() -> List[AgentDescriptor]:
                 "the causal timeline via `read_customer_memory_bank`, and stages governed card unlocks."
             ),
             memory_topics_scoped=[ALL_TOPICS_LABEL],
-            catalog_governance=[
-                "v_customer_360 (ACTIVE)",
-                "disputes (ACTIVE)",
-                "wallet_tokens (ACTIVE)",
-                "dispute_events (ACTIVE)",
-                "glossary:regulation-e (VERIFIED)",
-                "glossary:regulation-z (VERIFIED)",
-                "customers.ssn_last4 (REFUSE · PII)",
-                "cards.pan_full (REFUSE · PII)",
-            ],
-            authorized_golden_queries=[
-                "01_customer_360_snapshot",
-                "07_open_disputes_for_customer",
-                "08_dispute_filing_window_check",
-                "09_provisional_credit_due",
-                "10_wallet_tokens_active_on_card",
-                "11_dispute_event_timeline",
-            ],
-            default_live_prompt="For customer CUST00001, list the configured Memory Bank topics, read the consolidated customer memory bank, and synthesize the Lisbon stolen-wallet causal chain across Reg E and Reg Z.",
+            default_live_prompt="For customer CUST00001, list the configured Memory Bank topics, read the consolidated customer memory bank, and synthesize the Lisbon stolen-wallet causal chain.",
         ),
     ]
+    for descriptor in descriptors:
+        descriptor.authorized_golden_queries, descriptor.bound_golden_queries, descriptor.catalog_governance = (
+            _golden_card_fields(AgentId(descriptor.agent_id), descriptor.tools)
+        )
     return descriptors
+
+
+def _golden_card_fields(agent: AgentId, tools: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
+    """Card fields derived from GOLDEN_QUERY_CONTRACTS so they cannot drift.
+
+    authorized = contracts that list this agent (the INDEX.md grant).
+    bound      = golden tools actually attached to the agent.
+    governed   = tables and columns those contracts check. No verdicts here:
+                 the catalog decides at run time.
+    """
+    authorized = [c for c in GOLDEN_QUERY_CONTRACTS.values() if agent in c.authorized_agents]
+    bound = [c for c in GOLDEN_QUERY_CONTRACTS.values() if c.tool_name in tools]
+    governed = dict.fromkeys(
+        name for c in authorized for name in [*c.governed_tables, *c.governed_columns_checked]
+    )
+    return (
+        [c.sql_filename.removesuffix(".sql") for c in authorized],
+        [c.sql_filename.removesuffix(".sql") for c in bound],
+        list(governed),
+    )
 
 
 class UnknownAgentError(LookupError):

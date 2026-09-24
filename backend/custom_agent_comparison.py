@@ -17,8 +17,10 @@ WHAT THIS PROVES
 TWO LANES
 
     ADK lane      google.adk LlmAgent + Runner + VertexAiMemoryBankService.
-                  The Runner owns the memory lifecycle: it preloads memories
-                  before the turn and syncs the session afterwards.
+                  Memories reach the model only when it chooses to call our
+                  retrieve tool. The Runner does not preload (no
+                  PreloadMemoryTool is attached) and does not write the
+                  session back (nothing calls add_session_to_memory).
 
     Custom lane   StandaloneMemoryBankClient. Six lines of urllib over HTTPS.
                   No ADK, no Vertex SDK, no google-cloud-aiplatform. The lane
@@ -177,11 +179,12 @@ def _catalog_gate(governor: Optional[CatalogGovernor]) -> Dict[str, Any]:
 class GoogleADKNativeAgentRunner:
     """Memory Bank reached through ADK's managed memory lifecycle.
 
-    The ADK argument is not that it is faster. It is that `Runner` owns the
-    round trip: `VertexAiMemoryBankService` is preloaded into the prompt before
-    the turn and the session is handed back for extraction after it, without
-    the developer writing either call. This lane exists to show that, so it
-    does not hand-roll a retrieve and then claim ADK did it.
+    What ADK does here: turns Python callables into function declarations and
+    runs the tool loop. What it does not do, as wired today: preload memory
+    (that needs PreloadMemoryTool in the agent's tools) or save the session to
+    Memory Bank (that needs an explicit add_session_to_memory call). Even if
+    attached, VertexAiMemoryBankService scopes by {app_name, user_id}, while our
+    memories live under {customer_id}, so it would search an empty scope.
     """
 
     lane = "GOOGLE_ADK"
@@ -301,18 +304,17 @@ class GoogleADKNativeAgentRunner:
             "memory_facts_visible": _facts_from_memories(memories),
             "metrics": {
                 "total_latency_ms": total_ms,
-                "memory_retrieval": "managed by Runner (PreloadMemoryTool)",
+                "memory_retrieval": "only if the model calls the retrieve tool; no preload attached",
                 "integration_lines_of_code": _source_lines(
                     GoogleADKNativeAgentRunner.execute_turn
                 ),
             },
             "what_the_framework_did_for_us": [
-                "Runner preloaded Memory Bank into the prompt; this lane wrote "
-                "no retrieve call for that step.",
-                "Session events were handed to VertexAiMemoryBankService for "
-                "asynchronous extraction; this lane wrote no generate call.",
                 "Python callables became Gemini function declarations from "
                 "their signatures and docstrings.",
+                "Runner drove the tool-call loop and kept the in-memory session.",
+                "Not done by ADK here: memory preload and write-back. Memories "
+                "arrive only through our retrieve tool; nothing is written back.",
             ],
         }
 
@@ -592,9 +594,10 @@ class AgentComparisonEngine:
         return [
             {
                 "dimension": "Memory Bank lifecycle",
-                "adk": "Runner preloads and writes back. The developer writes neither call.",
+                "adk": "Retrieve happens only if the model calls our tool. No preload, no write-back as wired.",
                 "custom": "Both calls are the developer's: retrieve before, generate after.",
-                "note": "Same REST surface underneath; the difference is who calls it.",
+                "note": "Same REST surface underneath. ADK can preload and write back, but only with "
+                        "PreloadMemoryTool and an explicit add_session_to_memory, neither wired here.",
             },
             {
                 "dimension": "Knowledge Catalog governance",

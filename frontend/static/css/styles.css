@@ -961,6 +961,13 @@ code {
   font-variant-numeric: tabular-nums;
 }
 
+.tag-note {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--muted);
+  align-self: center;
+}
+
 .tag.on {
   border-color: var(--pink);
   color: var(--pink);

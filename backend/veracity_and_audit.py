@@ -47,7 +47,7 @@ from backend.models import (
     VeracityStatus,
     VerificationCheckItem,
 )
-from backend import obs
+from backend import memory_write_path, obs
 from backend.knowledge_catalog import CatalogGovernor, shared_catalog_governor
 from backend.memory_bank import MemoryBankClient, shared_memory_bank_client
 
@@ -747,13 +747,27 @@ RULES:
         severity: SeverityLevel = SeverityLevel.MEDIUM,
         session_id: Optional[str] = None,
     ) -> MemoryFragment:
-        """Validates first, then writes. The evaluation travels with the fragment."""
+        """Validates first, then writes. The evaluation travels with the fragment.
+
+        The claim is stored as a Memory Bank session and memories are generated
+        from it into the scope the verdict picks (trusted or quarantine), via
+        backend/memory_write_path.py:generate_with_lineage.
+        """
         evaluation = self.validate_claim_against_telemetry(
             customer_id=customer_id,
             channel=channel,
             claim_text=claim_text,
             claim_metadata=metadata,
         )
+        session_name = self.memory.create_session(
+            user_id=customer_id,
+            display_name="%s · CLAIM_VALIDATION" % channel.value,
+            session_state={"channel": channel.value, "customer_id": customer_id,
+                           "intent": "CLAIM_VALIDATION"},
+        )
+        self.memory.append_event(session_name, "customer", claim_text)
+        lineage = memory_write_path.generate_with_lineage(
+            self.memory, session_name, customer_id, evaluation.veracity_status.value)
 
         fragment = MemoryFragment(
             fragment_id="MEM-%s" % uuid.uuid4().hex[:10].upper(),
@@ -762,17 +776,19 @@ RULES:
             timestamp=datetime.now(timezone.utc),
             day_label=day_label,
             summary=summary,
-            metadata=dict(metadata or {}, claim_text=claim_text),
+            metadata=dict(metadata or {}, claim_text=claim_text, memory_lineage=lineage,
+                          caller_session_id=session_id),
             severity=severity,
-            session_id=session_id,
+            session_id=session_name.split("/")[-1],
             veracity_evaluation=evaluation,
         )
 
-        if evaluation.veracity_status == VeracityStatus.CONTRADICTED_BY_TELEMETRY:
+        if "corpus" in lineage["scope"]:
             LOG.warning(
-                "Claim %s for %s is contradicted by BigQuery; fragment carries the contradiction rather than hiding it.",
+                "Claim %s for %s is %s; its memories went to the quarantine scope.",
                 evaluation.claim_id,
                 customer_id,
+                evaluation.veracity_status.value,
             )
         return fragment
 

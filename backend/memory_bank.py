@@ -57,6 +57,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from collections.abc import Iterator
@@ -337,7 +338,39 @@ class MemoryBankClient:
         return self._request("GET", url).get("sessionEvents", [])
 
     def list_sessions(self) -> List[Dict[str, Any]]:
-        return self._request("GET", self.base_url + "/sessions").get("sessions", [])
+        sessions: List[Dict[str, Any]] = []
+        url = self.base_url + "/sessions"
+        page = self._request("GET", url)
+        sessions.extend(page.get("sessions", []))
+        while token := page.get("nextPageToken"):
+            page = self._request("GET", "%s?pageToken=%s" % (url, urllib.parse.quote(token)))
+            sessions.extend(page.get("sessions", []))
+        return sessions
+
+    def get_session(self, session_name: str) -> Dict[str, Any]:
+        return self._request("GET", "https://%s/%s/%s" % (self.host, self.api_version, session_name))
+
+    def append_state_delta(self, session_name: str, author: str,
+                           delta: Dict[str, Any]) -> Dict[str, Any]:
+        """Merges keys into the session's state.
+
+        Session state cannot be PATCHed (the API answers 400 and says to append
+        an event), so this appends a text-free event whose stateDelta the
+        service folds into sessionState.
+        """
+        event = {
+            "author": author,
+            "invocationId": "inv-%d" % int(time.time() * 1000),
+            "timestamp": rfc3339(datetime.now(timezone.utc)),
+            "actions": {"stateDelta": delta},
+        }
+        url = "https://%s/%s/%s:appendEvent" % (self.host, self.api_version, session_name)
+        return self._request("POST", url, event)
+
+    def delete_session(self, session_name: str) -> Dict[str, Any]:
+        if not session_name or "/sessions/" not in session_name:
+            raise ValueError("session_name must be the full resource name the service returned.")
+        return self._request("DELETE", "https://%s/%s/%s" % (self.host, self.api_version, session_name))
 
     # -- memories ----------------------------------------------------------
 
@@ -525,6 +558,29 @@ class MemoryBankClient:
                 "not a bare id."
             )
         return self._request("DELETE", "https://%s/%s/%s" % (self.host, self.api_version, memory_name))
+
+    def update_memory(self, memory_name: str, fact: str) -> Dict[str, Any]:
+        """Corrects the fact of one memory in place; the service keeps the old
+        text as a revision, so the correction stays auditable."""
+        if not memory_name or "/memories/" not in memory_name:
+            raise ValueError("memory_name must be the full resource name the service returned.")
+        if not fact or not fact.strip():
+            raise ValueError("fact is required - an empty memory is not a memory.")
+        url = "https://%s/%s/%s?updateMask=fact" % (self.host, self.api_version, memory_name)
+        return self._request("PATCH", url, {"fact": fact})
+
+
+def generated_memories(operation: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Pulls {name, action} pairs out of a finished memories:generate operation.
+
+    Returns [] for an operation that has not finished, because only a finished
+    one says what was created, updated or deleted.
+    """
+    items = (operation.get("response") or {}).get("generatedMemories") or []
+    return [
+        {"name": field(item, "memory", "name"), "action": item.get("action", NOT_RECORDED)}
+        for item in items
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -427,6 +427,7 @@ class AgentDescriptor(BaseModel):
     memory_topics_scoped: List[str] = Field(default_factory=list)
     catalog_governance: List[str] = Field(default_factory=list)
     authorized_golden_queries: List[str] = Field(default_factory=list)
+    bound_golden_queries: List[str] = Field(default_factory=list)
     default_live_prompt: str = ""
 
 

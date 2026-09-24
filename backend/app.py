@@ -64,6 +64,7 @@ from backend.knowledge_catalog import (
     shared_catalog_governor,
 )
 from backend.agent import MemoryBankSynthesizerAgent
+from backend import memory_write_path
 from backend.custom_agent_comparison import AgentComparisonEngine
 
 logging.basicConfig(
@@ -1053,21 +1054,34 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
                 }
                 _t.detail(status="failed", error=str(exc))
 
-    # Hand the turn to Memory Bank. Extraction and consolidation run inside the
-    # managed service; this process never decides what is worth remembering.
-    with obs.turn("phase.4_memory_write", LOG, agent="consumer_credit_synthesizer_agent",
-                  scope=customer_id) as _t:
-        try:
-            operation = memory_client().generate_from_contents(
-                turns=[{"role": "user", "text": claim_text}] if claim_text else [],
-                scope=scope_for(customer_id),
-                wait=False,
-            )
-            write_back = live(operation.get("name", NOT_RECORDED), "reasoningEngines.memories:generate")
-            _t.detail(operation=operation.get("name", NOT_RECORDED))
-        except MemoryBankError as exc:
-            write_back = unmeasured("reasoningEngines.memories:generate (%s)" % exc)
-            _t.detail(status="failed", error=str(exc))
+    # Store the turn as a session, then generate from it using the verdict we
+    # already have: contradicted claims land in the quarantine scope, which
+    # agents never read. See backend/memory_write_path.py:generate_with_lineage.
+    write_back: Dict[str, Any] = unmeasured("no customer text to store")
+    lineage: Any = unmeasured("no customer text to store")
+    if claim_text:
+        with obs.turn("phase.4_memory_write", LOG, agent="consumer_credit_synthesizer_agent",
+                      scope=customer_id) as _t:
+            try:
+                client = memory_client()
+                session_name = client.create_session(
+                    user_id=customer_id,
+                    display_name="%s · WORKBENCH_CHAT" % channel_str,
+                    session_state={"channel": channel_str, "customer_id": customer_id,
+                                   "intent": "WORKBENCH_CHAT", "scenario": scenario},
+                )
+                client.append_event(session_name, "customer", claim_text)
+                raw_status = (verdict.get("raw") or {}).get("veracity_status")
+                recorded = memory_write_path.generate_with_lineage(
+                    client, session_name, customer_id, raw_status)
+                write_back = live(recorded["operation"], "reasoningEngines.memories:generate")
+                lineage = live(dict(recorded, session_name=session_name),
+                               "memories:generate + sessions.appendEvent(stateDelta)")
+                _t.detail(operation=recorded["operation"], generated=len(recorded["generated"]))
+            except MemoryBankError as exc:
+                write_back = unmeasured("reasoningEngines.memories:generate (%s)" % exc)
+                lineage = unmeasured("memory write failed (%s)" % exc)
+                _t.detail(status="failed", error=str(exc))
 
     return {
         "status": "SUCCESS",
@@ -1091,6 +1105,7 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
         # synthesizer's job and it streams over /api/chat/stream.
         "agent_resolution": unmeasured("/api/chat/stream onAgentSynthesis"),
         "memory_write_operation": write_back,
+        "memory_lineage": lineage,
         "timestamp": computed(datetime.now(timezone.utc).isoformat(), "server clock"),
     }
 
@@ -1710,6 +1725,73 @@ def retrieve_relevant_memory():
             },
         }
     )
+
+
+def _transcript(client: MemoryBankClient, session_name: str) -> List[Dict[str, Any]]:
+    return [
+        {
+            "author": event.get("author", NOT_RECORDED),
+            "timestamp": event.get("timestamp", NOT_RECORDED),
+            "text": " ".join(p.get("text", "") for p in (event.get("content") or {}).get("parts", [])),
+        }
+        for event in client.list_events(session_name)
+        if (event.get("content") or {}).get("parts")
+    ]
+
+
+@app.route("/api/memory/session/<session_id>/lineage", methods=["GET"])
+def get_session_lineage(session_id: str):
+    """Which memories a stored session produced, and into which scope."""
+    client = memory_client()
+    session_name = "%s/sessions/%s" % (client.parent, session_id)
+    try:
+        lineage = memory_write_path.lineage_for_session(client, session_name)
+    except MemoryBankError as exc:
+        return _upstream_error(exc, "reasoningEngines.sessions.get")
+    return jsonify({
+        "session_id": session_id,
+        "lineage": live(lineage, "sessionState.memory_lineage") if lineage
+        else unmeasured("this session has no lineage record (written before lineage, or never generated)"),
+    })
+
+
+@app.route("/api/memory/<memory_id>/source", methods=["GET"])
+def get_memory_source(memory_id: str):
+    """The session a memory came from, with its transcript."""
+    client = memory_client()
+    customer_id = arg_customer()
+    memory_name = "%s/memories/%s" % (client.parent, memory_id)
+    try:
+        found = memory_write_path.source_session_for_memory(client, memory_name, customer_id)
+        transcript = _transcript(client, found["session_name"]) if found else []
+    except MemoryBankError as exc:
+        return _upstream_error(exc, "reasoningEngines.sessions.list")
+    if not found:
+        return jsonify({
+            "memory_id": memory_id,
+            "source": unmeasured("no session lineage names this memory (seeded directly or written before lineage)"),
+        })
+    return jsonify({
+        "memory_id": memory_id,
+        "source": live(found, "sessionState.memory_lineage"),
+        "transcript": live(transcript, "reasoningEngines.sessions.events.list"),
+    })
+
+
+@app.route("/api/memory/quarantine", methods=["GET"])
+def get_quarantined_memories():
+    """Memories generated from contradicted claims. Agents never read this scope."""
+    customer_id = arg_customer()
+    try:
+        memories = memory_client().retrieve(memory_write_path.quarantine_scope(customer_id), top_k=100)
+    except MemoryBankError as exc:
+        return _upstream_error(exc, "reasoningEngines.memories:retrieve")
+    records = [memory_record(m) for m in memories]
+    return jsonify({
+        "customer_id": customer_id,
+        "count": len(records),
+        "memories": live(records, "reasoningEngines.memories:retrieve (quarantine scope)"),
+    })
 
 
 @app.route("/api/memory/seed", methods=["POST"])

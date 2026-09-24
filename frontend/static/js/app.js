@@ -462,179 +462,18 @@ let LAST_TRACED_SPANS = [];
 let LAST_TRACED_RUN_ID = "";
 let ALL_DESK_AGENTS = [];
 
+// Identity only, so the pipeline can draw before /api/channels/summary answers.
+// Everything else on the card comes from the backend (list_all_agents in
+// backend/adk_agents.py) and shows n/r until it arrives.
 const FALLBACK_DESK_AGENTS = [
-  {
-    agent_id: "01_fraud_monitoring_agent",
-    name: "fraud_monitoring_agent",
-    role: "Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)",
-    description:
-      "01 · Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND): Monitors cross-border velocity anomalies and stolen-card POS attempts using Memory Bank (`TRAVEL_STATUS`, `CARD_LIFECYCLE`), Dataplex Catalog (`discover_sibling_tables` & `check_table`/`check_column` to refuse `authorizations_deprecated_v1` and `cards.pan_full`), and BigQuery Golden Queries 03 & 04.",
-    memory_topics_scoped: ["TRAVEL_STATUS", "CARD_LIFECYCLE", "SPENDING_CONTEXT"],
-    catalog_governance: [
-      "authorizations (ACTIVE)",
-      "agg_merchant_velocity_daily (ACTIVE)",
-      "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
-      "cards.pan_full (REFUSE · PII)",
-      "authorizations.is_fraud (REFUSE · Triage Label)",
-    ],
-    authorized_golden_queries: [
-      "02_recent_authorizations",
-      "03_suspicious_activity_window",
-      "04_geo_impossible_travel",
-      "05_merchant_velocity_spike",
-      "06_cnp_burst_detection",
-      "12_fraud_rate_by_mcc",
-    ],
-    tools: [
-      "query_fraud_velocity_alerts",
-      "golden_03_suspicious_activity_on_card_window",
-      "golden_04_geo_impossible_travel",
-      "execute_fraud_card_control_or_escalate",
-    ],
-  },
-  {
-    agent_id: "02_telephony_ivr_agent",
-    name: "telephony_ivr_agent",
-    role: "Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR)",
-    description:
-      "02 · Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR): Reads inbound customer call transcripts and DTMF step-up authentication turns from Memory Bank (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `TRAVEL_STATUS`) and cross-checks reported declined charges against the BigQuery ledger via Golden Query 02.",
-    memory_topics_scoped: ["CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "TRAVEL_STATUS"],
-    catalog_governance: [
-      "authorizations (ACTIVE)",
-      "cards (ACTIVE)",
-      "merchants (ACTIVE)",
-      "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
-      "cards.pan_full (REFUSE · PII)",
-      "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
-    ],
-    authorized_golden_queries: ["02_recent_authorizations_for_card"],
-    tools: ["query_ivr_call_records", "golden_02_recent_authorizations_for_card"],
-  },
-  {
-    agent_id: "03_mobile_app_agent",
-    name: "mobile_app_agent",
-    role: "Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP)",
-    description:
-      "03 · Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP): Tracks in-app push challenges, biometric logins, and Apple Pay / Google Pay device token provisioning (`DEVICE_WALLET_INVENTORY`, `CARD_LIFECYCLE`), verifying whether any device token can still spend on a frozen card via Golden Query 10.",
-    memory_topics_scoped: ["DEVICE_WALLET_INVENTORY", "CARD_LIFECYCLE"],
-    catalog_governance: [
-      "wallet_tokens (ACTIVE)",
-      "devices (ACTIVE)",
-      "cards (ACTIVE)",
-      "cards.pan_full (REFUSE · PII)",
-      "cards.pan_masked (ALLOW_TO_OWNER_ONLY)",
-    ],
-    authorized_golden_queries: ["10_wallet_tokens_active_on_card", "11_dispute_event_timeline"],
-    tools: ["query_mobile_wallet_events", "golden_10_wallet_tokens_active_on_card"],
-  },
-  {
-    agent_id: "04_web_portal_agent",
-    name: "web_portal_agent",
-    role: "Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL)",
-    description:
-      "04 · Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL): Reads online dispute filings and agent commitments (`DISPUTE_HISTORY`, `AGENT_COMMITMENTS`), and reconciles open disputes against BigQuery Golden Queries 07, 08, 09 and Dataplex Glossary (`Regulation E` debit vs `Regulation Z` credit).",
-    memory_topics_scoped: ["DISPUTE_HISTORY", "AGENT_COMMITMENTS"],
-    catalog_governance: [
-      "disputes (ACTIVE)",
-      "accounts (ACTIVE)",
-      "cards (ACTIVE)",
-      "glossary:regulation-e (VERIFIED)",
-      "glossary:regulation-z (VERIFIED)",
-      "cards.pan_full (REFUSE · PII)",
-    ],
-    authorized_golden_queries: [
-      "07_open_disputes_for_customer",
-      "08_dispute_filing_window_check",
-      "09_provisional_credit_due",
-    ],
-    tools: ["query_web_portal_activity", "golden_07_open_disputes_for_customer"],
-  },
-  {
-    agent_id: "05_branch_support_agent",
-    name: "branch_support_agent",
-    role: "In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT)",
-    description:
-      "05 · In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT): Reads in-person teller and branch banker sessions (`CONTACT_PREFERENCE`, `AGENT_COMMITMENTS`, `CARD_LIFECYCLE`) from Memory Bank and verifies customer 360 identity and 90-day tenure via Golden Query 01.",
-    memory_topics_scoped: ["CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "CARD_LIFECYCLE"],
-    catalog_governance: [
-      "v_customer_360 (ACTIVE)",
-      "customers (ACTIVE)",
-      "accounts (ACTIVE)",
-      "cards (ACTIVE)",
-      "customers.ssn_last4 (REFUSE · PII)",
-      "customers.customer_id (ALLOW)",
-    ],
-    authorized_golden_queries: ["01_customer_360_snapshot", "11_dispute_event_timeline"],
-    tools: ["query_branch_teller_interactions", "golden_01_customer_360_snapshot"],
-  },
-  {
-    agent_id: "06_claim_veracity_validator_agent",
-    name: "claim_veracity_validator_agent",
-    role: "Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR)",
-    description:
-      "06 · Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR): Gates every incoming customer claim before Memory Bank consolidation by cross-checking BigQuery Golden Queries (01, 02, 03, 04, 07) to flag contradicted travel timelines or mismatched dispute amounts.",
-    memory_topics_scoped: ["NONE (checks claims against BigQuery, does not read Memory Bank)"],
-    catalog_governance: [
-      "v_customer_360 (ACTIVE)",
-      "authorizations (ACTIVE)",
-      "disputes (ACTIVE)",
-      "authorizations_deprecated_v1 (REFUSE · DEPRECATED)",
-      "customers.ssn_last4 (REFUSE · PII)",
-      "cards.pan_full (REFUSE · PII)",
-    ],
-    authorized_golden_queries: [
-      "01_customer_360_snapshot",
-      "02_recent_authorizations_for_card",
-      "03_suspicious_activity_on_card_window",
-      "04_geo_impossible_travel",
-      "07_open_disputes_for_customer",
-    ],
-    tools: ["validate_and_record_customer_claim"],
-  },
-  {
-    agent_id: "07_memory_bank_audit_agent",
-    name: "memory_bank_audit_agent",
-    role: "Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)",
-    description:
-      "07 · Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB): Runs an async / scheduled sweep across enterprise customer memory scopes (`CUST00001`..`CUST00010`) against BigQuery telemetry to detect stale travel notices and un-superseded contradictions.",
-    memory_topics_scoped: ["ALL (every topic configured on the engine)"],
-    catalog_governance: [
-      "v_customer_360 (ACTIVE)",
-      "authorizations (ACTIVE)",
-      "disputes (ACTIVE)",
-      "customers.ssn_last4 (REFUSE · PII)",
-      "cards.pan_full (REFUSE · PII)",
-    ],
-    authorized_golden_queries: ["01_customer_360_snapshot", "04_geo_impossible_travel"],
-    tools: ["run_consolidated_memory_audit_sweep"],
-  },
-  {
-    agent_id: "08_consumer_credit_synthesizer_agent",
-    name: "consumer_credit_synthesizer_agent",
-    role: "Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING)",
-    description:
-      "08 · Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING): Hub of the 8-agent topology and the single agent that speaks to the customer/operator. Collects telemetry from all 7 spokes, queries `list_memory_topics_tool`, reconstructs the causal timeline via `read_customer_memory_bank`, and stages governed card unlocks.",
-    memory_topics_scoped: ["ALL (every topic configured on the engine)"],
-    catalog_governance: [
-      "v_customer_360 (ACTIVE)",
-      "disputes (ACTIVE)",
-      "wallet_tokens (ACTIVE)",
-      "dispute_events (ACTIVE)",
-      "glossary:regulation-e (VERIFIED)",
-      "glossary:regulation-z (VERIFIED)",
-      "customers.ssn_last4 (REFUSE · PII)",
-      "cards.pan_full (REFUSE · PII)",
-    ],
-    authorized_golden_queries: [
-      "01_customer_360_snapshot",
-      "07_open_disputes_for_customer",
-      "08_dispute_filing_window_check",
-      "09_provisional_credit_due",
-      "10_wallet_tokens_active_on_card",
-      "11_dispute_event_timeline",
-    ],
-    tools: ["list_memory_topics_tool", "read_customer_memory_bank", "execute_one_click_card_unlock"],
-  },
+  { agent_id: "01_fraud_monitoring_agent", name: "fraud_monitoring_agent", role: "Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)" },
+  { agent_id: "02_telephony_ivr_agent", name: "telephony_ivr_agent", role: "Contact Center IVR & Inbound Call Specialist (CHANNEL_PRODUCER · TELEPHONY_IVR)" },
+  { agent_id: "03_mobile_app_agent", name: "mobile_app_agent", role: "Mobile Banking & Digital Wallet Token Specialist (CHANNEL_PRODUCER · MOBILE_APP)" },
+  { agent_id: "04_web_portal_agent", name: "web_portal_agent", role: "Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL)" },
+  { agent_id: "05_branch_support_agent", name: "branch_support_agent", role: "In-Branch Banker & Identity Verification Specialist (CHANNEL_PRODUCER · BRANCH_SUPPORT)" },
+  { agent_id: "06_claim_veracity_validator_agent", name: "claim_veracity_validator_agent", role: "Pre-Write Claim Veracity Gatekeeper (PRE_WRITE_VALIDATOR)" },
+  { agent_id: "07_memory_bank_audit_agent", name: "memory_bank_audit_agent", role: "Enterprise Memory Bank Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)" },
+  { agent_id: "08_consumer_credit_synthesizer_agent", name: "consumer_credit_synthesizer_agent", role: "Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING)" },
 ];
 
 function setLivePulseState(mode) {
@@ -971,22 +810,24 @@ function openAgentCardModal(agentKey) {
       : `<span class="tag">${NOT_RECORDED}</span>`;
   }
 
+  // Catalog verdicts are decided live on each run, so the card lists what gets
+  // checked with no colour that would imply an outcome.
   const gov = Array.isArray(spec.catalog_governance) ? spec.catalog_governance : [];
   if ($("agentModalGovernance")) {
     $("agentModalGovernance").innerHTML = gov.length
-      ? gov.map((g) => {
-          const isRefuse = g.includes("REFUSE") || g.includes("DEPRECATED");
-          const isOwner = g.includes("OWNER_ONLY");
-          const cls = isRefuse ? "no" : isOwner ? "on" : "ok";
-          return `<span class="tag ${cls}">${escapeHtml(g)}</span>`;
-        }).join("")
+      ? gov.map((g) => `<span class="tag">${escapeHtml(g)}</span>`).join("") +
+        `<span class="tag-note">checked by the catalog at run time</span>`
       : `<span class="tag">${NOT_RECORDED}</span>`;
   }
 
   const gq = Array.isArray(spec.authorized_golden_queries) ? spec.authorized_golden_queries : [];
+  const bound = new Set(Array.isArray(spec.bound_golden_queries) ? spec.bound_golden_queries : []);
   if ($("agentModalGoldenQueries")) {
     $("agentModalGoldenQueries").innerHTML = gq.length
-      ? gq.map((q) => `<span class="tag ok">${escapeHtml(q)}</span>`).join("")
+      ? gq.map((q) => bound.has(q)
+          ? `<span class="tag ok" title="authorized and bound as a tool">${escapeHtml(q)} · bound</span>`
+          : `<span class="tag" title="authorized in INDEX.md, not bound as a tool">${escapeHtml(q)}</span>`
+        ).join("")
       : `<span class="tag">${NOT_RECORDED}</span>`;
   }
 
