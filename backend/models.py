@@ -1,12 +1,12 @@
 """
 models.py - Domain & Governance Data Models for the JPMC CCB Fraud & Disputes Desk.
 
-Models the live 6-agent architecture across:
+Models the live 8-agent hub-and-spoke architecture across:
 1. Vertex AI Agent Engine Memory Bank (`MemoryScope`, `SessionTurnRecord`, `ExtractedMemoryRecord`)
 2. Dataplex Universal Catalog Governance (`CatalogAspectVerdict`, `GlossaryTermDefinition`, `DataAccessAuthorization`)
 3. BigQuery Parameterized Golden Query Contracts (`GoldenQueryParameter`, `GoldenQueryContract`, `GoldenQueryExecutionResult`)
 4. Regulation E vs Regulation Z Dual-Rulebook Disputes (`RegulationPath`, `DisputeFilingWindowVerdict`, `FraudDeskCaseSummary`)
-5. 6-Agent Execution Spans & Audit Trace (`AgentId`, `SpanKind`, `AgentExecutionSpan`, `AgentTraceRecord`)
+5. 8-Agent Execution Spans & Audit Trace (`AgentId`, `SpanKind`, `AgentExecutionSpan`, `AgentTraceRecord`)
 """
 
 from __future__ import annotations
@@ -30,13 +30,23 @@ class RegulationPath(str, Enum):
 
 
 class AgentId(str, Enum):
-    """The 6 specialized agents in the CCB Fraud & Disputes Desk."""
-    ORCHESTRATOR = "01_orchestrator"
-    IDENTITY_CONTEXT = "02_identity_context"
-    FRAUD_TRIAGE = "03_fraud_triage"
-    POLICY_COMPLIANCE = "04_policy_compliance"
-    RESOLUTION_ACTIONS = "05_resolution_actions"
-    MEMORY_WRITER = "06_memory_writer"
+    """The 8 specialized agents in the CCB Fraud & Disputes Desk (`backend/adk_agents.py:list_all_agents`)."""
+    FRAUD_MONITORING = "01_fraud_monitoring_agent"
+    TELEPHONY_IVR = "02_telephony_ivr_agent"
+    MOBILE_APP = "03_mobile_app_agent"
+    WEB_PORTAL = "04_web_portal_agent"
+    BRANCH_SUPPORT = "05_branch_support_agent"
+    CLAIM_VERACITY_VALIDATOR = "06_claim_veracity_validator_agent"
+    MEMORY_BANK_AUDIT = "07_memory_bank_audit_agent"
+    CONSUMER_CREDIT_SYNTHESIZER = "08_consumer_credit_synthesizer_agent"
+
+    # Backward-compatible aliases mapping legacy 6-agent roles to the 8-agent roster
+    ORCHESTRATOR = "08_consumer_credit_synthesizer_agent"
+    IDENTITY_CONTEXT = "05_branch_support_agent"
+    FRAUD_TRIAGE = "01_fraud_monitoring_agent"
+    POLICY_COMPLIANCE = "04_web_portal_agent"
+    RESOLUTION_ACTIONS = "03_mobile_app_agent"
+    MEMORY_WRITER = "08_consumer_credit_synthesizer_agent"
 
 
 class CatalogAction(str, Enum):

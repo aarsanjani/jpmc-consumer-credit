@@ -387,7 +387,7 @@ function formatLiveSpanRow(span, t0) {
 function routeSpanToAgentNames(span, activePhase, activeGoldenTool) {
   const f = span.fields || {};
   const lbl = span.label || "";
-  const ag = f.agent || "";
+  const ag = String(f.agent || "").replace(/^\d+_/, "");
   const ch = (f.channel || "").toUpperCase();
   const tool = f.tool || activeGoldenTool || "";
 

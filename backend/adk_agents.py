@@ -145,7 +145,11 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="01_customer_360_snapshot.sql",
         tool_name="golden_01_customer_360_snapshot",
         plain_english_question="Who is this customer and what do their last 90 days look like?",
-        authorized_agents=[AgentId.ORCHESTRATOR, AgentId.IDENTITY_CONTEXT],
+        authorized_agents=[
+            AgentId.BRANCH_SUPPORT,
+            AgentId.CLAIM_VERACITY_VALIDATOR,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        ],
         required_parameters=["customer_id"],
         governed_tables=["v_customer_360", "customers", "accounts", "cards"],
         governed_columns_checked=["customers.customer_id", "customers.segment", "customers.ssn_last4"],
@@ -155,7 +159,11 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="02_recent_authorizations_for_card.sql",
         tool_name="golden_02_recent_authorizations_for_card",
         plain_english_question="What are the most recent charges on this card?",
-        authorized_agents=[AgentId.FRAUD_TRIAGE],
+        authorized_agents=[
+            AgentId.TELEPHONY_IVR,
+            AgentId.FRAUD_MONITORING,
+            AgentId.CLAIM_VERACITY_VALIDATOR,
+        ],
         required_parameters=["card_id", "as_of_ts", "lookback_days", "row_limit"],
         governed_tables=["authorizations", "cards", "merchants"],
         governed_columns_checked=["cards.pan_masked", "cards.pan_full"],
@@ -165,7 +173,10 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="03_suspicious_activity_on_card_window.sql",
         tool_name="golden_03_suspicious_activity_on_card_window",
         plain_english_question="Between these two moments, what on this card is worth a second look, and why?",
-        authorized_agents=[AgentId.FRAUD_TRIAGE],
+        authorized_agents=[
+            AgentId.FRAUD_MONITORING,
+            AgentId.CLAIM_VERACITY_VALIDATOR,
+        ],
         required_parameters=["card_id", "window_start_ts", "window_end_ts", "min_risk_score"],
         governed_tables=["authorizations", "cards", "merchants"],
         governed_columns_checked=["cards.pan_masked", "cards.pan_full"],
@@ -175,7 +186,10 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="04_geo_impossible_travel.sql",
         tool_name="golden_04_geo_impossible_travel",
         plain_english_question="Was this card used in two places too far apart to travel between in the time available?",
-        authorized_agents=[AgentId.FRAUD_TRIAGE],
+        authorized_agents=[
+            AgentId.FRAUD_MONITORING,
+            AgentId.CLAIM_VERACITY_VALIDATOR,
+        ],
         required_parameters=["card_id", "as_of_ts", "lookback_days", "max_plausible_kmh", "min_distance_km"],
         governed_tables=["authorizations", "merchants"],
         governed_columns_checked=["authorizations.auth_id", "cards.pan_full"],
@@ -185,7 +199,7 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="05_merchant_velocity_spike.sql",
         tool_name="golden_05_merchant_velocity_spike",
         plain_english_question="Which merchants had a day that looks nothing like their own normal day?",
-        authorized_agents=[AgentId.FRAUD_TRIAGE],
+        authorized_agents=[AgentId.FRAUD_MONITORING],
         required_parameters=["merchant_id", "start_date", "end_date", "min_fraud_rate", "min_auth_count", "velocity_flags"],
         governed_tables=["agg_merchant_velocity_daily", "merchants"],
         governed_columns_checked=[],
@@ -195,7 +209,7 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="06_cnp_burst_detection.sql",
         tool_name="golden_06_cnp_burst_detection",
         plain_english_question="Did someone fire a rapid run of online charges at this card?",
-        authorized_agents=[AgentId.FRAUD_TRIAGE],
+        authorized_agents=[AgentId.FRAUD_MONITORING],
         required_parameters=["card_id", "window_start_ts", "window_end_ts", "burst_window_seconds", "min_burst_count"],
         governed_tables=["authorizations", "merchants"],
         governed_columns_checked=["cards.pan_full"],
@@ -205,7 +219,11 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="07_open_disputes_for_customer.sql",
         tool_name="golden_07_open_disputes_for_customer",
         plain_english_question="What disputes does this customer already have running?",
-        authorized_agents=[AgentId.ORCHESTRATOR, AgentId.POLICY_COMPLIANCE],
+        authorized_agents=[
+            AgentId.WEB_PORTAL,
+            AgentId.CLAIM_VERACITY_VALIDATOR,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        ],
         required_parameters=["customer_id", "as_of_date", "open_statuses"],
         governed_tables=["disputes", "cards", "accounts"],
         governed_columns_checked=["cards.pan_masked", "cards.pan_full"],
@@ -215,7 +233,10 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="08_dispute_filing_window_check.sql",
         tool_name="golden_08_dispute_filing_window_check",
         plain_english_question="Was this dispute filed in time, and what does the bank now owe and by when?",
-        authorized_agents=[AgentId.POLICY_COMPLIANCE],
+        authorized_agents=[
+            AgentId.WEB_PORTAL,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        ],
         required_parameters=["dispute_id"],
         governed_tables=["disputes", "accounts", "cards", "authorizations"],
         governed_columns_checked=["cards.pan_masked"],
@@ -225,7 +246,10 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="09_provisional_credit_due.sql",
         tool_name="golden_09_provisional_credit_due",
         plain_english_question="Which Regulation E disputes owe the customer a provisional credit, and when is it due?",
-        authorized_agents=[AgentId.POLICY_COMPLIANCE],
+        authorized_agents=[
+            AgentId.WEB_PORTAL,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        ],
         required_parameters=["as_of_date", "horizon_days", "warn_days", "open_statuses"],
         governed_tables=["disputes", "accounts"],
         governed_columns_checked=[],
@@ -235,7 +259,10 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="10_wallet_tokens_active_on_card.sql",
         tool_name="golden_10_wallet_tokens_active_on_card",
         plain_english_question="Which phones and watches can still spend on this card?",
-        authorized_agents=[AgentId.RESOLUTION_ACTIONS],
+        authorized_agents=[
+            AgentId.MOBILE_APP,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        ],
         required_parameters=["card_id", "as_of_ts", "usage_lookback_days", "include_inactive"],
         governed_tables=["wallet_tokens", "devices", "cards"],
         governed_columns_checked=["cards.pan_masked", "cards.pan_full"],
@@ -245,7 +272,11 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="11_dispute_event_timeline.sql",
         tool_name="golden_11_dispute_event_timeline",
         plain_english_question="Everything that happened on this case, in order.",
-        authorized_agents=[AgentId.RESOLUTION_ACTIONS, AgentId.MEMORY_WRITER],
+        authorized_agents=[
+            AgentId.BRANCH_SUPPORT,
+            AgentId.MOBILE_APP,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        ],
         required_parameters=["dispute_id", "as_of_date", "pre_open_hours", "post_close_hours"],
         governed_tables=["dispute_events", "disputes"],
         governed_columns_checked=[],
@@ -255,7 +286,7 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         sql_filename="12_fraud_rate_by_merchant_category.sql",
         tool_name="golden_12_fraud_rate_by_merchant_category",
         plain_english_question="Which kinds of merchant are we losing money to?",
-        authorized_agents=[AgentId.FRAUD_TRIAGE],
+        authorized_agents=[AgentId.FRAUD_MONITORING],
         required_parameters=["start_date", "end_date", "min_auth_count"],
         governed_tables=["authorizations", "merchants"],
         governed_columns_checked=[],
@@ -509,7 +540,7 @@ def golden_01_customer_360_snapshot(customer_id: str = "CUST00001") -> Dict[str,
     """Golden Query 01: Who is this customer and what do their last 90 days look like? Column selection follows the catalog's sensitivity aspects."""
     return execute_golden_query_contract(
         query_id="01",
-        calling_agent=AgentId.IDENTITY_CONTEXT,
+        calling_agent=AgentId.BRANCH_SUPPORT,
         params={"customer_id": customer_id},
     )
 
@@ -522,7 +553,7 @@ def golden_02_recent_authorizations_for_card(
     """Golden Query 02: What are the most recent charges on this card? Column selection follows the catalog's sensitivity aspects."""
     return execute_golden_query_contract(
         query_id="02",
-        calling_agent=AgentId.FRAUD_TRIAGE,
+        calling_agent=AgentId.TELEPHONY_IVR,
         params={
             "card_id": card_id,
             "as_of_ts": datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc),
@@ -539,7 +570,7 @@ def golden_03_suspicious_activity_on_card_window(
     """Golden Query 03: Between two moments, what on this card is worth a second look, and why? Scores on signals only, never on a stored label."""
     return execute_golden_query_contract(
         query_id="03",
-        calling_agent=AgentId.FRAUD_TRIAGE,
+        calling_agent=AgentId.FRAUD_MONITORING,
         params={
             "card_id": card_id,
             "window_start_ts": datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc),
@@ -556,7 +587,7 @@ def golden_04_geo_impossible_travel(
     """Golden Query 04: Was this card used in two places too far apart to travel between in the time available?"""
     return execute_golden_query_contract(
         query_id="04",
-        calling_agent=AgentId.FRAUD_TRIAGE,
+        calling_agent=AgentId.FRAUD_MONITORING,
         params={
             "card_id": card_id,
             "as_of_ts": datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc),
@@ -571,7 +602,7 @@ def golden_07_open_disputes_for_customer(customer_id: str = "CUST00001") -> Dict
     """Golden Query 07: What disputes does this customer already have running, and which regulation does the ledger record for each?"""
     return execute_golden_query_contract(
         query_id="07",
-        calling_agent=AgentId.POLICY_COMPLIANCE,
+        calling_agent=AgentId.WEB_PORTAL,
         params={
             "customer_id": customer_id,
             "as_of_date": date(2026, 9, 22),
@@ -584,7 +615,7 @@ def golden_08_dispute_filing_window_check(dispute_id: str = "DSP00034") -> Dict[
     """Golden Query 08: Was this dispute filed in time, and what does the bank now owe and by when, under the regulation the ledger records for it?"""
     return execute_golden_query_contract(
         query_id="08",
-        calling_agent=AgentId.POLICY_COMPLIANCE,
+        calling_agent=AgentId.WEB_PORTAL,
         params={"dispute_id": dispute_id},
     )
 
@@ -593,7 +624,7 @@ def golden_09_provisional_credit_due() -> Dict[str, Any]:
     """Golden Query 09: Which Regulation E disputes owe the customer a provisional credit, and when is it due?"""
     return execute_golden_query_contract(
         query_id="09",
-        calling_agent=AgentId.POLICY_COMPLIANCE,
+        calling_agent=AgentId.WEB_PORTAL,
         params={
             "as_of_date": date(2026, 9, 22),
             "horizon_days": 14,
@@ -607,7 +638,7 @@ def golden_10_wallet_tokens_active_on_card(card_id: str = "CARD00002") -> Dict[s
     """Golden Query 10: Which phones and watches can still spend on this card?"""
     return execute_golden_query_contract(
         query_id="10",
-        calling_agent=AgentId.RESOLUTION_ACTIONS,
+        calling_agent=AgentId.MOBILE_APP,
         params={
             "card_id": card_id,
             "as_of_ts": datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc),
@@ -621,7 +652,7 @@ def golden_11_dispute_event_timeline(dispute_id: str = "DSP00033") -> Dict[str, 
     """Golden Query 11: Everything that happened on this case, in order."""
     return execute_golden_query_contract(
         query_id="11",
-        calling_agent=AgentId.RESOLUTION_ACTIONS,
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
         params={
             "dispute_id": dispute_id,
             "as_of_date": date(2026, 9, 22),
@@ -1613,158 +1644,38 @@ def produce_all_channels_snapshot(
 # 4. THE 8 CCB FRAUD DESK ADK AGENTS (hub-and-spoke around the synthesizer)
 # ==============================================================================
 
-# Retained internal tree. The golden-query specialists below predate the 8-agent
-# roster and are still the cleanest way to exercise Golden Queries 01-12 on their
-# own; the desk that /api/agents/list publishes is the hub-and-spoke built by
-# create_consumer_credit_synthesizer_agent further down.
+# Legacy 6-agent orchestrator wrapper (full definition moved to
+# `backend/legacy_six_agent_desk.py:build_legacy_six_agent_orchestrator`).
+# Kept as a thin caller here for standalone golden-query test harnesses
+# (`scripts/trace_adk_agents.py` and `scripts/probe_agents.py`); the active
+# 8-agent hub-and-spoke desk is `create_consumer_credit_synthesizer_agent()` below.
 def create_ccb_fraud_desk_orchestrator_agent(
     memory_bank_client: Optional[MemoryBankClient] = None,
     catalog_governor: Optional[CatalogGovernor] = None,
     model: str = "gemini-2.5-flash",
 ) -> LlmAgent:
-    """Builds the 6-agent JPMC CCB Fraud & Disputes ADK hierarchy (`Run 0412 · CUST00001 · Lisbon`).
+    """Caller wrapper that delegates to `backend/legacy_six_agent_desk.py:build_legacy_six_agent_orchestrator`."""
+    from backend.legacy_six_agent_desk import build_legacy_six_agent_orchestrator
 
-    Notice that `memory_bank_client` and `catalog_governor` are passed as service-level
-    clients — `customer_id` is never hardcoded on the client constructor, and is instead
-    passed dynamically at tool invocation time (`scope={"customer_id": customer_id}`).
-    """
     _ = memory_bank_client or GLOBAL_MEMORY_BANK_CLIENT
     _ = catalog_governor or GLOBAL_CATALOG_GOVERNOR
-
-    identity_context_agent = LlmAgent(
-        name="identity_and_context_agent",
+    return build_legacy_six_agent_orchestrator(
         model=model,
-        description="02 Identity & Context Agent: Retrieves scoped customer facts from Vertex AI Memory Bank and runs Golden Query 01 within whatever the catalog's sensitivity aspects permit.",
-        instruction=(
-            "You are Agent 02 (Identity & Context). Call list_memory_topics_tool first to see "
-            "what kinds of fact this Memory Bank files, then phrase your retrieval in that "
-            "vocabulary - retrieval is a semantic search, so a query worded like the topic it "
-            "lives under finds it and a guess may not. Then retrieve scoped customer memories "
-            "using retrieve_customer_memories_tool(customer_id=...) and run golden_01_customer_360_snapshot. "
-            "Before selecting any column, call catalog_governance_authorize_tool and honour the "
-            "agent_behavior it returns. Report which columns you declined and the aspect that "
-            "decided it; a refusal you cannot cite is not a refusal."
-        ),
-        tools=[
-            FunctionTool(list_memory_topics_tool),
-            FunctionTool(retrieve_customer_memories_tool),
-            FunctionTool(golden_01_customer_360_snapshot),
-            FunctionTool(catalog_governance_authorize_tool),
-        ],
+        list_memory_topics_tool=list_memory_topics_tool,
+        retrieve_customer_memories_tool=retrieve_customer_memories_tool,
+        catalog_governance_authorize_tool=catalog_governance_authorize_tool,
+        catalog_lookup_glossary_term_tool=catalog_lookup_glossary_term_tool,
+        golden_01_customer_360_snapshot=golden_01_customer_360_snapshot,
+        golden_02_recent_authorizations_for_card=golden_02_recent_authorizations_for_card,
+        golden_03_suspicious_activity_on_card_window=golden_03_suspicious_activity_on_card_window,
+        golden_04_geo_impossible_travel=golden_04_geo_impossible_travel,
+        golden_07_open_disputes_for_customer=golden_07_open_disputes_for_customer,
+        golden_08_dispute_filing_window_check=golden_08_dispute_filing_window_check,
+        golden_09_provisional_credit_due=golden_09_provisional_credit_due,
+        golden_10_wallet_tokens_active_on_card=golden_10_wallet_tokens_active_on_card,
+        golden_11_dispute_event_timeline=golden_11_dispute_event_timeline,
+        log_agent_tree=_log_agent_tree,
     )
-
-    fraud_triage_agent = LlmAgent(
-        name="fraud_triage_agent",
-        model=model,
-        description="03 Fraud Triage Agent: Executes Golden Queries 02, 03, 04 on BigQuery to score travel-window activity within whatever the catalog's sensitivity aspects permit.",
-        instruction=(
-            "You are Agent 03 (Fraud Triage). Use only approved Golden Queries (02, 03, 04) "
-            "with named @parameters (zero ad-hoc SQL). Before selecting any column, call "
-            "catalog_governance_authorize_tool and honour the agent_behavior it returns; where "
-            "it offers a replacement column, use the replacement. Triage on the signals only - "
-            "never read a stored fraud label, because scoring against the answer proves nothing."
-        ),
-        tools=[
-            FunctionTool(golden_02_recent_authorizations_for_card),
-            FunctionTool(golden_03_suspicious_activity_on_card_window),
-            FunctionTool(golden_04_geo_impossible_travel),
-            FunctionTool(catalog_governance_authorize_tool),
-        ],
-    )
-
-    policy_compliance_agent = LlmAgent(
-        name="policy_and_compliance_agent",
-        model=model,
-        description="04 Policy & Compliance Agent: Resolves the governing regulation for each dispute from the disputes ledger and the Dataplex glossary, and runs Golden Queries 07, 08, 09.",
-        instruction=(
-            "You are Agent 04 (Policy & Compliance). For each dispute in scope, read the "
-            "regulation the ledger records against that dispute - do not infer it from the "
-            "card, and do not carry one dispute's regulation over to another. Then call "
-            "catalog_lookup_glossary_term_tool for that regulation and state the remedy it "
-            "defines, including the case where the remedy is that none exists: 'no date "
-            "recorded' and 'no such remedy under this regulation' are different answers and "
-            "you must say which one applies. Every deadline you quote must come from a query "
-            "result, never from your own knowledge of the regulation. Before reading any "
-            "table, call catalog_governance_authorize_tool and honour the lifecycle status it "
-            "returns."
-        ),
-        tools=[
-            FunctionTool(catalog_lookup_glossary_term_tool),
-            FunctionTool(catalog_governance_authorize_tool),
-            FunctionTool(golden_07_open_disputes_for_customer),
-            FunctionTool(golden_08_dispute_filing_window_check),
-            FunctionTool(golden_09_provisional_credit_due),
-        ],
-    )
-
-    resolution_actions_agent = LlmAgent(
-        name="resolution_and_actions_agent",
-        model=model,
-        description="05 Resolution & Actions Agent: Freezes compromised cards, revokes active device wallet tokens (Golden Query 10), issues VCN, and obeys the customer's standing instructions as retrieved from Memory Bank.",
-        instruction=(
-            "You are Agent 05 (Resolution & Actions). Check active wallet tokens via "
-            "golden_10_wallet_tokens_active_on_card and event history via golden_11_dispute_event_timeline. "
-            "Before any irreversible action, retrieve the customer's standing instructions and "
-            "comply with whichever apply. Call list_memory_topics_tool first and pick the topic "
-            "whose description covers commitments the bank has made to this customer, then "
-            "retrieve using that topic's wording. Quote the instruction you are complying with, "
-            "and the topic it was filed under; if the retrieval returns none, say that you found "
-            "none rather than proceeding as though you had checked."
-        ),
-        tools=[
-            FunctionTool(golden_10_wallet_tokens_active_on_card),
-            FunctionTool(golden_11_dispute_event_timeline),
-            # Without these two the instruction above is uncallable: the agent
-            # would be told to retrieve standing instructions and given no way to
-            # do it, which is exactly the kind of gap a hardcoded instruction
-            # hides. The topics tool is what lets it find the right wording
-            # instead of being told the topic name.
-            FunctionTool(list_memory_topics_tool),
-            FunctionTool(retrieve_customer_memories_tool),
-        ],
-    )
-
-    memory_writer_agent = LlmAgent(
-        name="memory_writer_agent",
-        model=model,
-        description="06 Memory Writer Agent: Consolidates session turns into Vertex AI Memory Bank asynchronously after case close without storing restricted PII/PAN.",
-        instruction=(
-            "You are Agent 06 (Memory Writer). Summarize the ordered dispute timeline from "
-            "golden_11_dispute_event_timeline and trigger server-side Memory Bank consolidation "
-            "without storing full PAN, SSN last-4, or regulatory deadlines as static memories."
-        ),
-        tools=[
-            FunctionTool(golden_11_dispute_event_timeline),
-            FunctionTool(retrieve_customer_memories_tool),
-        ],
-    )
-
-    orchestrator = LlmAgent(
-        name="ccb_fraud_desk_orchestrator",
-        model=model,
-        description="01 Orchestrator Agent: Owns the customer conversation and coordinates the 6-agent JPMC CCB Fraud & Disputes Desk.",
-        instruction=(
-            "You are Agent 01 (Orchestrator) of the JPMorgan Chase CCB Fraud & Disputes Desk. "
-            "Route the customer's case across Identity & Context (02), Fraud Triage (03), "
-            "Policy & Compliance (04), Resolution & Actions (05), and Memory Writer (06). "
-            "Establish the facts from the tools and the spokes. Do not assume which regulation "
-            "governs a dispute, and do not assume two disputes on the same customer are "
-            "governed the same way - that is Agent 04's finding to report, not your premise."
-        ),
-        tools=[
-            FunctionTool(golden_01_customer_360_snapshot),
-            FunctionTool(golden_07_open_disputes_for_customer),
-        ],
-        sub_agents=[
-            identity_context_agent,
-            fraud_triage_agent,
-            policy_compliance_agent,
-            resolution_actions_agent,
-            memory_writer_agent,
-        ],
-    )
-    _log_agent_tree(orchestrator, "create_ccb_fraud_desk_orchestrator_agent")
-    return orchestrator
 
 
 def _log_agent_tree(root: LlmAgent, built_by: str) -> None:
@@ -1983,7 +1894,7 @@ def list_all_agents() -> List[AgentDescriptor]:
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     descriptors = [
         AgentDescriptor(
-            agent_id="01_fraud_monitoring_agent",
+            agent_id=AgentId.FRAUD_MONITORING.value,
             name="fraud_monitoring_agent",
             role="Fraud Velocity Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)",
             channel=BankChannel.FRAUD_DETECTION,
@@ -1997,7 +1908,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             description="Monitors FRAUD_DETECTION / FRAUD_OPS_OUTBOUND sessions, scores velocity and geography with Golden Queries 03 and 04, and stages card block/unblock or escalates to the synthesizer.",
         ),
         AgentDescriptor(
-            agent_id="02_telephony_ivr_agent",
+            agent_id=AgentId.TELEPHONY_IVR.value,
             name="telephony_ivr_agent",
             role="Contact Center IVR Specialist (CHANNEL_PRODUCER)",
             channel=BankChannel.TELEPHONY_IVR,
@@ -2009,7 +1920,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             description="Reads the seeded TELEPHONY_IVR call sessions and their recorded turns; declined amounts come from Golden Query 02, not from the transcript.",
         ),
         AgentDescriptor(
-            agent_id="03_mobile_app_agent",
+            agent_id=AgentId.MOBILE_APP.value,
             name="mobile_app_agent",
             role="Mobile & Digital Wallet Specialist (CHANNEL_PRODUCER)",
             channel=BankChannel.MOBILE_APP,
@@ -2021,7 +1932,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             description="Reads the seeded MOBILE_APP sessions covering wallet provisioning and tokenization outcomes, cross-checked against active tokens in Golden Query 10.",
         ),
         AgentDescriptor(
-            agent_id="04_web_portal_agent",
+            agent_id=AgentId.WEB_PORTAL.value,
             name="web_portal_agent",
             role="Online Web Banking Specialist (CHANNEL_PRODUCER)",
             channel=BankChannel.WEB_PORTAL,
@@ -2033,7 +1944,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             description="Reads the seeded WEB_PORTAL sessions - logins, dispute filings, card controls - and reconciles any dispute against the open-dispute ledger.",
         ),
         AgentDescriptor(
-            agent_id="05_branch_support_agent",
+            agent_id=AgentId.BRANCH_SUPPORT.value,
             name="branch_support_agent",
             role="Branch & Teller Specialist (CHANNEL_PRODUCER)",
             channel=BankChannel.BRANCH_SUPPORT,
@@ -2045,7 +1956,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             description="Reads the seeded BRANCH_SUPPORT sessions for banker consultations and in-person identity checks, with Golden Query 01 for customer identity only.",
         ),
         AgentDescriptor(
-            agent_id="06_claim_veracity_validator_agent",
+            agent_id=AgentId.CLAIM_VERACITY_VALIDATOR.value,
             name="claim_veracity_validator_agent",
             role="Pre-Write Veracity Gatekeeper (PRE_WRITE_VALIDATOR)",
             channel=None,
@@ -2054,7 +1965,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             description="Checks a customer claim against ground-truth avenues before any write reaches Memory Bank. Implemented in backend/veracity_and_audit.py.",
         ),
         AgentDescriptor(
-            agent_id="07_memory_bank_audit_agent",
+            agent_id=AgentId.MEMORY_BANK_AUDIT.value,
             name="memory_bank_audit_agent",
             role="Consolidated Sweep Auditor (CONSOLIDATED_AUDITOR · ASYNC JOB)",
             channel=None,
@@ -2063,7 +1974,7 @@ def list_all_agents() -> List[AgentDescriptor]:
             description="Async / scheduled enterprise-wide consolidated sweep across customer memory banks (kept off the synchronous chat path; triggerable on demand).",
         ),
         AgentDescriptor(
-            agent_id="08_consumer_credit_synthesizer_agent",
+            agent_id=AgentId.CONSUMER_CREDIT_SYNTHESIZER.value,
             name="consumer_credit_synthesizer_agent",
             role="Lead Synthesizer Orchestrator (LEAD_SYNTHESIZER)",
             channel=BankChannel.CORE_BANKING,

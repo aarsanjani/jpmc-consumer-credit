@@ -53,7 +53,7 @@ def main() -> None:
     print("=" * 84)
 
     query_id = "02"
-    calling_agent = AgentId.FRAUD_TRIAGE
+    calling_agent = AgentId.TELEPHONY_IVR
     params = {
         "card_id": "CARD00002",
         "as_of_ts": datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc),
