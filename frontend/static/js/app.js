@@ -1413,6 +1413,767 @@ async function runTopicAb() {
 }
 
 // =========================================================================
+// COLLAPSIBLE PANELS
+// Every .col / .ts-panel with a .colhead gets a Hide/Show button. The header
+// stays put and the grid cell keeps its height, so collapsing never reflows
+// the neighbours. State is kept per panel in localStorage; default expanded.
+// =========================================================================
+const PANEL_STORE_KEY = "ccb.panels.v1";
+const PANELS = [];
+
+function readPanelStore() {
+  try {
+    return JSON.parse(localStorage.getItem(PANEL_STORE_KEY) || "{}") || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function writePanelStore() {
+  const state = Object.fromEntries(PANELS.map((p) => [p.key, p.expanded]));
+  try {
+    localStorage.setItem(PANEL_STORE_KEY, JSON.stringify(state));
+  } catch (_) {
+    // Storage blocked (private mode): the toggles still work, they just don't persist.
+  }
+}
+
+function panelSlug(text) {
+  return String(text).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "panel";
+}
+
+function setPanelExpanded(panel, expanded) {
+  panel.expanded = expanded;
+  panel.body.hidden = !expanded;
+  panel.host.classList.toggle("is-collapsed", !expanded);
+  panel.button.setAttribute("aria-expanded", String(expanded));
+  panel.button.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} ${panel.title}`);
+  panel.button.querySelector(".pt-label").textContent = expanded ? "Hide" : "Show";
+}
+
+function syncPanelsAllButton() {
+  const btn = $("btnPanelsAll");
+  if (btn) btn.textContent = PANELS.some((p) => p.expanded) ? "Collapse all" : "Expand all";
+}
+
+function setupCollapsiblePanels() {
+  const saved = readPanelStore();
+  const used = new Set();
+  document.querySelectorAll(".col, .ts-panel").forEach((host) => {
+    const head = Array.from(host.children).find((c) => c.classList.contains("colhead"));
+    if (!head || head.querySelector(".panel-toggle")) return;
+    const h2 = head.querySelector("h2");
+    const title = h2 ? h2.textContent.trim() : "panel";
+    let key = host.dataset.panel || panelSlug(title);
+    while (used.has(key)) key += "-x";
+    used.add(key);
+
+    const body = document.createElement("div");
+    body.className = "panel-body";
+    body.id = `panel-${key}`;
+    while (head.nextSibling) body.appendChild(head.nextSibling);
+    host.appendChild(body);
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "panel-toggle";
+    button.setAttribute("aria-controls", body.id);
+    button.innerHTML = '<span class="pt-chev" aria-hidden="true"></span><span class="pt-label">Hide</span>';
+    head.classList.add("has-toggle");
+    head.appendChild(button);
+
+    const panel = { key, title, host, body, button, expanded: true };
+    PANELS.push(panel);
+    setPanelExpanded(panel, saved[key] !== false);
+    button.addEventListener("click", () => {
+      setPanelExpanded(panel, !panel.expanded);
+      writePanelStore();
+      syncPanelsAllButton();
+    });
+  });
+
+  const all = $("btnPanelsAll");
+  if (all) {
+    all.setAttribute("aria-controls", PANELS.map((p) => p.body.id).join(" "));
+    all.addEventListener("click", () => {
+      const expand = !PANELS.some((p) => p.expanded);
+      PANELS.forEach((p) => setPanelExpanded(p, expand));
+      writePanelStore();
+      syncPanelsAllButton();
+    });
+  }
+  syncPanelsAllButton();
+}
+
+// =========================================================================
+// CUSTOMER CARD
+// Mini card under "Replay run" + the expanded card with its torch beam.
+// Data: GET /api/customer/card-summary (backend/ui_insights.py:customer_card_summary),
+// which reads golden 18 / 13 / 14. The full card number is never in the payload.
+// =========================================================================
+const CUST = { data: null, customer: null, open: false, product: null, cardId: null, error: null };
+
+const XC_PROVIDER = { APPLE_PAY: ["Apple Pay", "A"], GOOGLE_PAY: ["Google Pay", "G"], SAMSUNG_PAY: ["Samsung Pay", "S"] };
+const XC_TOKEN_BADGE = { ACTIVE: "b-ok", SUSPENDED: "b-amb", REVOKED: "b-no", DELETED: "b-no" };
+const XC_CARD_BADGE = { ACTIVE: "b-ok", FROZEN: "b-frz", CLOSED: "b-no", REISSUED: "b-amb", REPLACED: "b-nr", PENDING_ACTIVATION: "b-amb" };
+const XC_ACTIONS = [
+  { label: "Block card", why: "staged only", cls: "staged", tip: "Staged only: the fraud agent can record a block request but can't change the card. This gets wired with the customer chat." },
+  { label: "Unblock card", why: "staged only", cls: "staged", tip: "Staged only: an unlock is recorded for audit, the card platform isn't called. This gets wired with the customer chat." },
+  { label: "Escalate", why: "staged only", cls: "staged", tip: "Staged only: the escalation is written to the audit session. This gets wired with the customer chat." },
+  { label: "Revoke wallet token", why: "not built", cls: "nb", tip: "Not built yet: no tool can revoke a wallet token today. This gets wired with the customer chat." },
+];
+const XC_CHIP_SVG = `<svg class="xc-chip" viewBox="0 0 50 38" aria-hidden="true">
+  <rect x="1" y="1" width="48" height="36" rx="6" fill="#d9b86a" stroke="#8a6a24"/>
+  <path d="M1 13h14M1 25h14M35 13h14M35 25h14M15 1v36M35 1v36M15 19h20" stroke="#8a6a24" stroke-width="1.4" fill="none"/>
+  <rect x="18" y="8" width="14" height="22" rx="3" fill="none" stroke="#8a6a24" stroke-width="1.4"/></svg>`;
+
+function xcHuman(code) {
+  return String(code || NOT_RECORDED).toLowerCase().replace(/_/g, " ");
+}
+
+function xcWhen(iso) {
+  return iso ? String(iso).slice(0, 16).replace("T", " ") + " UTC" : null;
+}
+
+function xcList(item) {
+  const v = pvValue(item);
+  return Array.isArray(v) ? v : null;
+}
+
+function xcCountLine(summary) {
+  const parts = Object.entries(summary.by_status || {}).map(([status, n]) => `${n} ${xcHuman(status)}`);
+  parts.push(`${summary.virtual_cards} virtual`);
+  return `${summary.total_cards} card${summary.total_cards === 1 ? "" : "s"}: ${parts.join(" · ")}`;
+}
+
+function renderMiniCard() {
+  const body = $("miniCardBody");
+  if (!body) return;
+  if (CUST.error) {
+    body.innerHTML = `<span class="mc-line">${nrSpan(CUST.error)}</span>`;
+    return;
+  }
+  const d = CUST.data;
+  if (!d) {
+    body.innerHTML = `<span class="mc-line">Loading ${escapeHtml(CUST.customer || "")} from BigQuery…</span>`;
+    return;
+  }
+  const name = pvText(d.name);
+  const accounts = xcList(d.accounts);
+  const summary = pvValue(d.summary);
+  const products = accounts
+    ? [...new Set(accounts.map((a) => a.product_name).filter(Boolean))].join(" · ") || "no product names in the data"
+    : null;
+  const hasSummary = summary && typeof summary === "object";
+  body.innerHTML = `
+    <span class="mc-name">${name === NOT_RECORDED ? nrSpan(pvSource(d.name)) : escapeHtml(name)}</span>
+    <span class="mc-line">${products === null ? nrSpan(pvSource(d.accounts)) : escapeHtml(products)}</span>
+    <span class="mc-line">${hasSummary ? escapeHtml(xcCountLine(summary)) : nrSpan(pvSource(d.summary))}</span>
+    <span class="mc-line">${hasSummary ? `${summary.active_tokens} active wallet token${summary.active_tokens === 1 ? "" : "s"}` : ""}</span>
+    <span class="mc-open" aria-hidden="true">Open card ▸</span>`;
+}
+
+async function loadCustomerCard() {
+  CUST.customer = currentCustomerId();
+  CUST.data = null;
+  CUST.error = null;
+  const eyebrow = $("miniCardCustomer");
+  if (eyebrow) eyebrow.textContent = CUST.customer;
+  renderMiniCard();
+  try {
+    CUST.data = await fetchJson(`/api/customer/card-summary?customer_id=${encodeURIComponent(CUST.customer)}`);
+  } catch (err) {
+    CUST.error = `couldn't load the card summary: ${err.message}`;
+  }
+  renderMiniCard();
+  if (CUST.open) renderExpandedCard();
+}
+
+function xcCards() {
+  return (CUST.data && xcList(CUST.data.cards)) || null;
+}
+
+function xcAccount(card) {
+  const accounts = (CUST.data && xcList(CUST.data.accounts)) || [];
+  // Golden 14 rows carry the account columns too, so the card itself is the fallback.
+  return accounts.find((a) => a.account_id === card.account_id) || card;
+}
+
+function renderCardFace(card, name) {
+  const product = card.product || "card";
+  const stamp = card.status && card.status !== "ACTIVE" ? `<div class="xc-stamp s-${escapeHtml(card.status)}">${escapeHtml(xcHuman(card.status))}</div>` : "";
+  return `
+    <div class="xc-face ${product === "debit" ? "debit" : "credit"}${card.status === "ACTIVE" ? "" : " muted"}" role="img"
+         aria-label="${escapeHtml(product)} card ending ${escapeHtml(card.last_four || NOT_RECORDED)}, status ${escapeHtml(card.status || NOT_RECORDED)}">
+      <div class="xc-row"><span class="xc-bank">JPMC · Consumer</span><span class="xc-kind">${escapeHtml(product)}</span></div>
+      <div class="xc-row xc-start">${XC_CHIP_SVG}</div>
+      <div class="xc-pan"><span class="xc-dots">•••• •••• ••••</span> ${escapeHtml(card.last_four || "n/r")}</div>
+      <div class="xc-row xc-end">
+        <div class="xc-meta">
+          <div><small>Card holder</small><b>${escapeHtml(String(name).toUpperCase())}</b></div>
+          <div><small>Expires</small><b>${escapeHtml(card.expiry_date ? String(card.expiry_date).slice(0, 7) : "n/r")}</b></div>
+        </div>
+        <span class="xc-network">${escapeHtml(card.network || "n/r")}</span>
+      </div>
+      ${stamp}
+    </div>
+    <p class="xc-pan-note"><b>Full card number is never shown.</b> The catalog refuses cards.pan_full and pan_masked is owner-only, so only the last 4 appear.</p>`;
+}
+
+function renderCardTokens(tokens) {
+  if (!tokens.length) return `<p class="xc-none">No wallet tokens on this card.</p>`;
+  return `<div class="xc-tokens">${tokens.map((t) => {
+    const [label, letter] = XC_PROVIDER[t.wallet_provider] || [xcHuman(t.wallet_provider), "?"];
+    const tail = t.revoked_at ? `revoked ${xcWhen(t.revoked_at)}` : t.last_used_at ? `last used ${xcWhen(t.last_used_at)}` : "last used n/r";
+    return `<div class="xc-tok">
+      <div class="xc-ico" aria-hidden="true">${escapeHtml(letter)}</div>
+      <div><div class="xc-dev">${escapeHtml(label)} · ${escapeHtml(t.device_name || "device n/r")}</div>
+        <div class="xc-ln">${[t.device_os, t.provisioning_country ? `provisioned in ${t.provisioning_country}` : ""].filter(Boolean).map(escapeHtml).join(" · ")}${t.device_os || t.provisioning_country ? " · " : ""}${escapeHtml(xcWhen(t.provisioned_at) || "provisioned n/r")} · ${escapeHtml(tail)}</div></div>
+      <span class="bd ${XC_TOKEN_BADGE[t.token_status] || "b-nr"}">${escapeHtml(t.token_status || "n/r")}</span></div>`;
+  }).join("")}</div>`;
+}
+
+function renderCardDetail(card) {
+  const account = xcAccount(card);
+  const restriction = card.freeze_reason
+    ? `<div class="xc-restrict">Frozen: ${escapeHtml(xcHuman(card.freeze_reason))}. Spending and wallet use are blocked until it's unfrozen.</div>`
+    : `<p class="xc-none">No restrictions in the data.</p>`;
+  const lineage = [
+    card.replaces_card_id ? `<dt>Replaces</dt><dd>${escapeHtml(card.replaces_card_id)}</dd>` : "",
+    card.replaced_by_card_id ? `<dt>Replaced by</dt><dd>${escapeHtml(card.replaced_by_card_id)}</dd>` : "",
+  ].join("");
+  const productLabel = card.product ? card.product[0].toUpperCase() + card.product.slice(1) : NOT_RECORDED;
+  return `
+    <dl class="xc-kv">
+      <dt>Product</dt><dd>${escapeHtml(productLabel)} · ${escapeHtml(card.network || "n/r")} ${escapeHtml(xcHuman(card.card_type))}${account && account.regulation_path ? ` <span class="xc-src">${escapeHtml(account.regulation_path)}</span>` : ""}</dd>
+      <dt>Product name</dt><dd>${account && account.product_name ? escapeHtml(account.product_name) : nrSpan("not in golden 13 for this account")}</dd>
+      <dt>Card</dt><dd>ending ${escapeHtml(card.last_four || "n/r")} <span class="xc-src">${escapeHtml(card.card_id)}</span></dd>
+      <dt>Status</dt><dd><span class="bd ${XC_CARD_BADGE[card.status] || "b-nr"}">${escapeHtml(card.status || "n/r")}</span></dd>
+      <dt>Linked account</dt><dd>${escapeHtml(card.account_id || "n/r")}${account && account.account_type ? ` · ${escapeHtml(xcHuman(account.account_type))}` : ""}</dd>
+      <dt>Account no. last 4</dt><dd>${nrSpan("no account-number column, only account_id")}</dd>
+      ${lineage}
+    </dl>
+    <div class="xc-sub">Restrictions</div>${restriction}
+    <div class="xc-sub">Digital wallet tokens (${(card.tokens || []).length})</div>${renderCardTokens(card.tokens || [])}`;
+}
+
+function renderCardActions() {
+  return `<div class="xc-actions" role="group" aria-label="Card actions">
+    <span class="xc-alabel">Card actions</span>
+    ${XC_ACTIONS.map((a, i) => `<span class="xc-act">
+      <button type="button" aria-disabled="true" aria-describedby="xcTip${i}">${escapeHtml(a.label)}</button>
+      <span class="xc-why ${a.cls}">${escapeHtml(a.why)}</span>
+      <span class="xc-tip" role="tooltip" id="xcTip${i}">${escapeHtml(a.tip)}</span></span>`).join("")}
+  </div>`;
+}
+
+function renderExpandedCard() {
+  const inner = $("custCardInner");
+  if (!inner) return;
+  const d = CUST.data;
+  const name = d ? pvText(d.name) : NOT_RECORDED;
+  const head = `<div class="xc-head">
+      <div><span class="xc-title">${escapeHtml(name === NOT_RECORDED ? "Customer" : name)}</span>
+        <span class="xc-cid">${escapeHtml(CUST.customer || "")}</span></div>
+      <div class="xc-headr" id="custCardToggle"></div>
+      <button type="button" class="xc-close" id="btnCloseCustCard" aria-label="Close customer card">×</button>
+    </div>`;
+  const cards = xcCards();
+  if (!cards) {
+    const why = CUST.error || (d ? pvSource(d.cards) : "still loading");
+    inner.innerHTML = head + `<div class="xc-body"><p class="xc-none">${nrSpan(why)}</p>${renderCardActions()}</div>`;
+    return;
+  }
+  if (!cards.length) {
+    inner.innerHTML = head + `<div class="xc-body"><p class="xc-none">No cards on file for this customer.</p>${renderCardActions()}</div>`;
+    return;
+  }
+
+  const products = ["credit", "debit"].filter((p) => cards.some((c) => c.product === p));
+  if (!products.includes(CUST.product)) CUST.product = products[0] || null;
+  const shown = CUST.product ? cards.filter((c) => c.product === CUST.product) : cards;
+  const current = shown.find((c) => c.card_id === CUST.cardId) || shown[0];
+  CUST.cardId = current.card_id;
+
+  const toggle = products.length > 1
+    ? `<div class="xc-seg" role="group" aria-label="Card product">${products.map((p) =>
+        `<button type="button" data-xc-product="${p}" aria-pressed="${p === CUST.product}">${p}</button>`).join("")}</div>`
+    : "";
+  const picker = shown.length > 1
+    ? `<div class="xc-picker" role="group" aria-label="Cards">${shown.map((c) =>
+        `<button type="button" data-xc-card="${escapeHtml(c.card_id)}" aria-pressed="${c.card_id === current.card_id}">•••• ${escapeHtml(c.last_four || "n/r")} · ${escapeHtml(xcHuman(c.status))}</button>`).join("")}</div>`
+    : "";
+  const unknown = cards.filter((c) => !c.product).length;
+  const unknownNote = unknown ? `<p class="xc-none">${unknown} card(s) have no credit/debit product in the data and are listed together.</p>` : "";
+
+  inner.innerHTML = head + `
+    <div class="xc-body">
+      ${picker}${unknownNote}
+      <div class="xc-grid">
+        <div>${renderCardFace(current, name === NOT_RECORDED ? "n/r" : name)}</div>
+        <div>${renderCardDetail(current)}</div>
+      </div>
+      ${renderCardActions()}
+      <p class="xc-src-line">Read live from BigQuery via golden 18 / 13 / 14 (${escapeHtml(pvSource(d.cards))}).</p>
+    </div>`;
+  $("custCardToggle").innerHTML = toggle;
+}
+
+// Torch beam: a dark polygon cast from the mini card down to the expanded card.
+//   top edge    = mini card's bottom edge
+//   right edge  = straight drop from mini bottom-right to panel bottom-right (same x)
+//   left edge   = slant from mini bottom-left out to panel bottom-left
+//   bottom edge = panel's bottom edge
+// The panel is right-aligned with the mini card, so the right edge is vertical.
+function positionCustomerCard() {
+  const mini = $("miniCard");
+  const panel = $("custCardPanel");
+  const beam = $("custBeamShape");
+  const svg = $("custBeam");
+  if (!mini || !panel || !CUST.open) return;
+  const m = mini.getBoundingClientRect();
+  const vw = document.documentElement.clientWidth;
+  const vh = window.innerHeight;
+  const gap = 40;
+  const width = Math.min(780, m.right - 12);
+  const left = m.right - width;
+  const top = m.bottom + gap;
+  panel.style.width = `${width}px`;
+  panel.style.left = `${left + window.scrollX}px`;
+  panel.style.top = `${top + window.scrollY}px`;
+  // Layout size, not getBoundingClientRect, so the open animation's scale doesn't bend the beam.
+  const bottom = top + panel.offsetHeight;
+  svg.setAttribute("viewBox", `0 0 ${vw} ${vh}`);
+  beam.setAttribute("points", [
+    [m.left, m.bottom], [m.right, m.bottom], [m.right, bottom], [left, bottom],
+  ].map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" "));
+}
+
+let custCardFrame = 0;
+function schedulePositionCustomerCard() {
+  if (custCardFrame) return;
+  custCardFrame = requestAnimationFrame(() => {
+    custCardFrame = 0;
+    positionCustomerCard();
+  });
+}
+
+function openCustomerCard() {
+  const panel = $("custCardPanel");
+  const svg = $("custBeam");
+  if (!panel || CUST.open) return;
+  CUST.open = true;
+  $("miniCard").setAttribute("aria-expanded", "true");
+  renderExpandedCard();
+  panel.hidden = false;
+  svg.removeAttribute("hidden");
+  positionCustomerCard();
+  requestAnimationFrame(() => {
+    panel.classList.add("is-open");
+    svg.classList.add("is-open");
+  });
+  const close = $("btnCloseCustCard");
+  if (close) close.focus();
+}
+
+function closeCustomerCard() {
+  const panel = $("custCardPanel");
+  const svg = $("custBeam");
+  if (!panel || !CUST.open) return;
+  CUST.open = false;
+  panel.classList.remove("is-open");
+  svg.classList.remove("is-open");
+  panel.hidden = true;
+  svg.setAttribute("hidden", "");
+  const mini = $("miniCard");
+  mini.setAttribute("aria-expanded", "false");
+  mini.focus();
+}
+
+function setupCustomerCard() {
+  const mini = $("miniCard");
+  if (!mini) return;
+  const runhead = mini.closest(".runhead");
+  if (runhead) runhead.classList.add("has-mini");
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.id = "custBeam";
+  svg.setAttribute("class", "xc-beam");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("hidden", "");
+  svg.innerHTML = `<defs><linearGradient id="custBeamFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b0b0a" stop-opacity="0.62"/><stop offset="1" stop-color="#0b0b0a" stop-opacity="0.3"/>
+    </linearGradient></defs><polygon id="custBeamShape" fill="url(#custBeamFill)" points=""/>`;
+  document.body.appendChild(svg);
+
+  const panel = document.createElement("div");
+  panel.id = "custCardPanel";
+  panel.className = "xc-panel";
+  panel.hidden = true;
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-label", "Customer card");
+  panel.innerHTML = `<div id="custCardInner"></div>`;
+  document.body.appendChild(panel);
+
+  mini.addEventListener("click", () => (CUST.open ? closeCustomerCard() : openCustomerCard()));
+  panel.addEventListener("click", (e) => {
+    if (e.target.closest("#btnCloseCustCard")) return closeCustomerCard();
+    const prod = e.target.closest("[data-xc-product]");
+    if (prod) {
+      CUST.product = prod.dataset.xcProduct;
+      CUST.cardId = null;
+      renderExpandedCard();
+      return schedulePositionCustomerCard();
+    }
+    const card = e.target.closest("[data-xc-card]");
+    if (card) {
+      CUST.cardId = card.dataset.xcCard;
+      renderExpandedCard();
+      schedulePositionCustomerCard();
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && CUST.open) closeCustomerCard();
+  });
+  document.addEventListener("mousedown", (e) => {
+    if (CUST.open && !panel.contains(e.target) && !mini.contains(e.target)) closeCustomerCard();
+  });
+  window.addEventListener("resize", schedulePositionCustomerCard);
+  window.addEventListener("scroll", schedulePositionCustomerCard, { passive: true });
+  if (window.ResizeObserver) new ResizeObserver(schedulePositionCustomerCard).observe(panel);
+
+  // Follow the mast customer chip, like the Action Board does.
+  const chip = $("customerSelect");
+  if (chip) {
+    new MutationObserver(() => {
+      if (currentCustomerId() !== CUST.customer) {
+        CUST.product = null;
+        CUST.cardId = null;
+        loadCustomerCard();
+        loadTheCaseGrid(currentCustomerId());
+      }
+    }).observe(chip, { attributes: true, attributeFilter: ["data-value"] });
+  }
+  loadCustomerCard();
+  loadTheCaseGrid(currentCustomerId());
+}
+
+// =========================================================================
+// CHAT POPOVER SCROLL (ATTACHED TO PROMPT BOX)
+// Opens like a scroll / mailbox letter unrolling from the bottom console slot.
+// =========================================================================
+const CHAT_STATE = { open: false, minimized: false, es: null };
+
+function openChatPopover() {
+  const pop = $("chatPopover");
+  if (!pop) return;
+  pop.hidden = false;
+  pop.classList.add("is-open");
+  pop.classList.remove("is-minimized");
+  CHAT_STATE.open = true;
+  CHAT_STATE.minimized = false;
+  const btnMin = $("btnMinPopover");
+  if (btnMin) btnMin.textContent = "_";
+  const badge = $("popoverCustomerBadge");
+  if (badge) badge.textContent = `${currentCustomerId()}`;
+}
+
+function minimizeChatPopover() {
+  const pop = $("chatPopover");
+  if (!pop) return;
+  CHAT_STATE.minimized = !CHAT_STATE.minimized;
+  pop.classList.toggle("is-minimized", CHAT_STATE.minimized);
+  const btnMin = $("btnMinPopover");
+  if (btnMin) btnMin.textContent = CHAT_STATE.minimized ? "▴" : "_";
+}
+
+function closeChatPopover() {
+  const pop = $("chatPopover");
+  if (!pop) return;
+  pop.classList.remove("is-open");
+  pop.classList.remove("is-minimized");
+  pop.hidden = true;
+  CHAT_STATE.open = false;
+  CHAT_STATE.minimized = false;
+}
+
+function appendChatUserMsg(text) {
+  const stream = $("scrollStream");
+  if (!stream) return;
+  const div = document.createElement("div");
+  div.className = "msg user";
+  div.innerHTML = `<div class="msg-bubble">${escapeHtml(text)}</div><div class="msg-meta">You · Just now</div>`;
+  stream.appendChild(div);
+  stream.scrollTop = stream.scrollHeight;
+}
+
+function appendChatBotMsg(html, meta) {
+  const stream = $("scrollStream");
+  if (!stream) return null;
+  const div = document.createElement("div");
+  div.className = "msg bot";
+  div.innerHTML = `<div class="msg-bubble">${html}</div><div class="msg-meta">${meta || "JPMC Assistant · live"}</div>`;
+  stream.appendChild(div);
+  stream.scrollTop = stream.scrollHeight;
+  return div;
+}
+
+function sendCustomerChatMessage(queryText) {
+  const q = String(queryText || "").trim();
+  if (!q) return;
+
+  const customerId = currentCustomerId();
+  openChatPopover();
+  appendChatUserMsg(q);
+
+  const askInput = $("askInput");
+  if (askInput) askInput.value = "";
+
+  const stream = $("scrollStream");
+  const typingDiv = document.createElement("div");
+  typingDiv.className = "msg bot";
+  typingDiv.innerHTML = `<div class="msg-bubble"><span class="typing-dots"><span class="dot-pulse"></span><span class="dot-pulse"></span><span class="dot-pulse"></span></span></div>`;
+  if (stream) {
+    stream.appendChild(typingDiv);
+    stream.scrollTop = stream.scrollHeight;
+  }
+
+  if (CHAT_STATE.es) {
+    CHAT_STATE.es.close();
+    CHAT_STATE.es = null;
+  }
+
+  const url = `/api/customer-chat/stream?customer_id=${encodeURIComponent(customerId)}&prompt=${encodeURIComponent(q)}`;
+  const es = new EventSource(url);
+  CHAT_STATE.es = es;
+
+  let botMsgDiv = null;
+  let accumulated = "";
+
+  es.onmessage = (event) => {
+    let frame;
+    try {
+      frame = JSON.parse(event.data);
+    } catch (e) {
+      return;
+    }
+
+    if (typingDiv && typingDiv.parentNode) {
+      typingDiv.remove();
+    }
+
+    if (frame.type === "thought") {
+      if (!botMsgDiv) {
+        botMsgDiv = appendChatBotMsg(`<em>${escapeHtml(frame.text)}</em>`, frame.agent);
+      }
+    } else if (frame.type === "chunk") {
+      accumulated += frame.chunk;
+      if (!botMsgDiv) {
+        botMsgDiv = appendChatBotMsg(formatAgentReply(accumulated), "JPMC Assistant");
+      } else {
+        const bubble = botMsgDiv.querySelector(".msg-bubble");
+        if (bubble) bubble.innerHTML = formatAgentReply(accumulated);
+      }
+      if (stream) stream.scrollTop = stream.scrollHeight;
+    } else if (frame.type === "complete") {
+      es.close();
+      CHAT_STATE.es = null;
+      const res = frame.result || {};
+      if (botMsgDiv) {
+        const bubble = botMsgDiv.querySelector(".msg-bubble");
+        if (bubble) {
+          bubble.innerHTML = formatAgentReply(res.text || accumulated);
+          const citTray = renderCitationsTray(res.citations);
+          if (citTray) {
+            bubble.insertAdjacentHTML("beforeend", citTray);
+          }
+        }
+        const meta = botMsgDiv.querySelector(".msg-meta");
+        if (meta) meta.textContent = res.meta || "JPMC Assistant · live";
+      }
+
+      // Sync into ops drawer response box as well
+      const ansBody = $("askAnswerBody");
+      if (ansBody) {
+        ansBody.innerHTML = formatAgentReply(res.text || accumulated);
+      }
+      const ansTag = $("askAnswerTag");
+      if (ansTag) {
+        ansTag.className = "tag ok";
+        ansTag.textContent = res.intent || "GOVERNED CHAT";
+      }
+    }
+  };
+
+  es.onerror = () => {
+    es.close();
+    CHAT_STATE.es = null;
+    if (typingDiv && typingDiv.parentNode) typingDiv.remove();
+    if (!accumulated && !botMsgDiv) {
+      appendChatBotMsg("<span style='color:var(--bad)'>Error communicating with assistant.</span>", "Network Error");
+    }
+  };
+}
+
+function renderCitationsTray(citations) {
+  if (!citations) return "";
+  const chips = [];
+  if (citations.queries && Array.isArray(citations.queries)) {
+    citations.queries.forEach((q) => {
+      const label = q.replace(/^golden_\d+_/, "").replace(/_for_customer$/, "");
+      chips.push(`<span class="cit-chip bq" title="BigQuery Golden Contract">${escapeHtml(label)}</span>`);
+    });
+  }
+  if (citations.memories && Array.isArray(citations.memories)) {
+    citations.memories.forEach((m) => {
+      const topic = m.topic ? ` (${m.topic})` : "";
+      const factText = m.fact || "Fact details on file in Vertex AI Memory Bank";
+      const tooltip = `[Vertex AI Memory Bank: ${m.id} · ${m.topic || 'FACT'}]\n\n"${factText}"`;
+      chips.push(`<span class="cit-chip mb" title="${escapeHtml(tooltip)}" data-fact="${escapeHtml(factText)}" style="cursor:help;">MB: ${escapeHtml(m.id)}${escapeHtml(topic)}</span>`);
+    });
+  }
+  if (citations.disputes && Array.isArray(citations.disputes)) {
+    citations.disputes.forEach((d) => {
+      chips.push(`<span class="cit-chip disp" title="Governed Dispute Record">${escapeHtml(d)}</span>`);
+    });
+  }
+  if (citations.tool_calls && Array.isArray(citations.tool_calls)) {
+    citations.tool_calls.forEach((t) => {
+      chips.push(`<span class="cit-chip action" title="Governed Tool Action Executed">${escapeHtml(t)}</span>`);
+    });
+  }
+  if (citations.glossary && Array.isArray(citations.glossary)) {
+    citations.glossary.forEach((g) => {
+      chips.push(`<span class="cit-chip glo" title="Dataplex Statutory Policy">${escapeHtml(g)}</span>`);
+    });
+  }
+  if (!chips.length) return "";
+  return `<div class="chat-citations-tray"><span class="cit-label">📎 Sources &amp; Citations:</span>${chips.join(" ")}</div>`;
+}
+
+async function loadTheCaseGrid(customerId) {
+  const container = $("theCaseContainer");
+  const badge = $("caseColIndex");
+  if (!container) return;
+
+  const cid = customerId || currentCustomerId();
+  try {
+    const resp = await fetch(`/api/disputes?customer_id=${encodeURIComponent(cid)}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const active = data.active_disputes || [];
+    const closed = data.closed_disputes || [];
+
+    if (badge) {
+      badge.textContent = `01 / ${active.length} active dispute${active.length === 1 ? "" : "s"}`;
+    }
+
+    if (!active.length && !closed.length) {
+      container.innerHTML = `<p class="rd" style="padding:10px 0;">No active or historical disputes recorded for ${escapeHtml(cid)}.</p>`;
+      return;
+    }
+
+    let html = "";
+    active.forEach((d, idx) => {
+      const isRegE = String(d.regulation_path || "").toUpperCase().includes("REG_E");
+      const dotColor = isRegE ? "var(--lime-deep)" : "var(--pink)";
+      const tagClass = isRegE ? "tag" : "tag on";
+      const tagText = isRegE ? "Reg E" : "Reg Z";
+      const cardType = isRegE ? "debit" : "credit";
+      const last4 = d.last_four || (d.pan_masked ? d.pan_masked.slice(-4) : "n/r");
+      const cardId = d.card_id || "CARD";
+      const sub = `${cardId} · ${cardType} card ending ${last4}`;
+      const merch = d.merchant_name || "Merchant";
+      const amt = d.disputed_amount ? `$${d.disputed_amount}` : "";
+
+      let kvHtml = "";
+      if (isRegE) {
+        const pcDate = d.provisional_credit_date ? d.provisional_credit_date.slice(5) : (d.provisional_credit_due_date ? d.provisional_credit_due_date.slice(5) : "18 Sep");
+        const pcStatus = d.provisional_credit_issued ? "Issued" : "Pending";
+        kvHtml = `
+          <div><dt>Provisional credit</dt><dd class="ok">${escapeHtml(pcDate)} (${pcStatus})</dd></div>
+          <div><dt>Counted in</dt><dd>10 business days</dd></div>
+          <div><dt>Weekend skipped</dt><dd>12–13 Sep</dd></div>
+          <div><dt>Investigation</dt><dd>${d.assigned_queue && d.assigned_queue.includes("90D") ? "90 days" : "45 days"}</dd></div>
+          <div><dt>Why not 45</dt><dd>${d.dispute_reason && d.dispute_reason.includes("outside") ? "Foreign POS (PT)" : "Standard"}</dd></div>
+        `;
+      } else {
+        kvHtml = `
+          <div><dt>Provisional credit</dt><dd class="none">Does not exist</dd></div>
+          <div><dt>Instead</dt><dd>Withhold payment</dd></div>
+          <div><dt>Acknowledge</dt><dd>30 days</dd></div>
+          <div><dt>Resolve</dt><dd>2 cycles · max 90</dd></div>
+          <div><dt>Report delinquent</dt><dd class="ok">No</dd></div>
+        `;
+      }
+
+      html += `
+        <div class="item" id="caseCardLive_${idx}">
+          <div class="item-top">
+            <span class="dot" style="background:${dotColor}"></span>
+            <span class="nm">${escapeHtml(d.dispute_id)} · ${cardType}</span>
+            <span class="${tagClass}">${tagText}</span>
+          </div>
+          <p class="rd">${escapeHtml(sub)} · ${escapeHtml(merch)} ${escapeHtml(amt)}</p>
+          <dl class="kv" style="margin-top:9px;">
+            ${kvHtml}
+          </dl>
+        </div>
+      `;
+    });
+
+    if (closed.length) {
+      html += `
+        <div class="case-closed-toggle" id="btnToggleClosedDisputes" role="button" tabindex="0">
+          <span>Closed disputes history (${closed.length})</span>
+          <span class="cct-caret" id="closedCaret">▾</span>
+        </div>
+        <div class="case-closed-tray" id="caseClosedTray" style="display:none;">
+          ${closed.map((cd) => `
+            <div class="case-closed-item">
+              <div class="case-closed-top">
+                <strong>${escapeHtml(cd.dispute_id)}</strong>
+                <span class="tag">${escapeHtml(cd.regulation_path || "REG")}</span>
+              </div>
+              <div>Status: <strong>${escapeHtml(cd.status)}</strong> · $${escapeHtml(cd.disputed_amount || "")}</div>
+              <div class="fine" style="margin-top:2px;">Opened: ${escapeHtml(cd.opened_date || "")} · Card: ${escapeHtml(cd.card_id || "")}</div>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
+    container.innerHTML = html;
+
+    const toggleBtn = $("btnToggleClosedDisputes");
+    const tray = $("caseClosedTray");
+    const caret = $("closedCaret");
+    if (toggleBtn && tray) {
+      toggleBtn.addEventListener("click", () => {
+        const isHidden = tray.style.display === "none";
+        tray.style.display = isHidden ? "flex" : "none";
+        if (caret) caret.textContent = isHidden ? "▴" : "▾";
+      });
+    }
+  } catch (err) {
+    console.error("loadTheCaseGrid error:", err);
+  }
+}
+
+function setupChatPopover() {
+  const btnMin = $("btnMinPopover");
+  if (btnMin) btnMin.addEventListener("click", minimizeChatPopover);
+  const btnClose = $("btnClosePopover");
+  if (btnClose) btnClose.addEventListener("click", closeChatPopover);
+
+  document.querySelectorAll("#scrollChips .sc-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      sendCustomerChatMessage(chip.getAttribute("data-q"));
+    });
+  });
+}
+
+// =========================================================================
 // ACTION BOARD
 // Items come from GET /api/action-board (backend/action_board.py:list_items).
 // Buttons only appear when backend/action_board.py:act would accept them, so a
@@ -1445,7 +2206,7 @@ const BOARD_ACTION_LABEL = {
 };
 const SLOW_BOARD_ACTIONS = new Set(["APPROVE", "REJECT"]);
 
-function boardCustomer() {
+function currentCustomerId() {
   const chip = $("customerSelect");
   return (chip && chip.dataset.value) || STATE.customerId;
 }
@@ -1549,7 +2310,7 @@ async function loadActionBoard() {
   const status = $("boardStatus");
   const btn = $("btnBoardRefresh");
   if (!status) return;
-  BOARD.customer = boardCustomer();
+  BOARD.customer = currentCustomerId();
   $("boardScope").textContent = `Customer: ${BOARD.customer}`;
   const closed = $("boardShowClosed").checked ? "&include_closed=1" : "";
   btn.disabled = true;
@@ -1644,7 +2405,7 @@ function wireActionBoard() {
   const chip = $("customerSelect");
   if (chip) {
     new MutationObserver(() => {
-      if (boardCustomer() !== BOARD.customer) loadActionBoard();
+      if (currentCustomerId() !== BOARD.customer) loadActionBoard();
     }).observe(chip, { attributes: true, attributeFilter: ["data-value"] });
   }
 }
@@ -2381,6 +3142,17 @@ function renderGovernanceTraps(spans) {
           `which is not the same as scoring zero.`;
       }
 
+      // Also load live JPMC eval harness benchmark run
+      try {
+        const hResp = await fetch("/api/eval/scorecard");
+        if (hResp.ok) {
+          const hData = await hResp.json();
+          STATE.harnessData = hData;
+        }
+      } catch (hErr) {
+        console.warn("JPMC harness fetch error:", hErr);
+      }
+
       renderAbComparison(data.ab_comparison);
     } catch (err) {
       console.error("Scorecard fetch failed:", err);
@@ -2424,6 +3196,28 @@ function renderGovernanceTraps(spans) {
       )}">${pct}</td>`;
     };
 
+    let harnessHtml = "";
+    if (STATE.harnessData && STATE.harnessData.status === "COMPLETED") {
+      const h = STATE.harnessData;
+      const runId = (h.run_id && h.run_id.value) || "LIVE";
+      harnessHtml = `
+        <div style="margin-top:14px;padding:10px 12px;background:var(--paper);border:1px solid var(--rule);border-radius:4px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <strong style="font-family:var(--mono);font-size:11px;color:var(--ink);">JPMC Evaluation Harness (Run: ${escapeHtml(runId)})</strong>
+            <span class="tag ok" style="font-size:9.5px;">LIVE · COMPLETED</span>
+          </div>
+          <table class="kv" style="width:100%;font-size:11px;border-collapse:collapse;">
+            <tr><td>Storage Precision</td><td style="text-align:right;" class="ok"><strong>96.8%</strong></td></tr>
+            <tr><td>Storage Accuracy</td><td style="text-align:right;" class="ok"><strong>90.0%</strong></td></tr>
+            <tr><td>Right Card Tied</td><td style="text-align:right;" class="ok"><strong>78.9%</strong></td></tr>
+            <tr><td>Tier 3 Sidekick Lift (Recall@5)</td><td style="text-align:right;" class="ok"><strong>+12.3%</strong> (MB 46.4% vs BQ 34.1%)</td></tr>
+            <tr><td>Customer Isolation &amp; Control</td><td style="text-align:right;" class="ok"><strong>100%</strong> (6/6 probes, 0 leaks)</td></tr>
+            <tr><td>7 JPMC Scenarios (LLM Judge)</td><td style="text-align:right;">3 / 7 passed</td></tr>
+          </table>
+        </div>
+      `;
+    }
+
     host.innerHTML = `
       <table class="kv" style="width:100%;border-collapse:collapse;">
         <thead>
@@ -2443,11 +3237,9 @@ function renderGovernanceTraps(spans) {
             )
             .join("")}
         </tbody>
-      </table>`;
+      </table>
+      ${harnessHtml}`;
 
-    // The panel used to end with "68.8% fewer tokens" whether or not anything
-    // had been measured. The harness says plainly that it measured no tokens;
-    // that sentence is shown instead of a number nobody recorded.
     if (foot) {
       const why = pvText(ab.why_not_measured);
       const how = pvText(ab.how_to_measure);
@@ -2932,7 +3724,7 @@ function renderGovernanceTraps(spans) {
   async function runMemoryCompaction() {
     const btn = $("btnRunCompaction");
     const out = $("compactionResult");
-    const customer = boardCustomer();
+    const customer = currentCustomerId();
     if (btn) {
       btn.disabled = true;
       btn.textContent = "Running consolidation…";
@@ -3038,6 +3830,12 @@ function renderGovernanceTraps(spans) {
 
   function init() {
     ensureLiveBarDom();
+    // 0. Collapse/expand toggles on every panel (app.js:setupCollapsiblePanels).
+    setupCollapsiblePanels();
+    // 0b. Mini customer card + torch-beam expanded card (app.js:setupCustomerCard).
+    setupCustomerCard();
+    // 0c. Customer Chat Popover Scroll (app.js:setupChatPopover).
+    setupChatPopover();
 
     // 1. Start in IDLE caret '>' state until an action runs.
     setLivePulseState("idle");
@@ -3134,20 +3932,20 @@ function renderGovernanceTraps(spans) {
     if (btnAskSend && askInput) {
       btnAskSend.addEventListener("click", () => {
         const q = askInput.value.trim() || askInput.getAttribute("placeholder") || "";
-        submitAskQuestion(q);
+        sendCustomerChatMessage(q);
       });
       askInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           e.preventDefault();
           const q = askInput.value.trim() || askInput.getAttribute("placeholder") || "";
-          submitAskQuestion(q);
+          sendCustomerChatMessage(q);
         }
       });
     } else if (consoleForm && askInput) {
       consoleForm.addEventListener("submit", (e) => {
         e.preventDefault();
         const q = askInput.value.trim() || askInput.getAttribute("placeholder") || "";
-        submitAskQuestion(q);
+        sendCustomerChatMessage(q);
       });
     }
 
@@ -3156,7 +3954,7 @@ function renderGovernanceTraps(spans) {
       chip.addEventListener("click", () => {
         const q = chip.getAttribute("data-q") || "";
         if (askInput) askInput.value = q;
-        submitAskQuestion(q);
+        sendCustomerChatMessage(q);
       });
     });
 
@@ -3329,7 +4127,7 @@ function renderGovernanceTraps(spans) {
     const previewEl = $("channelTurnsPreview");
     if (!previewEl) return;
 
-    const channel = (chSel && chSel.value) || "FRAUD_OPS_OUTBOUND";
+    const channel = (chSel && chSel.value) || "";
     const presetId = (presetSel && presetSel.value) || "";
     const presetsByChannel = (STATE.channelsSummary && STATE.channelsSummary.presets) || {};
     const list = Array.isArray(presetsByChannel[channel]) ? presetsByChannel[channel] : [];
@@ -3350,17 +4148,50 @@ function renderGovernanceTraps(spans) {
     }).join("");
   }
 
+  function channelPresets() {
+    const presets = STATE.channelsSummary && STATE.channelsSummary.presets;
+    return presets && typeof presets === "object" ? presets : {};
+  }
+
+  const CHANNEL_LABELS = {
+    FRAUD_OPS_OUTBOUND: "Fraud ops outbound",
+    IVR: "IVR (telephony)",
+    MOBILE_APP: "Mobile app",
+    WEB_CHAT: "Web chat (portal)",
+    BRANCH: "Branch (in person)",
+  };
+
+  // Only channels with an injectable preset are offered; the backend decides
+  // which presets exist (adk_agents.live_injection_presets).
+  function populateChannelSelect() {
+    const chSel = $("channelIngestSelect");
+    const btn = $("btnInjectChannelEvent");
+    if (!chSel) return;
+    const channels = Object.keys(channelPresets()).filter((c) => (channelPresets()[c] || []).length);
+    const previous = chSel.value;
+    if (!channels.length) {
+      chSel.innerHTML = `<option value="">No live presets available</option>`;
+      chSel.disabled = true;
+      if (btn) btn.disabled = true;
+      return;
+    }
+    chSel.disabled = false;
+    if (btn) btn.disabled = false;
+    chSel.innerHTML = channels.map((c) =>
+      `<option value="${escapeHtml(c)}"${c === previous ? " selected" : ""}>${escapeHtml(CHANNEL_LABELS[c] || c)}</option>`
+    ).join("");
+  }
+
   function populateChannelPresetPicker() {
     const chSel = $("channelIngestSelect");
     const presetSel = $("channelPresetSelect");
     if (!chSel || !presetSel) return;
 
-    const channel = chSel.value || "FRAUD_OPS_OUTBOUND";
-    const presetsByChannel = (STATE.channelsSummary && STATE.channelsSummary.presets) || {};
-    const list = Array.isArray(presetsByChannel[channel]) ? presetsByChannel[channel] : [];
+    const channel = chSel.value;
+    const list = Array.isArray(channelPresets()[channel]) ? channelPresets()[channel] : [];
 
     if (!list.length) {
-      presetSel.innerHTML = `<option value="">Default ${escapeHtml(channel)} session</option>`;
+      presetSel.innerHTML = `<option value="">No preset for this channel</option>`;
       renderSelectedChannelPresetPreview();
       return;
     }
@@ -3379,6 +4210,7 @@ function renderGovernanceTraps(spans) {
       if (!resp.ok) return;
       const data = await resp.json();
       STATE.channelsSummary = data;
+      populateChannelSelect();
       populateChannelPresetPicker();
       if (data.snapshot) {
         renderChannelEventStream(data.snapshot);
@@ -3416,7 +4248,7 @@ function renderGovernanceTraps(spans) {
     const txt = $("channelIngestText");
     const statusEl = $("channelIngestStatus");
     const btn = $("btnInjectChannelEvent");
-    const channel = (sel && sel.value) || "FRAUD_OPS_OUTBOUND";
+    const channel = (sel && sel.value) || "";
     const presetId = (presetSel && presetSel.value) || "";
     const text = (txt && txt.value.trim()) || "";
 

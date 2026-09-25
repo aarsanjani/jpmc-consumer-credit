@@ -11,3 +11,10 @@ def dummy_env_vars(monkeypatch):
     monkeypatch.setenv("DATAPLEX_GLOSSARY", "test-glossary")
     monkeypatch.setenv("DATAPLEX_GLOSSARY_ID", "test-glossary")
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+
+@pytest.fixture
+def test_client():
+    from backend.app import app
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        yield client

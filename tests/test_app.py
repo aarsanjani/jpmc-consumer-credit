@@ -9,12 +9,12 @@ def test_client():
         yield client
 
 def test_api_agents_list(test_client):
-    """Verify /api/agents/list returns exactly 8 agents."""
+    """Verify /api/agents/list returns exactly 9 agents."""
     resp = test_client.get("/api/agents/list")
     assert resp.status_code == 200
     data = resp.get_json()
-    assert data["count"] == 8
-    assert len(data["agents"]) == 8
+    assert data["count"] == 9
+    assert len(data["agents"]) == 9
 
 def test_api_session_upstream_error_handling(test_client, monkeypatch):
     """Verify routes return structured upstream errors rather than fabricated successes."""

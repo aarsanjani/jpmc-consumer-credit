@@ -46,7 +46,7 @@ import threading
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -136,7 +136,7 @@ def _resolve_golden_sql_dir() -> Path:
     return kit_dir
 
 
-# Maps each of the 12 SQL contracts (`01`..`12`) to:
+# Maps each SQL contract (`01`..`19`) to:
 #   - Which agents are allowed to run it (`authorized_agents`)
 #   - Which BigQuery tables and sensitive columns Dataplex must check before execution
 # Enforced at runtime by `execute_golden_query_contract()` (`backend/adk_agents.py:331`).
@@ -224,6 +224,7 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
             AgentId.WEB_PORTAL,
             AgentId.CLAIM_VERACITY_VALIDATOR,
             AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+            AgentId.DISPUTE_SPECIALIST,
         ],
         required_parameters=["customer_id", "as_of_date", "open_statuses"],
         governed_tables=["disputes", "cards", "accounts"],
@@ -237,6 +238,7 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         authorized_agents=[
             AgentId.WEB_PORTAL,
             AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+            AgentId.DISPUTE_SPECIALIST,
         ],
         required_parameters=["dispute_id"],
         governed_tables=["disputes", "accounts", "cards", "authorizations"],
@@ -250,6 +252,7 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         authorized_agents=[
             AgentId.WEB_PORTAL,
             AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+            AgentId.DISPUTE_SPECIALIST,
         ],
         required_parameters=["as_of_date", "horizon_days", "warn_days", "open_statuses"],
         governed_tables=["disputes", "accounts"],
@@ -277,6 +280,7 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
             AgentId.BRANCH_SUPPORT,
             AgentId.MOBILE_APP,
             AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+            AgentId.DISPUTE_SPECIALIST,
         ],
         required_parameters=["dispute_id", "as_of_date", "pre_open_hours", "post_close_hours"],
         governed_tables=["dispute_events", "disputes"],
@@ -291,6 +295,96 @@ GOLDEN_QUERY_CONTRACTS: Dict[str, GoldenQueryContract] = {
         required_parameters=["start_date", "end_date", "min_auth_count"],
         governed_tables=["authorizations", "merchants"],
         governed_columns_checked=[],
+    ),
+    "13": GoldenQueryContract(
+        query_id="13",
+        sql_filename="13_customer_accounts_and_balances.sql",
+        tool_name="golden_13_customer_accounts_and_balances",
+        plain_english_question="Which accounts does this customer hold, and what is the balance on each?",
+        authorized_agents=[AgentId.CONSUMER_CREDIT_SYNTHESIZER],
+        required_parameters=["customer_id"],
+        governed_tables=["accounts"],
+        governed_columns_checked=[
+            "accounts.current_balance", "accounts.available_balance", "accounts.joint_customer_id",
+        ],
+    ),
+    "14": GoldenQueryContract(
+        query_id="14",
+        sql_filename="14_customer_cards_and_wallets.sql",
+        tool_name="golden_14_customer_cards_and_wallets",
+        plain_english_question="Which cards does this customer have, in any state, and which devices carry them?",
+        authorized_agents=[
+            AgentId.MOBILE_APP,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        ],
+        required_parameters=["customer_id"],
+        governed_tables=["cards", "accounts", "wallet_tokens"],
+        governed_columns_checked=["cards.last_four", "wallet_tokens.device_name"],
+    ),
+    "15": GoldenQueryContract(
+        query_id="15",
+        sql_filename="15_spend_summary.sql",
+        tool_name="golden_15_spend_summary",
+        plain_english_question="How much did this customer spend between two dates, on what, and where?",
+        authorized_agents=[AgentId.CONSUMER_CREDIT_SYNTHESIZER],
+        required_parameters=["customer_id", "start_date", "end_date", "top_merchant_limit"],
+        governed_tables=["authorizations", "merchants"],
+        governed_columns_checked=["authorizations.amount_usd"],
+    ),
+    "16": GoldenQueryContract(
+        query_id="16",
+        sql_filename="16_statement_transactions.sql",
+        tool_name="golden_16_statement_transactions",
+        plain_english_question="What are the line items on this account for the statement period?",
+        authorized_agents=[AgentId.CONSUMER_CREDIT_SYNTHESIZER],
+        required_parameters=["customer_id", "account_id", "period_start", "period_end", "row_limit"],
+        governed_tables=["authorizations", "accounts", "merchants"],
+        governed_columns_checked=[
+            "authorizations.amount_usd", "authorizations.posted_amount", "accounts.joint_customer_id",
+        ],
+    ),
+    "17": GoldenQueryContract(
+        query_id="17",
+        sql_filename="17_card_replacement_tracking.sql",
+        tool_name="golden_17_card_replacement_tracking",
+        plain_english_question="Where is this customer's replacement card, and is it activated yet?",
+        authorized_agents=[
+            AgentId.WEB_PORTAL,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+            AgentId.DISPUTE_SPECIALIST,
+        ],
+        required_parameters=["customer_id"],
+        governed_tables=["dispute_events", "cards"],
+        governed_columns_checked=[
+            "dispute_events.shipment_destination_country", "dispute_events.event_detail", "cards.last_four",
+        ],
+    ),
+    "18": GoldenQueryContract(
+        query_id="18",
+        sql_filename="18_customer_contact_profile.sql",
+        tool_name="golden_18_customer_contact_profile",
+        plain_english_question="What is this customer's name, address and preferred way to be contacted?",
+        authorized_agents=[AgentId.CONSUMER_CREDIT_SYNTHESIZER],
+        required_parameters=["customer_id", "as_of_date"],
+        governed_tables=["customers"],
+        governed_columns_checked=[
+            "customers.phone_primary", "customers.home_address_line1",
+            "customers.temp_address_line1", "customers.standing_instructions",
+        ],
+    ),
+    "19": GoldenQueryContract(
+        query_id="19",
+        sql_filename="19_travel_notices_for_customer.sql",
+        tool_name="golden_19_travel_notices_for_customer",
+        plain_english_question="What travel has this customer told us about, and is any of it still current?",
+        authorized_agents=[
+            AgentId.WEB_PORTAL,
+            AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+            AgentId.DISPUTE_SPECIALIST,
+        ],
+        required_parameters=["customer_id"],
+        governed_tables=["travel_notices"],
+        governed_columns_checked=["travel_notices.destination_city", "travel_notices.actual_return_date"],
     ),
 }
 
@@ -537,6 +631,42 @@ def execute_golden_query_contract(
 # 2. CALLABLE ADK GOLDEN QUERY FUNCTION TOOLS (shared by the roster)
 # ==============================================================================
 
+def demo_as_of_date() -> date:
+    """The demo's "today", read from DEMO_AS_OF_DATE (YYYY-MM-DD).
+
+    The seeded data stops on a fixed day. Measuring windows back from the wall
+    clock instead would slide them past the data until every one came back empty.
+    """
+    raw = require_env("DEMO_AS_OF_DATE")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"DEMO_AS_OF_DATE must be a YYYY-MM-DD date, got {raw!r}") from exc
+
+
+def demo_as_of_ts() -> datetime:
+    """Noon UTC on the demo date, the moment the timestamp-based golden queries treat as now."""
+    as_of = demo_as_of_date()
+    return datetime(as_of.year, as_of.month, as_of.day, 12, tzinfo=timezone.utc)
+
+
+def _date_window(start: str | None, end: str | None, today: date, days: int) -> tuple[date, date]:
+    """Inclusive first and last day of a date window a caller asked for.
+
+    A missing end is `today`. A missing start is `days` days back from the end,
+    counting the end day itself. Raises ValueError for a date that is not
+    YYYY-MM-DD or a window that ends before it starts.
+
+    `today` is passed in rather than read here, so a broken DEMO_AS_OF_DATE
+    fails loudly in the wrapper instead of being reported back as a bad date.
+    """
+    last = date.fromisoformat(end) if end else today
+    first = date.fromisoformat(start) if start else last - timedelta(days=days - 1)
+    if first > last:
+        raise ValueError(f"the window starts on {first}, after it ends on {last}")
+    return first, last
+
+
 def golden_01_customer_360_snapshot(customer_id: str = "CUST00001") -> Dict[str, Any]:
     """Golden Query 01: Who is this customer and what do their last 90 days look like? Column selection follows the catalog's sensitivity aspects."""
     return execute_golden_query_contract(
@@ -557,7 +687,7 @@ def golden_02_recent_authorizations_for_card(
         calling_agent=AgentId.TELEPHONY_IVR,
         params={
             "card_id": card_id,
-            "as_of_ts": datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc),
+            "as_of_ts": demo_as_of_ts(),
             "lookback_days": lookback_days,
             "row_limit": row_limit,
         },
@@ -569,13 +699,15 @@ def golden_03_suspicious_activity_on_card_window(
     min_risk_score: float = 0.65,
 ) -> Dict[str, Any]:
     """Golden Query 03: Between two moments, what on this card is worth a second look, and why? Scores on signals only, never on a stored label."""
+    window_start = demo_as_of_date() - timedelta(days=14)
     return execute_golden_query_contract(
         query_id="03",
         calling_agent=AgentId.FRAUD_MONITORING,
         params={
             "card_id": card_id,
-            "window_start_ts": datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc),
-            "window_end_ts": datetime(2026, 9, 13, 23, 59, tzinfo=timezone.utc),
+            # From midnight, so the first day counts in full and nothing the old fixed window caught drops out.
+            "window_start_ts": datetime(window_start.year, window_start.month, window_start.day, tzinfo=timezone.utc),
+            "window_end_ts": demo_as_of_ts(),
             "min_risk_score": min_risk_score,
         },
     )
@@ -591,7 +723,7 @@ def golden_04_geo_impossible_travel(
         calling_agent=AgentId.FRAUD_MONITORING,
         params={
             "card_id": card_id,
-            "as_of_ts": datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc),
+            "as_of_ts": demo_as_of_ts(),
             "lookback_days": lookback_days,
             "max_plausible_kmh": 950.0,
             "min_distance_km": 500.0,
@@ -606,7 +738,7 @@ def golden_07_open_disputes_for_customer(customer_id: str = "CUST00001") -> Dict
         calling_agent=AgentId.WEB_PORTAL,
         params={
             "customer_id": customer_id,
-            "as_of_date": date(2026, 9, 22),
+            "as_of_date": demo_as_of_date(),
             # Must match disputes.status values (jpmc_fraud_demo_kit/.../schemas/disputes.json).
             # A provisional credit leaves the dispute open: the money can still be reversed.
             "open_statuses": ["OPEN", "UNDER_REVIEW", "PROVISIONAL_CREDIT_ISSUED"],
@@ -629,7 +761,7 @@ def golden_09_provisional_credit_due() -> Dict[str, Any]:
         query_id="09",
         calling_agent=AgentId.WEB_PORTAL,
         params={
-            "as_of_date": date(2026, 9, 22),
+            "as_of_date": demo_as_of_date(),
             "horizon_days": 14,
             "warn_days": 3,
             # Already-credited disputes (PROVISIONAL_CREDIT_ISSUED) are left out on purpose: nothing is due.
@@ -645,7 +777,7 @@ def golden_10_wallet_tokens_active_on_card(card_id: str = "CARD00002") -> Dict[s
         calling_agent=AgentId.MOBILE_APP,
         params={
             "card_id": card_id,
-            "as_of_ts": datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc),
+            "as_of_ts": demo_as_of_ts(),
             "usage_lookback_days": 30,
             "include_inactive": True,
         },
@@ -659,10 +791,104 @@ def golden_11_dispute_event_timeline(dispute_id: str = "DSP00033") -> Dict[str, 
         calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
         params={
             "dispute_id": dispute_id,
-            "as_of_date": date(2026, 9, 22),
+            "as_of_date": demo_as_of_date(),
             "pre_open_hours": 48,
             "post_close_hours": 48,
         },
+    )
+
+
+def golden_13_customer_accounts_and_balances(customer_id: str) -> dict[str, Any]:
+    """Golden Query 13: Which accounts does this customer hold, alone or jointly, and what is the current and available balance on each?"""
+    return execute_golden_query_contract(
+        query_id="13",
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        params={"customer_id": customer_id},
+    )
+
+
+def golden_14_customer_cards_and_wallets(customer_id: str) -> dict[str, Any]:
+    """Golden Query 14: Every card this customer has, in any state (active, frozen, replaced, awaiting activation, closed or virtual), with the account behind it and the phone and watch wallets that carry it."""
+    return execute_golden_query_contract(
+        query_id="14",
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        params={"customer_id": customer_id},
+    )
+
+
+def golden_15_spend_summary(
+    customer_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Golden Query 15: How much did this customer spend between two dates, on which kinds of merchant, and where? Dates are YYYY-MM-DD and inclusive; leave them out for the 7 days ending today. Declined attempts are counted separately and never added to spend."""
+    today = demo_as_of_date()
+    try:
+        first, last = _date_window(start_date, end_date, today, days=7)
+    except ValueError as exc:
+        return {"allowed": False, "error": f"Dates must be YYYY-MM-DD with the start on or before the end ({exc})."}
+    return execute_golden_query_contract(
+        query_id="15",
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        params={
+            "customer_id": customer_id,
+            "start_date": first,
+            "end_date": last,
+            "top_merchant_limit": 5,
+        },
+    )
+
+
+def golden_16_statement_transactions(
+    customer_id: str,
+    account_id: str,
+    period_start: str | None = None,
+    period_end: str | None = None,
+) -> dict[str, Any]:
+    """Golden Query 16: The line items on one of this customer's accounts for a statement period, newest first. Dates are YYYY-MM-DD and inclusive; leave them out for the 30 days ending today. A busy period lists only the newest items, but the totals on every row cover the whole period. Returns no rows for an account the customer does not own."""
+    today = demo_as_of_date()
+    try:
+        first, last = _date_window(period_start, period_end, today, days=30)
+    except ValueError as exc:
+        return {"allowed": False, "error": f"Dates must be YYYY-MM-DD with the start on or before the end ({exc})."}
+    return execute_golden_query_contract(
+        query_id="16",
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        params={
+            "customer_id": customer_id,
+            "account_id": account_id,
+            "period_start": first,
+            "period_end": last,
+            # The SQL totals the whole period in its own step, so this cap only trims the list.
+            "row_limit": 200,
+        },
+    )
+
+
+def golden_17_card_replacement_tracking(customer_id: str) -> dict[str, Any]:
+    """Golden Query 17: Where are this customer's replacement cards? When each was ordered, where it is being shipped, its latest delivery status and carrier, and whether the new card has been activated."""
+    return execute_golden_query_contract(
+        query_id="17",
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        params={"customer_id": customer_id},
+    )
+
+
+def golden_18_customer_contact_profile(customer_id: str) -> dict[str, Any]:
+    """Golden Query 18: This customer's name, home address, any temporary address and whether it applies today, preferred contact channel and language, standing instructions, and the last four digits of their phone number."""
+    return execute_golden_query_contract(
+        query_id="18",
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        params={"customer_id": customer_id, "as_of_date": demo_as_of_date()},
+    )
+
+
+def golden_19_travel_notices_for_customer(customer_id: str) -> dict[str, Any]:
+    """Golden Query 19: Every travel notice this customer has given, newest first: its status, travel dates, destination, the channel it came in on, and which later notice replaced it."""
+    return execute_golden_query_contract(
+        query_id="19",
+        calling_agent=AgentId.CONSUMER_CREDIT_SYNTHESIZER,
+        params={"customer_id": customer_id},
     )
 
 
@@ -878,6 +1104,7 @@ AGENT_MEMORY_TOPICS: Dict[str, Tuple[str, ...]] = {
     "mobile_app_agent": ("DEVICE_WALLET_INVENTORY", "CARD_LIFECYCLE"),
     "web_portal_agent": ("DISPUTE_HISTORY", "AGENT_COMMITMENTS"),
     "branch_support_agent": ("CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "CARD_LIFECYCLE"),
+    "dispute_specialist_agent": ("DISPUTE_HISTORY", "AGENT_COMMITMENTS", "TRAVEL_STATUS"),
 }
 ALL_TOPICS_LABEL = "ALL (every topic configured on the engine)"
 NO_MEMORY_READS_LABEL = "NONE (checks claims against BigQuery, does not read Memory Bank)"
@@ -1325,6 +1552,171 @@ def execute_fraud_card_control_or_escalate(
         }
 
 
+def stage_dispute_filing_tool(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    card_id: str = DEFAULT_CARD_ID,
+    transaction_id: str = "",
+    dispute_reason: str = "",
+    regulation_path: str = "REG_E",
+    amount_usd: float = 0.0,
+) -> Dict[str, Any]:
+    """Action tool for `dispute_specialist_agent` to stage a formal dispute filing.
+
+    Precondition: Resolves the Dataplex glossary term for the applicable regulation
+    ('regulation-e' or 'regulation-z') and 'provisional-credit'. Refuses if resolution fails.
+    Stages the dispute into Memory Bank under DISPUTE_OPS and registers an Action Board item.
+    """
+    bank = _memory_bank(None)
+    reg_clean = (regulation_path or "REG_E").strip().upper()
+    reg_term_id = "regulation-e" if "E" in reg_clean else "regulation-z"
+
+    reg_term = catalog_lookup_glossary_term_tool(reg_term_id)
+    if not reg_term or reg_term.get("term_id") == NOT_RECORDED:
+        return {
+            "allowed": False,
+            "status": "REFUSED_PRECONDITION_FAILED",
+            "error": f"Dataplex glossary term '{reg_term_id}' could not be resolved.",
+        }
+
+    session_name = bank.create_session(
+        user_id=customer_id,
+        display_name=f"DISPUTE STAGED {card_id} {reg_clean}",
+        session_state={
+            "channel": "WEB_CHAT",
+            "customer_id": customer_id,
+            "card_id": card_id,
+            "intent": "STAGE_DISPUTE_FILING",
+            "regulation_path": reg_clean,
+            "amount_usd": amount_usd,
+        },
+    )
+    event_text = (
+        f"Dispute filing staged for {customer_id} on card {card_id}: "
+        f"txn={transaction_id or NOT_RECORDED}, amount=${amount_usd:.2f}, path={reg_clean}. "
+        f"Regulatory basis: {reg_term.get('name', reg_term_id)} - {str(reg_term.get('definition', ''))[:120]}. "
+        f"Reason: {dispute_reason or 'unauthorized transaction'}."
+    )
+    event = bank.append_event(
+        session_name=session_name,
+        author="dispute_specialist_agent",
+        text=event_text,
+    )
+    claim = memory_write_path.Claim(customer_id, event_text, "WEB_CHAT")
+    item = memory_write_path.board_item(
+        "DISPUTE_FILED",
+        "HIGH",
+        claim,
+        memory_write_path.Standing.PENDING_REVIEW,
+        verdict=None,
+        customer_name=customer_display_name(customer_id),
+        facts=[event_text],
+    )
+    bank.append_state_delta(
+        session_name,
+        memory_write_path.LINEAGE_AUTHOR,
+        {memory_write_path.BOARD_STATE_KEY: item},
+    )
+    invalidate_sessions_cache()
+
+    return {
+        "status": "STAGED",
+        "action": "DISPUTE_FILED",
+        "customer_id": computed(customer_id, "customer_id argument"),
+        "card_id": computed(card_id, "card_id argument"),
+        "transaction_id": computed(transaction_id or NOT_RECORDED, "transaction_id argument"),
+        "amount_usd": computed(amount_usd, "amount_usd argument"),
+        "regulation_path": computed(reg_clean, "regulation_path argument"),
+        "regulatory_basis": live(reg_term.get("definition", NOT_RECORDED), f"dataplex.glossary:{reg_term_id}"),
+        "action_board_item": "DISPUTE_FILED (HIGH priority, pending review)",
+        "audit_session": live(session_name, "sessions.create"),
+        "audit_timestamp": _tagged_value(mb_field(event, "timestamp"), "sessions.appendEvent"),
+    }
+
+
+def stage_provisional_credit_request_tool(
+    customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
+    dispute_id: str = "",
+    regulation_path: str = "REG_E",
+    amount_usd: float = 0.0,
+) -> Dict[str, Any]:
+    """Action tool for `dispute_specialist_agent` to stage a provisional credit request.
+
+    Precondition: Resolves 'provisional-credit' and 'regulation-e' in Dataplex glossary.
+    If regulation is REG_Z, explains that credit cards allow withholding payment rather than provisional cash credit.
+    If REG_E, stages provisional credit on the Action Board for disbursement review within 10 business days.
+    """
+    bank = _memory_bank(None)
+    reg_clean = (regulation_path or "REG_E").strip().upper()
+
+    pc_term = catalog_lookup_glossary_term_tool("provisional-credit")
+    if not pc_term or pc_term.get("term_id") == NOT_RECORDED:
+        return {
+            "allowed": False,
+            "status": "REFUSED_PRECONDITION_FAILED",
+            "error": "Dataplex glossary term 'provisional-credit' could not be resolved.",
+        }
+
+    if reg_clean == "REG_Z":
+        return {
+            "allowed": True,
+            "status": "POLICY_INFORMATIONAL",
+            "regulation_path": "REG_Z",
+            "provisional_credit_applicable": False,
+            "cardholder_remedy": "Withhold payment on disputed charge pending investigation resolution.",
+            "statutory_reference": "Regulation Z (12 CFR § 1026.13): Cardholder is not required to pay disputed amount or associated finance charges while investigation is open.",
+        }
+
+    session_name = bank.create_session(
+        user_id=customer_id,
+        display_name=f"PROVISIONAL CREDIT REQ {dispute_id}",
+        session_state={
+            "channel": "CORE_BANKING",
+            "customer_id": customer_id,
+            "intent": "PROVISIONAL_CREDIT_REQUEST",
+            "dispute_id": dispute_id,
+            "amount_usd": amount_usd,
+        },
+    )
+    event_text = (
+        f"Provisional credit request staged for {customer_id} on dispute {dispute_id or NOT_RECORDED}: "
+        f"amount=${amount_usd:.2f} under Regulation E. Due within 10 business days per 12 CFR § 1005.11(c)."
+    )
+    event = bank.append_event(
+        session_name=session_name,
+        author="dispute_specialist_agent",
+        text=event_text,
+    )
+    claim = memory_write_path.Claim(customer_id, event_text, "CORE_BANKING")
+    item = memory_write_path.board_item(
+        "PROVISIONAL_CREDIT_REQUEST",
+        "HIGH",
+        claim,
+        memory_write_path.Standing.PENDING_REVIEW,
+        verdict=None,
+        customer_name=customer_display_name(customer_id),
+        facts=[event_text],
+    )
+    bank.append_state_delta(
+        session_name,
+        memory_write_path.LINEAGE_AUTHOR,
+        {memory_write_path.BOARD_STATE_KEY: item},
+    )
+    invalidate_sessions_cache()
+
+    return {
+        "status": "STAGED",
+        "action": "PROVISIONAL_CREDIT_REQUEST",
+        "customer_id": computed(customer_id, "customer_id argument"),
+        "dispute_id": computed(dispute_id or NOT_RECORDED, "dispute_id argument"),
+        "amount_usd": computed(amount_usd, "amount_usd argument"),
+        "regulation_path": "REG_E",
+        "disbursement_deadline": "Within 10 business days of notice",
+        "statutory_basis": live(pc_term.get("definition", NOT_RECORDED), "dataplex.glossary:provisional-credit"),
+        "action_board_item": "PROVISIONAL_CREDIT_REQUEST (HIGH priority, pending review)",
+        "audit_session": live(session_name, "sessions.create"),
+    }
+
+
 CANONICAL_SEEDED_CHANNEL_LABELS: Dict[str, str] = {
     BankChannel.FRAUD_DETECTION.value: "FRAUD_OPS_OUTBOUND",
     "FRAUD_OPS_OUTBOUND": "FRAUD_OPS_OUTBOUND",
@@ -1337,6 +1729,10 @@ CANONICAL_SEEDED_CHANNEL_LABELS: Dict[str, str] = {
     "BRANCH": "BRANCH",
 }
 
+
+# The live demo focuses on the customer chat, so the UI offers one injectable
+# event only. The other presets stay in code for tests and the harness.
+LIVE_INJECTION_PRESET_IDS: Tuple[str, ...] = ("branch_passport_id_check",)
 
 CHANNEL_MULTI_TURN_PRESETS: Dict[str, List[Dict[str, Any]]] = {
     "FRAUD_OPS_OUTBOUND": [
@@ -1526,6 +1922,16 @@ CHANNEL_MULTI_TURN_PRESETS: Dict[str, List[Dict[str, Any]]] = {
 }
 
 
+def live_injection_presets() -> Dict[str, List[Dict[str, Any]]]:
+    """The presets the UI may inject, by channel (see LIVE_INJECTION_PRESET_IDS)."""
+    allowed = {}
+    for channel, presets in CHANNEL_MULTI_TURN_PRESETS.items():
+        kept = [p for p in presets if p.get("preset_id") in LIVE_INJECTION_PRESET_IDS]
+        if kept:
+            allowed[channel] = kept
+    return allowed
+
+
 def ingest_live_channel_event(
     channel: str,
     customer_id: str = DEFAULT_CUSTOMER_SCOPE_ID,
@@ -1643,8 +2049,11 @@ def ingest_live_channel_event(
 
 def customer_display_name(customer_id: str) -> str:
     """Full name from golden 01, for claim records a human reviews."""
-    rows = golden_01_customer_360_snapshot(customer_id=customer_id).get("rows") or []
-    return str(rows[0].get("full_name") or NOT_RECORDED) if rows else NOT_RECORDED
+    try:
+        rows = golden_01_customer_360_snapshot(customer_id=customer_id).get("rows") or []
+        return str(rows[0].get("full_name") or NOT_RECORDED) if rows else NOT_RECORDED
+    except Exception:
+        return NOT_RECORDED
 
 
 def _bank_channel_for(label: str) -> BankChannel:
@@ -1962,6 +2371,37 @@ def create_consumer_credit_synthesizer_agent(
         tools=[FunctionTool(run_consolidated_memory_audit_sweep)],
     )
 
+    dispute_specialist_agent = _spoke_agent(
+        name="dispute_specialist_agent",
+        model=model,
+        description=(
+            "Statutory Dispute & Regulation Policy Specialist (DISPUTE_SPECIALIST · STATUTORY_POLICY): "
+            "evaluates dispute filings, statutory deadlines under governing regulations, and stages provisional credit."
+        ),
+        instruction=(
+            "You are the Dispute & Regulation Policy Specialist for JPMorgan Chase CCB. "
+            "You track open disputes, verify statutory filing deadlines (60-day filing window), "
+            "and evaluate provisional credit eligibility under statutory regulations (debit vs credit card paths). "
+            "Always verify statutory glossary terms with catalog_lookup_glossary_term_tool before staging actions. "
+            "Inspect dispute history with golden_07_open_disputes_for_customer and golden_11_dispute_event_timeline. "
+            "Check deadlines with golden_08_dispute_filing_window_check and golden_09_provisional_credit_due. "
+            "When appropriate, stage dispute filings with stage_dispute_filing_tool and provisional credit "
+            "requests with stage_provisional_credit_request_tool. Never promise credit outside bank policy."
+            + UNVERIFIED_GUIDANCE
+        ),
+        tools=[
+            FunctionTool(golden_07_open_disputes_for_customer),
+            FunctionTool(golden_08_dispute_filing_window_check),
+            FunctionTool(golden_09_provisional_credit_due),
+            FunctionTool(golden_11_dispute_event_timeline),
+            FunctionTool(golden_17_card_replacement_tracking),
+            FunctionTool(golden_19_travel_notices_for_customer),
+            FunctionTool(catalog_lookup_glossary_term_tool),
+            FunctionTool(stage_dispute_filing_tool),
+            FunctionTool(stage_provisional_credit_request_tool),
+        ],
+    )
+
     synthesizer = LlmAgent(
         name="consumer_credit_synthesizer_agent",
         model=model,
@@ -1985,6 +2425,14 @@ def create_consumer_credit_synthesizer_agent(
             FunctionTool(list_memory_topics_tool),
             FunctionTool(read_customer_memory_bank),
             FunctionTool(execute_one_click_card_unlock),
+            FunctionTool(golden_13_customer_accounts_and_balances),
+            FunctionTool(golden_14_customer_cards_and_wallets),
+            FunctionTool(golden_15_spend_summary),
+            FunctionTool(golden_16_statement_transactions),
+            FunctionTool(golden_17_card_replacement_tracking),
+            FunctionTool(golden_18_customer_contact_profile),
+            FunctionTool(golden_19_travel_notices_for_customer),
+            FunctionTool(catalog_lookup_glossary_term_tool),
         ],
         sub_agents=[
             fraud_monitoring_agent,
@@ -1994,6 +2442,7 @@ def create_consumer_credit_synthesizer_agent(
             branch_support_agent,
             claim_veracity_validator_agent,
             memory_bank_audit_agent,
+            dispute_specialist_agent,
         ],
     )
     _log_agent_tree(synthesizer, "create_consumer_credit_synthesizer_agent")
@@ -2132,18 +2581,55 @@ def list_all_agents() -> List[AgentDescriptor]:
         AgentDescriptor(
             agent_id=AgentId.CONSUMER_CREDIT_SYNTHESIZER.value,
             name="consumer_credit_synthesizer_agent",
-            role="Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING)",
+            role="Lead Synthesizer & Customer Assistant (LEAD_SYNTHESIZER · CORE_BANKING)",
             channel=BankChannel.CORE_BANKING,
             model=model_name,
-            tools=["list_memory_topics_tool", "read_customer_memory_bank", "execute_one_click_card_unlock"],
+            tools=[
+                "list_memory_topics_tool",
+                "read_customer_memory_bank",
+                "execute_one_click_card_unlock",
+                "golden_13_customer_accounts_and_balances",
+                "golden_14_customer_cards_and_wallets",
+                "golden_15_spend_summary",
+                "golden_16_statement_transactions",
+                "golden_17_card_replacement_tracking",
+                "golden_18_customer_contact_profile",
+                "golden_19_travel_notices_for_customer",
+                "catalog_lookup_glossary_term_tool",
+            ],
             description=(
-                "08 · Lead Synthesizer & Hub Orchestrator (LEAD_SYNTHESIZER · CORE_BANKING): "
-                "Hub of the 8-agent topology and the single agent that speaks to the customer/operator. "
-                "Collects telemetry from all 7 spokes, queries `list_memory_topics_tool`, reconstructs "
-                "the causal timeline via `read_customer_memory_bank`, and stages governed card unlocks."
+                "08 · Lead Synthesizer & Customer Assistant (LEAD_SYNTHESIZER · CORE_BANKING): "
+                "Hub of the 9-agent topology and the primary agent that speaks to the customer/operator. "
+                "Reconstructs causal timelines, answers balances, cards, and transactions via governed golden queries, "
+                "coordinates with specialist spokes, and stages governed card controls."
             ),
             memory_topics_scoped=[ALL_TOPICS_LABEL],
             default_live_prompt="For customer CUST00001, list the configured Memory Bank topics, read the consolidated customer memory bank, and synthesize the Lisbon stolen-wallet causal chain.",
+        ),
+        AgentDescriptor(
+            agent_id=AgentId.DISPUTE_SPECIALIST.value,
+            name="dispute_specialist_agent",
+            role="Statutory Dispute & Regulation Policy Specialist (DISPUTE_SPECIALIST · STATUTORY_POLICY)",
+            channel=BankChannel.WEB_PORTAL,
+            model=model_name,
+            tools=[
+                "golden_07_open_disputes_for_customer",
+                "golden_08_dispute_filing_window_check",
+                "golden_09_provisional_credit_due",
+                "golden_11_dispute_event_timeline",
+                "golden_17_card_replacement_tracking",
+                "golden_19_travel_notices_for_customer",
+                "catalog_lookup_glossary_term_tool",
+                "stage_dispute_filing_tool",
+                "stage_provisional_credit_request_tool",
+            ],
+            description=(
+                "09 · Statutory Dispute & Regulation Policy Specialist (DISPUTE_SPECIALIST · STATUTORY_POLICY): "
+                "Evaluates open dispute filings, verifies statutory provisional credit eligibility and deadlines "
+                "(looked up dynamically via Dataplex glossary, not hardcoded), checks the 60-day filing window, and stages disputes."
+            ),
+            memory_topics_scoped=list(AGENT_MEMORY_TOPICS["dispute_specialist_agent"]),
+            default_live_prompt="For customer CUST00001, evaluate open disputes DSP00033 and DSP00034, verify provisional credit eligibility, and check the 60-day filing window.",
         ),
     ]
     for descriptor in descriptors:

@@ -3,8 +3,8 @@
 trace_adk_agents.py - exercise backend/adk_agents.py end to end against the live project.
 
 This is the terminal harness for `backend/adk_agents.py`. It runs the module's
-real surface -- roster, catalog governance, glossary, all nine wrapped golden
-queries, Memory Bank retrieval, the five channel producers -- against the live
+real surface -- roster, catalog governance, glossary, every wrapped golden
+query, Memory Bank retrieval, the five channel producers -- against the live
 Vertex AI and Dataplex and BigQuery services, and prints a pass/fail line per
 stage so every claim the module makes can be checked by reading the output.
 
@@ -250,10 +250,11 @@ EXPECTED_AGENTS = [
     "claim_veracity_validator_agent",
     "memory_bank_audit_agent",
     "consumer_credit_synthesizer_agent",
+    "dispute_specialist_agent",
 ]
 
 
-@stage("roster", "list_all_agents() publishes exactly the 8 expected agents.")
+@stage("roster", "list_all_agents() publishes exactly the 9 expected agents.")
 def stage_roster(ctx: Context) -> StageResult:
     descriptors = ctx.adk.list_all_agents()
     names = [d.name if hasattr(d, "name") else d.get("name") for d in descriptors]
@@ -267,7 +268,7 @@ def stage_roster(ctx: Context) -> StageResult:
             unexpected=[n for n in names if n not in EXPECTED_AGENTS],
             order_differs=sorted(names) == sorted(EXPECTED_AGENTS),
         )
-    return ok("roster", "8/8 agents, in the expected order", agents=names)
+    return ok("roster", "9/9 agents, in the expected order", agents=names)
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +394,15 @@ def stage_glossary(ctx: Context) -> StageResult:
 # Stage 7: golden queries
 # ---------------------------------------------------------------------------
 
+def _statement_account(ctx: Context) -> str:
+    """The account behind the demo card, read through golden 14 so the harness names no account id."""
+    cards = ctx.adk.golden_14_customer_cards_and_wallets(customer_id=ctx.customer_id).get("rows") or []
+    account = next((c["account_id"] for c in cards if c.get("card_id") == ctx.card_id), None)
+    if not account:
+        raise LookupError("card %s is not on %s's record, so there is no statement to read" % (ctx.card_id, ctx.customer_id))
+    return account
+
+
 def _golden_calls(ctx: Context) -> List[tuple]:
     a = ctx.adk
     return [
@@ -405,16 +415,25 @@ def _golden_calls(ctx: Context) -> List[tuple]:
         ("09", lambda: a.golden_09_provisional_credit_due()),
         ("10", lambda: a.golden_10_wallet_tokens_active_on_card(card_id=ctx.card_id)),
         ("11", lambda: a.golden_11_dispute_event_timeline(dispute_id=ctx.dispute_id)),
+        ("13", lambda: a.golden_13_customer_accounts_and_balances(customer_id=ctx.customer_id)),
+        ("14", lambda: a.golden_14_customer_cards_and_wallets(customer_id=ctx.customer_id)),
+        ("15", lambda: a.golden_15_spend_summary(customer_id=ctx.customer_id)),
+        ("16", lambda: a.golden_16_statement_transactions(
+            customer_id=ctx.customer_id, account_id=_statement_account(ctx))),
+        ("17", lambda: a.golden_17_card_replacement_tracking(customer_id=ctx.customer_id)),
+        ("18", lambda: a.golden_18_customer_contact_profile(customer_id=ctx.customer_id)),
+        ("19", lambda: a.golden_19_travel_notices_for_customer(customer_id=ctx.customer_id)),
     ]
 
 
 UNWRAPPED_GOLDEN = ["05", "06", "12"]
 
 
-@stage("golden", "All 9 wrapped golden queries execute with bound parameters and no ad-hoc SQL.")
+@stage("golden", "Every wrapped golden query executes with bound parameters and no ad-hoc SQL.")
 def stage_golden(ctx: Context) -> StageResult:
     results, failures = {}, []
-    for query_id, call in _golden_calls(ctx):
+    calls = _golden_calls(ctx)
+    for query_id, call in calls:
         started = time.perf_counter()
         try:
             payload = call()
@@ -454,11 +473,18 @@ def stage_golden(ctx: Context) -> StageResult:
         "/".join(UNWRAPPED_GOLDEN),
     )
 
+    # A new contract with no call here would otherwise pass this stage without ever running.
+    unexercised = sorted(set(ctx.adk.GOLDEN_QUERY_CONTRACTS) - {q for q, _ in calls} - set(UNWRAPPED_GOLDEN))
+    if unexercised:
+        LOG.error("golden %s have a contract but no call in this stage", "/".join(unexercised))
+        failures.extend(unexercised)
+
     if failures:
         return fail("golden", "failed: %s" % ", ".join(failures), results=results)
     return ok(
         "golden",
-        "9/9 executed; %d reported a voluntary refusal" % sum(1 for r in results.values() if r["refusals"]),
+        "%d/%d executed; %d reported a voluntary refusal" % (
+            len(results), len(calls), sum(1 for r in results.values() if r["refusals"])),
         results=results, unwrapped=UNWRAPPED_GOLDEN,
     )
 

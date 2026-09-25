@@ -9,7 +9,8 @@ def test_web_portal_card_separates_authorized_from_bound():
     card = AGENTS["web_portal_agent"]
 
     assert card.authorized_golden_queries == [
-        "07_open_disputes_for_customer", "08_dispute_filing_window_check", "09_provisional_credit_due"]
+        "07_open_disputes_for_customer", "08_dispute_filing_window_check", "09_provisional_credit_due",
+        "17_card_replacement_tracking", "19_travel_notices_for_customer"]
     assert card.bound_golden_queries == ["07_open_disputes_for_customer"]
 
 

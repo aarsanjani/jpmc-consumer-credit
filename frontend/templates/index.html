@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
-<link rel="stylesheet" href="/static/css/styles.css?v=20260924g">
+<link rel="stylesheet" href="/static/css/styles.css?v=20260925b">
 </head>
 <body>
 
@@ -77,6 +77,14 @@
     <p class="sum" id="heroLede">A stolen wallet in Lisbon holds a debit card and a credit card.
       <mark>One theft, two disputes</mark>, two different correct answers.
       Everything below is <mark>one run</mark> of the desk working that case.</p>
+    <!-- Mini customer card: rendered by app.js:renderMiniCard from GET /api/customer/card-summary
+         (backend/ui_insights.py:customer_card_summary). Click opens the expanded card (app.js:openCustomerCard). -->
+    <aside class="mini-wrap" aria-label="Customer card">
+      <button type="button" class="mini-card" id="miniCard" aria-haspopup="dialog" aria-expanded="false" aria-controls="custCardPanel">
+        <span class="mc-eyebrow">Customer card · <span id="miniCardCustomer">n/r</span></span>
+        <span class="mc-body" id="miniCardBody"><span class="mc-line">Loading from BigQuery…</span></span>
+      </button>
+    </aside>
       <div class="truth-strip" id="heroTruthStrip">
         <div class="ts-row">
           <span id="truthCustomer">CUST00001 · ACCT000003</span>
@@ -89,36 +97,41 @@
   </section>
 
   <!-- ============ DECK 1 ============ -->
+  <!-- One switch for every panel's collapse toggle; app.js:setupCollapsiblePanels adds the per-panel buttons. -->
+  <div class="panel-bar">
+    <button type="button" class="chip panel-all" id="btnPanelsAll" aria-controls="deckPrimary1 deckPrimary2 actionBoard consoleDrawer">Collapse all</button>
+  </div>
   <div class="deck" id="deckPrimary1">
     <div class="col">
       <div class="colhead"><h2>Pipeline</h2><span class="n" id="agentCountPill"><span id="agentsColIndex"></span></span></div>
       <div class="roster" id="agentRosterList"></div>
     </div>
 
-    <div class="col">
+    <div class="col" id="colTheCase">
       <div class="colhead"><h2>The case</h2><span class="n" id="caseColIndex">01 / two rulebooks</span></div>
+      <div id="theCaseContainer">
+        <div class="item" id="caseCard1"><div class="item-top"><span class="dot" style="background:var(--lime-deep)"></span>
+          <span class="nm" id="caseCard1Title">DSP00033 · debit</span><span class="tag" id="caseCard1Tag">Reg E</span></div>
+          <p class="rd" id="caseCard1Sub">CARD00004 · checking</p>
+          <dl class="kv" id="caseCard1Kv" style="margin-top:9px;">
+            <div><dt>Provisional credit</dt><dd class="ok">23 Sep</dd></div>
+            <div><dt>Counted in</dt><dd>10 business days</dd></div>
+            <div><dt>Weekend skipped</dt><dd>12–13 Sep</dd></div>
+            <div><dt>Investigation</dt><dd>90 days</dd></div>
+            <div><dt>Why not 45</dt><dd>Foreign</dd></div>
+          </dl></div>
 
-      <div class="item" id="caseCard1"><div class="item-top"><span class="dot" style="background:var(--lime-deep)"></span>
-        <span class="nm" id="caseCard1Title">DSP00033 · debit</span><span class="tag" id="caseCard1Tag">Reg E</span></div>
-        <p class="rd" id="caseCard1Sub">CARD00004 · checking</p>
-        <dl class="kv" id="caseCard1Kv" style="margin-top:9px;">
-          <div><dt>Provisional credit</dt><dd class="ok">23 Sep</dd></div>
-          <div><dt>Counted in</dt><dd>10 business days</dd></div>
-          <div><dt>Weekend skipped</dt><dd>12–13 Sep</dd></div>
-          <div><dt>Investigation</dt><dd>90 days</dd></div>
-          <div><dt>Why not 45</dt><dd>Foreign</dd></div>
-        </dl></div>
-
-      <div class="item" id="caseCard2"><div class="item-top"><span class="dot" style="background:var(--pink)"></span>
-        <span class="nm" id="caseCard2Title">DSP00034 · credit</span><span class="tag on" id="caseCard2Tag">Reg Z</span></div>
-        <p class="rd" id="caseCard2Sub">CARD00002 · credit card</p>
-        <dl class="kv" id="caseCard2Kv" style="margin-top:9px;">
-          <div><dt>Provisional credit</dt><dd class="none">Does not exist</dd></div>
-          <div><dt>Instead</dt><dd>Withhold payment</dd></div>
-          <div><dt>Acknowledge</dt><dd>30 days</dd></div>
-          <div><dt>Resolve</dt><dd>2 cycles · max 90</dd></div>
-          <div><dt>Report delinquent</dt><dd class="ok">No</dd></div>
-        </dl></div>
+        <div class="item" id="caseCard2"><div class="item-top"><span class="dot" style="background:var(--pink)"></span>
+          <span class="nm" id="caseCard2Title">DSP00034 · credit</span><span class="tag on" id="caseCard2Tag">Reg Z</span></div>
+          <p class="rd" id="caseCard2Sub">CARD00002 · credit card</p>
+          <dl class="kv" id="caseCard2Kv" style="margin-top:9px;">
+            <div><dt>Provisional credit</dt><dd class="none">Does not exist</dd></div>
+            <div><dt>Instead</dt><dd>Withhold payment</dd></div>
+            <div><dt>Acknowledge</dt><dd>30 days</dd></div>
+            <div><dt>Resolve</dt><dd>2 cycles · max 90</dd></div>
+            <div><dt>Report delinquent</dt><dd class="ok">No</dd></div>
+          </dl></div>
+      </div>
       <p class="fine" id="caseFineNote">Same customer, same trip, same theft. The correct answer differs by card.</p>
     </div>
 
@@ -194,12 +207,9 @@
       <div class="colhead"><h2>Event stream</h2><span class="n" id="eventStreamColBadge">04 / 5 live channels</span></div>
       <div class="item" id="channelIngestBar" style="margin-bottom:8px;padding:8px 10px;">
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px;">
+          <!-- Filled by populateChannelSelect() in app.js from /api/channels/summary `presets`. -->
           <select class="chip chip-select" id="channelIngestSelect" aria-label="Channel" style="font-size:10px;padding:2px 20px 2px 7px;">
-            <option value="FRAUD_OPS_OUTBOUND">01 · FRAUD_OPS_OUTBOUND</option>
-            <option value="IVR">02 · IVR (telephony)</option>
-            <option value="MOBILE_APP">03 · MOBILE_APP</option>
-            <option value="WEB_CHAT">04 · WEB_CHAT (portal)</option>
-            <option value="BRANCH">05 · BRANCH (teller)</option>
+            <option value="">Loading live presets…</option>
           </select>
           <select class="chip chip-select" id="channelPresetSelect" aria-label="Available channel events" style="font-size:10px;padding:2px 20px 2px 7px;flex:1 1 180px;max-width:100%;">
             <option value="">Loading channel events…</option>
@@ -207,11 +217,11 @@
         </div>
         <div id="channelTurnsPreview" style="font-family:var(--mono);font-size:10px;line-height:1.45;padding:5px 7px;margin-bottom:6px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);"></div>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-          <input type="text" id="channelIngestText" placeholder="Optional: append an extra customer turn to this session…" aria-label="Optional custom turn" style="flex:1 1 160px;font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);">
+          <input type="text" id="channelIngestText" placeholder="Optional: add your own customer turn (it still goes through the veracity check)" aria-label="Optional custom turn" style="flex:1 1 160px;font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);">
           <button type="button" class="chip" id="btnInjectChannelEvent" style="font-size:10px;padding:2px 8px;">+ Inject live event</button>
           <button type="button" class="chip" id="btnFraudCardControl" style="font-size:10px;padding:2px 8px;">⚡ Fraud block / escalate</button>
         </div>
-        <p class="rd" id="channelIngestStatus" style="margin-top:4px;font-size:10px;">Select a channel &amp; prebaked multi-turn event, then click + Inject live event.</p>
+        <p class="rd" id="channelIngestStatus" style="margin-top:4px;font-size:10px;">Pick a preset, then click + Inject live event. Only presets the backend allows for live injection are listed.</p>
       </div>
       <ul class="tl" id="eventStreamList"></ul>
     </div>
@@ -375,10 +385,48 @@
   </footer>
 </div>
 
+<!-- ============ ASK THE DESK POPOVER CHAT SCROLL ============ -->
+<div class="chat-popover-wrap" id="chatPopover" aria-expanded="false" hidden>
+  <div class="scroll-card" id="scrollCard">
+    <div class="scroll-header">
+      <div class="sh-left">
+        <span class="sh-title">JPMC Consumer Assistant</span>
+        <span class="sh-cust" id="popoverCustomerBadge">CUST00001</span>
+        <span class="sh-status"><span class="sh-dot"></span> Ready</span>
+      </div>
+      <div class="sh-controls">
+        <button type="button" class="sh-btn" id="btnMinPopover" title="Minimize scroll into prompt slot" aria-label="Minimize">_</button>
+        <button type="button" class="sh-btn" id="btnClosePopover" title="Close scroll card" aria-label="Close">✕</button>
+      </div>
+    </div>
+
+    <!-- Quick Action Chips -->
+    <div class="scroll-chips" id="scrollChips">
+      <button type="button" class="sc-chip" data-q="hi">👋 Hi</button>
+      <button type="button" class="sc-chip" data-q="What are my accounts and balances?">💳 Balances</button>
+      <button type="button" class="sc-chip" data-q="What cards do I have and which are locked?">🔒 Cards &amp; Locks</button>
+      <button type="button" class="sc-chip" data-q="Why is nothing working on my account?">⚠️ Why is nothing working?</button>
+      <button type="button" class="sc-chip" data-q="What is the tracking status of my replacement card?">📦 Replacement Tracking</button>
+      <button type="button" class="sc-chip" data-q="I lost my wallet in Lisbon, file a dispute and provisional credit">⚖️ File Lisbon Dispute</button>
+    </div>
+
+    <!-- Live Conversation Stream -->
+    <div class="scroll-stream" id="scrollStream">
+      <div class="msg bot">
+        <div class="msg-bubble" id="scrollWelcomeMsg">
+          Welcome, Priya Vantalis — thanks for banking with JPMC. I can see your <b>Premier Checking</b>, <b>Premier Savings</b>, and <b>Horizon Sapphire Card</b>. How can I assist you today?
+        </div>
+        <div class="msg-meta">JPMC Assistant · Direct session initialization</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="console">
   <div class="console-in">
+    <div class="mailbox-slot-lip"></div>
     <span class="hintk">Ask the desk</span>
-    <input type="text" id="askInput" placeholder="Why does the credit card have no provisional credit date?" aria-label="Ask the fraud desk">
+    <input type="text" id="askInput" placeholder="Ask JPMC Consumer Credit Assistant..." aria-label="Ask the fraud desk">
     <button type="button" class="cta" id="btnAskSend">Send →</button>
   </div>
 </div>
@@ -428,6 +476,6 @@
   </div>
 </div>
 
-<script src="/static/js/app.js?v=20260924g"></script>
+<script src="/static/js/app.js?v=20260925d"></script>
 </body>
 </html>

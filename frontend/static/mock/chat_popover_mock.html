@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JPMC CCB — Customer Chat Popover Scroll Mock</title>
+  <link rel="stylesheet" href="../css/styles.css?v=20260925a">
+  <style>
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      margin: 0;
+      padding: 0 0 120px 0;
+      min-height: 100vh;
+    }
+
+    .mock-banner {
+      background: #111;
+      color: #fff;
+      padding: 10px 20px;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 2px solid var(--lime);
+    }
+    .mock-banner b { color: var(--lime); }
+    .mock-banner a { color: #8bc4ff; text-decoration: none; margin-left: 14px; }
+
+    .mock-container {
+      max-width: 1200px;
+      margin: 30px auto;
+      padding: 0 20px;
+    }
+
+    .mock-intro {
+      background: var(--card);
+      border: 1px solid var(--line);
+      padding: 18px 24px;
+      margin-bottom: 24px;
+      box-shadow: 2px 2px 0 var(--shadow);
+    }
+    .mock-intro h1 {
+      margin: 0 0 8px 0;
+      font-size: 20px;
+      letter-spacing: -0.02em;
+    }
+    .mock-intro p {
+      margin: 0 0 10px 0;
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--muted);
+    }
+
+    /* ===== THE CHAT SCROLL POPOVER ===== */
+    .chat-popover-wrap {
+      position: fixed;
+      bottom: 58px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: calc(100% - 40px);
+      max-width: 1200px;
+      z-index: 950;
+      display: flex;
+      flex-direction: column;
+      pointer-events: none;
+    }
+    .chat-popover-wrap.is-open {
+      pointer-events: auto;
+    }
+
+    /* The Scroll Roller / Mailbox Envelope */
+    .scroll-card {
+      background: var(--card);
+      border: 2px solid var(--ink);
+      box-shadow: 0 -12px 36px rgba(0, 0, 0, 0.18), 4px 4px 0 var(--shadow);
+      display: flex;
+      flex-direction: column;
+      height: 480px;
+      max-height: calc(100vh - 120px);
+      transform-origin: bottom center;
+      transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease, height 0.35s ease;
+      opacity: 0;
+      transform: translateY(24px) scaleY(0.08);
+      overflow: hidden;
+      margin: 0 4px; /* leaves ~4px margin on both sides matching prompt box */
+      position: relative;
+    }
+
+    /* Scroll caps simulating wooden/brass scroll roller cylinder */
+    .scroll-card::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 4px;
+      background: linear-gradient(90deg, #8a6a24, #d9b86a 20%, #f7e1a0 50%, #d9b86a 80%, #8a6a24);
+      z-index: 10;
+    }
+
+    .chat-popover-wrap.is-open .scroll-card {
+      opacity: 1;
+      transform: translateY(0) scaleY(1);
+    }
+
+    .chat-popover-wrap.is-minimized .scroll-card {
+      height: 42px;
+      opacity: 1;
+      transform: translateY(0) scaleY(1);
+    }
+
+    /* Header Bar */
+    .scroll-header {
+      background: var(--card);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      user-select: none;
+    }
+    .sh-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .sh-title {
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: -0.01em;
+    }
+    .sh-cust {
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--rail);
+      padding: 2px 7px;
+      border-radius: 3px;
+      font-family: var(--mono);
+    }
+    .sh-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      color: var(--good);
+      font-weight: 600;
+    }
+    .sh-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--good);
+      display: inline-block;
+    }
+    .sh-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .sh-btn {
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--ink);
+      width: 26px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      border-radius: 3px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .sh-btn:hover {
+      background: var(--rail);
+      border-color: var(--ink);
+    }
+    .sh-btn:focus-visible {
+      outline: 2px solid var(--ink);
+      outline-offset: 1px;
+    }
+
+    /* Action Chips Strip */
+    .scroll-chips {
+      background: var(--bg);
+      border-bottom: 1px solid var(--hair);
+      padding: 8px 14px;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .sc-chip {
+      background: var(--card);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      border-radius: 12px;
+      transition: background 0.15s, transform 0.1s;
+      flex: none;
+    }
+    .sc-chip:hover {
+      background: var(--ink);
+      color: #fff;
+      transform: translateY(-1px);
+    }
+
+    /* Conversation Scroll Stream */
+    .scroll-stream {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      background: var(--card);
+    }
+
+    .msg {
+      display: flex;
+      flex-direction: column;
+      max-width: 82%;
+      animation: msgPop 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    @keyframes msgPop {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .msg.user {
+      align-self: flex-end;
+      align-items: flex-end;
+    }
+    .msg.bot {
+      align-self: flex-start;
+      align-items: flex-start;
+    }
+
+    .msg-bubble {
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .msg.user .msg-bubble {
+      background: #0f4c81;
+      color: #fff;
+      border-bottom-right-radius: 1px;
+    }
+    .msg.bot .msg-bubble {
+      background: var(--rail);
+      color: var(--ink);
+      border: 1px solid var(--hair);
+      border-bottom-left-radius: 1px;
+    }
+
+    .msg-meta {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 4px;
+      font-family: var(--mono);
+    }
+
+    /* Structured Assistant Payload Cards */
+    .card-payload {
+      margin-top: 8px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 10px 14px;
+      font-size: 12px;
+      width: 100%;
+      box-sizing: border-box;
+      box-shadow: 1px 1px 0 rgba(0,0,0,0.06);
+    }
+    .card-payload .cp-title {
+      font-weight: 700;
+      color: var(--ink);
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .cp-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 3px 0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .cp-row:last-child { border-bottom: none; }
+    .cp-k { color: var(--muted); }
+    .cp-v { font-weight: 600; }
+    .cp-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      font-size: 10px;
+      font-weight: 700;
+      border-radius: 3px;
+      text-transform: uppercase;
+    }
+    .cp-badge.ok { background: #e6f6ec; color: #0a6634; }
+    .cp-badge.frz { background: #feecef; color: #a41b2e; }
+
+    /* Typing Dots */
+    .typing-dots {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+    }
+    .dot-pulse {
+      width: 6px;
+      height: 6px;
+      background: var(--muted);
+      border-radius: 50%;
+      animation: pulse 1s infinite alternate;
+    }
+    .dot-pulse:nth-child(2) { animation-delay: 0.2s; }
+    .dot-pulse:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes pulse { from { opacity: 0.3; transform: scale(0.8); } to { opacity: 1; transform: scale(1.1); } }
+
+    /* Mailbox slot lip on console */
+    .console-in {
+      position: relative;
+    }
+    .mailbox-slot-lip {
+      position: absolute;
+      top: -3px;
+      left: 10px;
+      right: 10px;
+      height: 3px;
+      background: #333;
+      border-radius: 3px 3px 0 0;
+      box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
+    }
+  </style>
+</head>
+<body>
+
+<div class="mock-banner">
+  <div>
+    <b>STATIC MOCK</b> — Customer Chat Popover Scroll & Mailbox Unroll Reveal
+    <span style="color:#aaa;margin-left:12px;">Reviewing UI Popover design for user approval</span>
+  </div>
+  <div>
+    <a href="/" target="_blank">View Live App ↗</a>
+  </div>
+</div>
+
+<div class="mock-container">
+  <div class="mock-intro">
+    <h1>JPMC Customer Assistant — Popover Scroll & Mailbox Slot Reveal</h1>
+    <p>
+      <b>The design vision:</b> The popover card sits directly above the bottom chat prompt bar, aligned with 4px margins on each side. When summoned or clicked, it rolls upward like an authoritative parchment scroll or rises like a letter emerging from a mailbox slot. When minimized (<code>_</code>) or closed (<code>✕</code>), it rolls smoothly back down into the console bar slot without obstructing the desk grids behind it.
+    </p>
+    <p>
+      Try clicking the chips below or typing in the prompt bar at the bottom.
+    </p>
+  </div>
+</div>
+
+<!-- ============ THE CHAT POPOVER SCROLL ============ -->
+<div class="chat-popover-wrap is-open" id="chatPopover">
+  <div class="scroll-card" id="scrollCard">
+    <div class="scroll-header">
+      <div class="sh-left">
+        <span class="sh-title">JPMC Consumer Assistant</span>
+        <span class="sh-cust" id="popoverCustomerBadge">Priya Vantalis · CUST00001</span>
+        <span class="sh-status"><span class="sh-dot"></span> Ready</span>
+      </div>
+      <div class="sh-controls">
+        <button type="button" class="sh-btn" id="btnMinPopover" title="Minimize scroll into prompt slot" aria-label="Minimize">_</button>
+        <button type="button" class="sh-btn" id="btnClosePopover" title="Close scroll card" aria-label="Close">✕</button>
+      </div>
+    </div>
+
+    <!-- Quick Action Chips -->
+    <div class="scroll-chips" id="scrollChips">
+      <button type="button" class="sc-chip" data-q="hi">👋 Hi</button>
+      <button type="button" class="sc-chip" data-q="What are my accounts and balances?">💳 Balances</button>
+      <button type="button" class="sc-chip" data-q="What cards do I have and which are locked?">🔒 Cards & Locks</button>
+      <button type="button" class="sc-chip" data-q="Why is nothing working on my account?">⚠️ Why is nothing working?</button>
+      <button type="button" class="sc-chip" data-q="What is the tracking status of my replacement card?">📦 Replacement Tracking</button>
+      <button type="button" class="sc-chip" data-q="I lost my wallet in Lisbon, file a dispute and provisional credit">⚖️ File Lisbon Dispute</button>
+    </div>
+
+    <!-- Live Conversation Stream -->
+    <div class="scroll-stream" id="scrollStream">
+      <div class="msg bot">
+        <div class="msg-bubble">
+          Welcome, Priya Vantalis — thanks for banking with JPMC. I can see your <b>Premier Checking</b>, <b>Premier Savings</b>, and <b>Horizon Sapphire Card</b>. How can I help you today?
+        </div>
+        <div class="msg-meta">JPMC Assistant · Direct session initialization</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ BOTTOM CONSOLE WITH MAILBOX LIP ============ -->
+<div class="console">
+  <div class="console-in">
+    <div class="mailbox-slot-lip"></div>
+    <span class="hintk">Ask the desk</span>
+    <input type="text" id="mockInput" placeholder="Ask JPMC Consumer Credit Assistant..." aria-label="Ask the fraud desk">
+    <button type="button" class="cta" id="btnMockSend">Send →</button>
+  </div>
+</div>
+
+<script>
+  const wrap = document.getElementById("chatPopover");
+  const stream = document.getElementById("scrollStream");
+  const input = document.getElementById("mockInput");
+  const btnSend = document.getElementById("btnMockSend");
+  const btnMin = document.getElementById("btnMinPopover");
+  const btnClose = document.getElementById("btnClosePopover");
+
+  let isMinimized = false;
+
+  function openPopover() {
+    wrap.classList.add("is-open");
+    wrap.classList.remove("is-minimized");
+    isMinimized = false;
+    btnMin.textContent = "_";
+  }
+
+  function minimizePopover() {
+    isMinimized = !isMinimized;
+    wrap.classList.toggle("is-minimized", isMinimized);
+    btnMin.textContent = isMinimized ? "▴" : "_";
+  }
+
+  function closePopover() {
+    wrap.classList.remove("is-open");
+    wrap.classList.remove("is-minimized");
+    isMinimized = false;
+  }
+
+  btnMin.addEventListener("click", minimizePopover);
+  btnClose.addEventListener("click", closePopover);
+
+  function appendUserMsg(text) {
+    const div = document.createElement("div");
+    div.className = "msg user";
+    div.innerHTML = `<div class="msg-bubble">${escapeHtml(text)}</div><div class="msg-meta">You · Just now</div>`;
+    stream.appendChild(div);
+    stream.scrollTop = stream.scrollHeight;
+  }
+
+  function appendBotMsg(html, meta) {
+    const div = document.createElement("div");
+    div.className = "msg bot";
+    div.innerHTML = `<div class="msg-bubble">${html}</div><div class="msg-meta">${meta || "JPMC Assistant · live"}</div>`;
+    stream.appendChild(div);
+    stream.scrollTop = stream.scrollHeight;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  const RESPONSES = {
+    "hi": {
+      text: "Welcome, Priya Vantalis — thanks for banking with JPMC. I can see your <b>Premier Checking</b> ($37,501.85), <b>Premier Savings</b> ($50,366.76), and <b>Horizon Sapphire Card</b> ($21,830.00 available credit). How can I assist you with your accounts, cards, or recent activity?",
+      meta: "Fast greeting · Golden 01 & 13"
+    },
+    "balances": {
+      text: `Here are your current account balances:
+        <div class="card-payload">
+          <div class="cp-title"><span>Deposit & Credit Balances</span><span class="cp-badge ok">Active</span></div>
+          <div class="cp-row"><span class="cp-k">Premier Checking (ACCT000001)</span><span class="cp-v">$37,501.85</span></div>
+          <div class="cp-row"><span class="cp-k">Premier Savings (ACCT000002)</span><span class="cp-v">$50,366.76</span></div>
+          <div class="cp-row"><span class="cp-k">Horizon Sapphire Card (ACCT000003)</span><span class="cp-v">Limit $29,500 · Avail $21,830</span></div>
+        </div>`,
+      meta: "Golden Query 13 (accounts_and_balances)"
+    },
+    "cards": {
+      text: `You have 5 cards on file across your accounts:
+        <div class="card-payload">
+          <div class="cp-title"><span>Card Inventory & Restriction Status</span></div>
+          <div class="cp-row"><span class="cp-k">CARD00005 (Virtual · 2758)</span><span class="cp-v"><span class="cp-badge ok">Active</span> Apple Pay</span></div>
+          <div class="cp-row"><span class="cp-k">CARD00003 (Credit · 9013)</span><span class="cp-v"><span class="cp-badge" style="background:#fff3cd;color:#856404;">Pending Activation</span></span></div>
+          <div class="cp-row"><span class="cp-k">CARD00002 (Credit · 0513)</span><span class="cp-v"><span class="cp-badge frz">Frozen</span> Suspected Fraud Travel</span></div>
+          <div class="cp-row"><span class="cp-k">CARD00004 (Debit · 6420)</span><span class="cp-v"><span class="cp-badge frz">Frozen</span> Suspected Fraud Travel</span></div>
+          <div class="cp-row"><span class="cp-k">CARD00001 (Credit · 0931)</span><span class="cp-v"><span class="cp-badge" style="background:#e2e3e5;color:#383d41;">Replaced</span> Replaced by 0513</span></div>
+        </div>`,
+      meta: "Golden Query 14 (cards_and_wallets)"
+    },
+    "tracking": {
+      text: `Your replacement card tracking history shows:
+        <div class="card-payload">
+          <div class="cp-title"><span>Tracking # TRK0000201</span><span class="cp-badge ok">Delivered</span></div>
+          <div class="cp-row"><span class="cp-k">Carrier</span><span class="cp-v">GlobalPost Express</span></div>
+          <div class="cp-row"><span class="cp-k">Destination</span><span class="cp-v">Temporary Address · Lisbon, Portugal</span></div>
+          <div class="cp-row"><span class="cp-k">Status</span><span class="cp-v">Delivered on 2026-09-09</span></div>
+          <div class="cp-row"><span class="cp-k">Card</span><span class="cp-v">Replacement CARD00003 (ending 9013)</span></div>
+        </div>
+        Your physical replacement card arrived in Lisbon. It is currently awaiting activation.`,
+      meta: "Golden Query 17 (card_replacement_tracking)"
+    },
+    "why": {
+      text: `Here is the full picture of why transactions were declining:
+        <ol style="margin:8px 0;padding-left:18px;line-height:1.5;">
+          <li><b>Sep 2:</b> Your physical cards (ending 0513 and 6420) were frozen by Fraud Monitoring after simultaneous card present activity in Lisbon and a remote login attempt.</li>
+          <li><b>Sep 2:</b> An immediate virtual card (ending 2758) was provisioned for your Apple Pay so you could continue spending in Lisbon.</li>
+          <li><b>Sep 5:</b> You called customer service regarding a declined charge; that call ended before step-up verification was completed, so the security flags remained on file.</li>
+          <li><b>Sep 9:</b> A physical replacement card (ending 9013) was delivered to your Lisbon hotel, but it has not been activated yet.</li>
+        </ol>
+        Your active Apple Pay card ending in 2758 remains available. Would you like to activate card 9013 or request an unblock review?`,
+      meta: "Consolidated Causal Explanation · Zero-question synthesis"
+    },
+    "dispute": {
+      text: `I've coordinated with our <b>Dispute Specialist Agent (09)</b> to review the Lisbon charges:
+        <div class="card-payload">
+          <div class="cp-title"><span>Dispute Staging & Policy Evaluation</span><span class="cp-badge ok">Staged</span></div>
+          <div class="cp-row"><span class="cp-k">Debit Charge (CARD00004)</span><span class="cp-v">Taberna Do Monte · $15.11</span></div>
+          <div class="cp-row"><span class="cp-k">Regulation Path</span><span class="cp-v">Regulation E (10 business-day provisional credit)</span></div>
+          <div class="cp-row"><span class="cp-k">Credit Charge (CARD00002)</span><span class="cp-v">Pastéis de Belém · $32.40</span></div>
+          <div class="cp-row"><span class="cp-k">Regulation Path</span><span class="cp-v">Regulation Z (Payment withholding permitted)</span></div>
+          <div class="cp-row"><span class="cp-k">Statutory Deadline</span><span class="cp-v">Within 60-day filing window (Day 19 of 60)</span></div>
+          <div class="cp-row"><span class="cp-k">Provisional Credit</span><span class="cp-v">$15.11 staged for release on Sep 23</span></div>
+        </div>
+        I have staged the dispute filing and filed an action item on the Action Board for audit review.`,
+      meta: "Dispute Specialist Agent (09) · Reg E & Reg Z Glossary Precondition Checked"
+    }
+  };
+
+  function handleQuery(q) {
+    if (!q) return;
+    openPopover();
+    appendUserMsg(q);
+
+    // Show temporary typing indicator
+    const typingId = "typing-" + Date.now();
+    const typingDiv = document.createElement("div");
+    typingDiv.className = "msg bot";
+    typingDiv.id = typingId;
+    typingDiv.innerHTML = `<div class="msg-bubble"><span class="typing-dots"><span class="dot-pulse"></span><span class="dot-pulse"></span><span class="dot-pulse"></span></span></div>`;
+    stream.appendChild(typingDiv);
+    stream.scrollTop = stream.scrollHeight;
+
+    setTimeout(() => {
+      const el = document.getElementById(typingId);
+      if (el) el.remove();
+
+      const lower = q.toLowerCase();
+      let match = RESPONSES["hi"];
+      if (lower.includes("balance") || lower.includes("account") || lower.includes("money")) match = RESPONSES["balances"];
+      else if (lower.includes("card") || lower.includes("lock") || lower.includes("wallet")) match = RESPONSES["cards"];
+      else if (lower.includes("track") || lower.includes("ship") || lower.includes("replac")) match = RESPONSES["tracking"];
+      else if (lower.includes("why") || lower.includes("nothing working")) match = RESPONSES["why"];
+      else if (lower.includes("dispute") || lower.includes("credit") || lower.includes("stolen") || lower.includes("thief")) match = RESPONSES["dispute"];
+
+      appendBotMsg(match.text, match.meta);
+    }, 600);
+  }
+
+  btnSend.addEventListener("click", () => {
+    const q = input.value.trim() || input.placeholder;
+    input.value = "";
+    handleQuery(q);
+  });
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const q = input.value.trim() || input.placeholder;
+      input.value = "";
+      handleQuery(q);
+    }
+  });
+
+  document.querySelectorAll(".sc-chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      handleQuery(chip.getAttribute("data-q"));
+    });
+  });
+</script>
+
+</body>
+</html>

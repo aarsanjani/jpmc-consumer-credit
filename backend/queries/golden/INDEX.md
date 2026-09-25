@@ -1,6 +1,6 @@
 # Golden query index
 
-These are the twelve approved queries for the JPMC CCB fraud demo dataset. They
+These are the nineteen approved queries for the JPMC CCB fraud demo dataset. They
 all run against BigQuery project `abhinayboda-genai-bb`, dataset
 `jpmc_ccb_fraud`, and they all use `@named` parameters so nothing is pasted
 into a string.
@@ -11,12 +11,13 @@ SQL, because each one already handles a mistake that is easy to make and hard
 to spot. Every file says what that mistake is, in its own header, under WHY
 THIS IS THE APPROVED WAY.
 
-Two rules hold across all twelve: no query ever selects `ssn_last4` from
+Two rules hold across all nineteen: no query ever selects `ssn_last4` from
 `customers` or `pan_full` from `cards`, and no query reads
 `authorizations_deprecated_v1`. Those are the two governance traps, explained
-in `quality/governance_traps.md`.
+in `quality/governance_traps.md`. Queries 13 to 19 also never select
+`pan_masked`: they name a card by `last_four` alone.
 
-## The twelve
+## The nineteen
 
 | # | File | Question it answers, in plain English | Agent that calls it | Key parameters |
 |---|---|---|---|---|
@@ -32,6 +33,36 @@ in `quality/governance_traps.md`.
 | 10 | `10_wallet_tokens_active_on_card.sql` | Which phones and watches can still spend on this card? | Resolution / Actions | `@card_id`, `@as_of_ts`, `@usage_lookback_days`, `@include_inactive` |
 | 11 | `11_dispute_event_timeline.sql` | Everything that happened on this case, in order. | Resolution / Actions, and the Memory Writer when it summarises the session | `@dispute_id`, `@as_of_date`, `@pre_open_hours`, `@post_close_hours` |
 | 12 | `12_fraud_rate_by_merchant_category.sql` | Which kinds of merchant are we losing money to? | Fraud Triage, on the portfolio question rather than a single case | `@start_date`, `@end_date`, `@min_auth_count` |
+| 13 | `13_customer_accounts_and_balances.sql` | Which accounts does this customer hold, and what is the balance on each? | Customer assistant | `@customer_id` |
+| 14 | `14_customer_cards_and_wallets.sql` | Which cards does this customer have, in any state, and which devices carry them? | Customer assistant, Mobile App | `@customer_id` |
+| 15 | `15_spend_summary.sql` | How much did this customer spend between two dates, on what, and where? | Customer assistant | `@customer_id`, `@start_date`, `@end_date`, `@top_merchant_limit` |
+| 16 | `16_statement_transactions.sql` | What are the line items on this account for the statement period? | Customer assistant | `@customer_id`, `@account_id`, `@period_start`, `@period_end`, `@row_limit` |
+| 17 | `17_card_replacement_tracking.sql` | Where is this customer's replacement card, and is it activated yet? | Customer assistant, Web Portal | `@customer_id` |
+| 18 | `18_customer_contact_profile.sql` | What is this customer's name, address and preferred way to be contacted? | Customer assistant | `@customer_id`, `@as_of_date` |
+| 19 | `19_travel_notices_for_customer.sql` | What travel has this customer told us about, and is any of it still current? | Customer assistant, Web Portal | `@customer_id` |
+
+## The customer-facing seven (13 to 19)
+
+These answer what a customer asks in chat: balances, cards, spend, statements,
+where the new card is, what address we hold, and travel notices. The customer
+assistant (`consumer_credit_synthesizer`) may run all seven; the Mobile App
+agent may also run 14, and the Web Portal agent 17 and 19. What they share:
+
+- Each takes the customer asking as `@customer_id` and returns only that
+  customer's rows. 16 returns nothing for an account the customer does not
+  own. 17 only names cards on the customer's own record, because in this
+  dataset `dispute_events.card_id` often belongs to a different customer
+  than the event's `customer_id`.
+- 18 returns only the last four digits of the phone number, never the number.
+- Money is totalled in `amount_usd`, and declined attempts are counted on
+  their own and never added to spend.
+- No date is written into the SQL or the wrappers. The wrappers in
+  `backend/adk_agents.py` measure default windows back from `DEMO_AS_OF_DATE`
+  (`demo_as_of_date()`): 15 defaults to the 7 days ending that date, 16 to
+  the 30 days ending it, and 18 uses it to say whether a temporary address
+  applies today.
+- 16 lists at most `@row_limit` line items (the wrapper passes 200), but its
+  totals always cover the whole period.
 
 ## Which agent is which
 

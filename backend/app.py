@@ -134,6 +134,12 @@ CORS(app)
 from backend.ui_insights import insights  # read-only topic A/B + agent card popover data, see backend/ui_insights.py:insights
 app.register_blueprint(insights)
 
+from backend.eval_api import eval_api  # JPMC eval harness scorecard and run results API: backend/eval_api.py:eval_api
+app.register_blueprint(eval_api)
+
+from backend.customer_chat import customer_chat  # Conversational customer assistant and streaming chat API: backend/customer_chat.py:customer_chat
+app.register_blueprint(customer_chat)
+
 
 # ---------------------------------------------------------------------------
 # Modules this file needs but does not own. `backend/veracity_and_audit.py`
@@ -1193,7 +1199,7 @@ def get_channels_summary():
             else {"channels": [], "events": [], "total_sessions": 0, "total_events": 0}
         )
         roster = [a.model_dump(mode="json") for a in _adk.list_all_agents()] if _adk else []
-        presets = getattr(_adk, "CHANNEL_MULTI_TURN_PRESETS", {}) if _adk else {}
+        presets = _adk.live_injection_presets() if _adk else {}
         with _AUDIT_SWEEP_LOCK:
             sweep = dict(_AUDIT_SWEEP_STATE)
         return jsonify({

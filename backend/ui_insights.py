@@ -9,11 +9,14 @@ Routes (register with `app.register_blueprint(insights)`):
     GET /api/memory/topics                  engine topic vocabulary + channel queries
     GET /api/catalog/verdicts?names=a,b.c   live catalog decision per table/column
     GET /api/golden/contracts               which tables each golden query reads
+    GET /api/customer/card-summary?customer_id=   name, accounts, cards + wallet tokens (golden 18/13/14)
 """
 
+import contextvars
 import functools
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -61,12 +64,12 @@ def channel_agents() -> tuple[ChannelAgent, ...]:
     """Agents 01-05: each one's topics, and the fixed query its producer tool sends."""
     agents = []
     for descriptor in adk_agents.list_all_agents():
+        if descriptor.name not in adk_agents.CHANNEL_RETRIEVAL_QUERIES:
+            continue
         topics = adk_agents.AGENT_MEMORY_TOPICS.get(descriptor.name)
         if not topics:
             continue
-        query = adk_agents.CHANNEL_RETRIEVAL_QUERIES.get(descriptor.name)
-        if not query:
-            raise LookupError("no CHANNEL_RETRIEVAL_QUERIES entry for %s" % descriptor.name)
+        query = adk_agents.CHANNEL_RETRIEVAL_QUERIES[descriptor.name]
         agents.append(ChannelAgent(descriptor.agent_id, descriptor.name, tuple(topics), query))
     return tuple(agents)
 
@@ -279,3 +282,179 @@ def golden_contracts():
         "source": "adk_agents.GOLDEN_QUERY_CONTRACTS",
     })
 
+
+
+# ---------------------------------------------------------------------------
+# Customer card: GET /api/customer/card-summary (mini card + expanded card)
+# ---------------------------------------------------------------------------
+
+# Whitelists, not blacklists: pan_full, pan_masked and ssn_last4 can never leak
+# through a column somebody adds to the SQL later.
+CARD_FIELDS = (
+    "card_id", "account_id", "last_four", "network", "card_type", "status", "freeze_reason",
+    "replaces_card_id", "replaced_by_card_id", "issue_date", "expiry_date",
+    "account_type", "product_name", "regulation_path", "live_token_count",
+)
+TOKEN_FIELDS = (
+    "token_id", "wallet_provider", "device_name", "device_os", "token_status",
+    "provisioned_at", "provisioning_country", "last_used_at", "revoked_at",
+)
+ACCOUNT_FIELDS = ("account_id", "product_name", "account_type", "regulation_path", "status")
+NAME_FIELDS = ("full_name", "customer_name", "display_name", "preferred_name")
+CARD_SOURCES = {
+    "profile": "golden_18_customer_contact_profile",
+    "accounts": "golden_13_customer_accounts_and_balances",
+    "cards": "golden_14_customer_cards_and_wallets",
+}
+_CREDIT_ACCOUNT_TYPES = frozenset({"CREDIT_CARD", "CREDIT"})
+_DEBIT_ACCOUNT_TYPES = frozenset({"CHECKING", "SAVINGS", "DEBIT", "DEPOSIT"})
+
+
+def _pick(row: Mapping[str, Any], fields: Iterable[str]) -> dict[str, Any]:
+    return {f: row[f] for f in fields if f in row}
+
+
+def card_product(account: Mapping[str, Any] | None) -> str | None:
+    """'credit' or 'debit' for the account a card draws on; None when the data can't say.
+
+    cards.card_type is PHYSICAL/VIRTUAL, so credit vs debit has to come from the account.
+    """
+    if not account:
+        return None
+    account_type = str(account.get("account_type") or "").upper()
+    if account_type in _CREDIT_ACCOUNT_TYPES:
+        return "credit"
+    if account_type in _DEBIT_ACCOUNT_TYPES:
+        return "debit"
+    return {"REG_Z": "credit", "REG_E": "debit"}.get(str(account.get("regulation_path") or "").upper())
+
+
+def shape_accounts(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(_pick(row, ACCOUNT_FIELDS), product=card_product(row)) for row in rows]
+
+
+def _tokens_of(row: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """Tokens nested on a card row, or None when this row is one flattened token."""
+    for key in ("wallet_tokens", "tokens"):
+        if key in row:
+            nested = row[key] or []
+            return [_pick(t, TOKEN_FIELDS) for t in nested if isinstance(t, Mapping) and t.get("token_id")]
+    return None
+
+
+def shape_cards(rows: Iterable[Mapping[str, Any]],
+                accounts: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """One entry per card, tokens under it, product from its account.
+
+    Accepts either one row per card with a token array, or one row per
+    card-token pair (grouped here), so the shape of golden 14 can settle either way.
+    """
+    by_account = {a.get("account_id"): a for a in accounts}
+    cards: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        card_id = row.get("card_id")
+        if not card_id:
+            continue
+        card = cards.get(card_id)
+        if card is None:
+            card = _pick(row, CARD_FIELDS)
+            if "status" not in card and "card_status" in row:
+                card["status"] = row["card_status"]
+            # Golden 14 carries the account columns itself; golden 13 fills in if it doesn't.
+            card["product"] = card_product(by_account.get(card.get("account_id"))) or card_product(row)
+            card["tokens"] = []
+            cards[card_id] = card
+        nested = _tokens_of(row)
+        if nested is not None:
+            card["tokens"].extend(nested)
+        elif row.get("token_id"):
+            card["tokens"].append(_pick(row, TOKEN_FIELDS))
+    return list(cards.values())
+
+
+def token_is_live(token: Mapping[str, Any]) -> bool:
+    """Same rule as golden 10 and 14: ACTIVE and never revoked (the two can disagree)."""
+    return str(token.get("token_status") or "").upper() == "ACTIVE" and not token.get("revoked_at")
+
+
+def summarize_cards(cards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    by_status: dict[str, int] = {}
+    for card in cards:
+        status = str(card.get("status") or NOT_RECORDED)
+        by_status[status] = by_status.get(status, 0) + 1
+    return {
+        "total_cards": len(cards),
+        "by_status": by_status,
+        "virtual_cards": sum(1 for c in cards if str(c.get("card_type") or "").upper() == "VIRTUAL"),
+        "active_tokens": sum(1 for c in cards for t in c.get("tokens", []) if token_is_live(t)),
+        "products": sorted({c["product"] for c in cards if c.get("product")}),
+    }
+
+
+def customer_name(rows: Sequence[Mapping[str, Any]]) -> str | None:
+    if not rows:
+        return None
+    row = rows[0]
+    for field in NAME_FIELDS:
+        if row.get(field):
+            return str(row[field])
+    joined = " ".join(str(row[f]) for f in ("first_name", "last_name") if row.get(f))
+    return joined or None
+
+
+def _run_golden(fn: Callable[[str], Mapping[str, Any]] | None, label: str,
+                customer_id: str) -> tuple[list[dict[str, Any]] | None, str]:
+    """Rows from one golden wrapper, or (None, why not)."""
+    if fn is None:
+        return None, "%s is not available in adk_agents yet" % label
+    try:
+        result = fn(customer_id)
+    except Exception as exc:  # noqa: BLE001 - one failed query must not blank the other two
+        LOG.warning("%s failed for %s: %r", label, customer_id, exc)
+        return None, "%s failed: %s" % (label, exc)
+    if result.get("allowed") is False:
+        return None, "%s refused: %s" % (label, result.get("error", NOT_RECORDED))
+    return list(result.get("rows") or []), label
+
+
+def build_card_summary(customer_id: str,
+                       sources: Mapping[str, Callable[[str], Mapping[str, Any]] | None]) -> dict[str, Any]:
+    # Three independent BigQuery jobs; in parallel the card loads in the time of the slowest.
+    keys = ("profile", "accounts", "cards")
+    with ThreadPoolExecutor(max_workers=len(keys)) as pool:
+        futures = [pool.submit(contextvars.copy_context().run, _run_golden, sources.get(k), CARD_SOURCES[k], customer_id)
+                   for k in keys]
+        (profile, profile_src), (account_rows, accounts_src), (card_rows, cards_src) = (f.result() for f in futures)
+
+    accounts = shape_accounts(account_rows) if account_rows is not None else None
+    cards = shape_cards(card_rows, accounts or []) if card_rows is not None else None
+    name = customer_name(profile) if profile is not None else None
+
+    def tagged(value: Any, source: str, missing: str) -> dict[str, Any]:
+        return live(value, "BigQuery via adk_agents.%s" % source) if value is not None else unmeasured(missing)
+
+    return {
+        "customer_id": computed(customer_id, "request.args.customer_id"),
+        "name": tagged(name, profile_src, profile_src if profile is None else "no name column in golden 18 rows"),
+        "accounts": tagged(accounts, accounts_src, accounts_src),
+        "cards": tagged(cards, cards_src, cards_src),
+        "summary": (computed(summarize_cards(cards), "ui_insights.summarize_cards over golden 14 rows")
+                    if cards is not None else unmeasured(cards_src)),
+        "never_shown": identity(["cards.pan_full", "cards.pan_masked", "customers.ssn_last4"],
+                                "ui_insights.CARD_FIELDS / TOKEN_FIELDS whitelists",
+                                "columns this endpoint never returns"),
+    }
+
+
+def card_sources() -> dict[str, Callable[[str], Mapping[str, Any]] | None]:
+    return {key: getattr(adk_agents, name, None) for key, name in CARD_SOURCES.items()}
+
+
+@insights.get("/api/customer/card-summary")
+def customer_card_summary():
+    customer_id = _customer_arg()
+    if customer_id is None:
+        return jsonify({"error": "customer_id must be letters, digits, '_' or '-'"}), 400
+    with obs.turn("ui.card_summary", LOG, customer_id=customer_id):
+        payload = build_card_summary(customer_id, card_sources())
+    return jsonify(payload)

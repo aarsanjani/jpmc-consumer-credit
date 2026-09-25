@@ -39,6 +39,7 @@ class AgentId(str, Enum):
     CLAIM_VERACITY_VALIDATOR = "06_claim_veracity_validator_agent"
     MEMORY_BANK_AUDIT = "07_memory_bank_audit_agent"
     CONSUMER_CREDIT_SYNTHESIZER = "08_consumer_credit_synthesizer_agent"
+    DISPUTE_SPECIALIST = "09_dispute_specialist_agent"
 
     # Backward-compatible aliases mapping legacy 6-agent roles to the 8-agent roster
     ORCHESTRATOR = "08_consumer_credit_synthesizer_agent"

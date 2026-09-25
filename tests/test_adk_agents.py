@@ -2,10 +2,10 @@ import pytest
 from backend.adk_agents import list_all_agents, CHANNEL_SESSION_TOKENS
 
 def test_list_all_agents_count_and_names():
-    """Verify list_all_agents returns exactly the 8 specified agents."""
+    """Verify list_all_agents returns exactly the 9 specified agents."""
     agents = list_all_agents()
-    assert len(agents) == 8
-    
+    assert len(agents) == 9
+
     expected_names = {
         "fraud_monitoring_agent",
         "telephony_ivr_agent",
@@ -14,7 +14,8 @@ def test_list_all_agents_count_and_names():
         "branch_support_agent",
         "claim_veracity_validator_agent",
         "memory_bank_audit_agent",
-        "consumer_credit_synthesizer_agent"
+        "consumer_credit_synthesizer_agent",
+        "dispute_specialist_agent",
     }
     actual_names = {agent.name for agent in agents}
     assert actual_names == expected_names
