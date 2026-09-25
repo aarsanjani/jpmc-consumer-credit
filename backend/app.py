@@ -51,7 +51,6 @@ from backend.provenance import (
 )
 from backend.memory_bank import (
     topic_labels,
-    LISBON_THEFT_TURNS,
     MemoryBankClient,
     MemoryBankError,
     StandaloneMemoryBankClient,
@@ -64,7 +63,7 @@ from backend.knowledge_catalog import (
     shared_catalog_governor,
 )
 from backend.agent import MemoryBankSynthesizerAgent
-from backend import memory_write_path
+from backend import action_board, memory_write_path
 from backend.custom_agent_comparison import AgentComparisonEngine
 
 logging.basicConfig(
@@ -131,6 +130,9 @@ LOG = obs.get_logger(__name__)
 obs.configure()
 obs.enable_tracing()
 CORS(app)
+
+from backend.ui_insights import insights  # read-only topic A/B + agent card popover data, see backend/ui_insights.py:insights
+app.register_blueprint(insights)
 
 
 # ---------------------------------------------------------------------------
@@ -206,10 +208,6 @@ def catalog_governor() -> CatalogGovernor:
     return shared_catalog_governor()
 
 
-def scope_for(customer_id: str) -> Dict[str, str]:
-    return {"customer_id": customer_id}
-
-
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
@@ -254,6 +252,7 @@ def memory_record(item: Dict[str, Any]) -> Dict[str, Any]:
         "topic": ", ".join(topic_labels(body)) if topic_labels(body) else NOT_RECORDED,
         "topics": body.get("topics", []),
         "scope": body.get("scope", {}),
+        "standing": item.get("standing", NOT_RECORDED),
     }
 
 
@@ -395,8 +394,8 @@ def get_live_testbed_status():
         customer_id = arg_customer()
 
         try:
-            memories = memory_client().retrieve(
-                scope_for(customer_id),
+            memories = memory_write_path.retrieve_for_agents(
+                memory_client(), customer_id,
                 query=request.args.get("query", "travel notice, disputes, card status"),
                 top_k=int(request.args.get("top_k", 10)),
             )
@@ -806,7 +805,7 @@ def _run_avenue(spec: Dict[str, Any], customer_id: str) -> Dict[str, Any]:
         # up in the phase total with no child span to account for it.
         with obs.turn("memory.retrieve", LOG, query=target, scope=customer_id) as span:
             try:
-                hits = memory_client().retrieve(scope_for(customer_id), query=target, top_k=5)
+                hits = memory_write_path.retrieve_for_agents(memory_client(), customer_id, query=target, top_k=5)
             except MemoryBankError as exc:
                 span.detail(error=str(exc))
                 avenue["evidence"] = unmeasured("reasoningEngines.memories:retrieve (%s)" % exc)
@@ -969,7 +968,7 @@ def _measured_tool_trajectory(run_id: str) -> List[Dict[str, Any]]:
     return steps or _containment_trajectory()
 
 
-def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]:
+def _evaluate_interactive_workbench_turn(body: Dict[str, Any], record_claim: bool = False) -> Dict[str, Any]:
     """One workbench turn: gather evidence, ask the validator, record the turn.
 
     The verdict is the validator's, not this function's. If the validator cannot
@@ -1056,10 +1055,10 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
 
     # Store the turn as a session, then generate from it using the verdict we
     # already have: contradicted claims land in the quarantine scope, which
-    # agents never read. See backend/memory_write_path.py:generate_with_lineage.
-    write_back: Dict[str, Any] = unmeasured("no customer text to store")
-    lineage: Any = unmeasured("no customer text to store")
-    if claim_text:
+    # agents never read. See backend/memory_write_path.py:record.
+    write_back: Dict[str, Any] = unmeasured("operator question: not stored as a customer statement")
+    lineage: Any = unmeasured("operator question: not stored as a customer statement")
+    if record_claim and claim_text:
         with obs.turn("phase.4_memory_write", LOG, agent="consumer_credit_synthesizer_agent",
                       scope=customer_id) as _t:
             try:
@@ -1072,8 +1071,10 @@ def _evaluate_interactive_workbench_turn(body: Dict[str, Any]) -> Dict[str, Any]
                 )
                 client.append_event(session_name, "customer", claim_text)
                 raw_status = (verdict.get("raw") or {}).get("veracity_status")
-                recorded = memory_write_path.generate_with_lineage(
-                    client, session_name, customer_id, raw_status)
+                recorded = memory_write_path.record(
+                    client, session_name,
+                    memory_write_path.Claim(customer_id, claim_text, channel_str), raw_status,
+                    name_lookup=getattr(_adk, "customer_display_name", None))
                 write_back = live(recorded["operation"], "reasoningEngines.memories:generate")
                 lineage = live(dict(recorded, session_name=session_name),
                                "memories:generate + sessions.appendEvent(stateDelta)")
@@ -1263,7 +1264,10 @@ def post_fraud_card_control():
 @app.route("/api/session/channel/record", methods=["POST"])
 def handle_workbench_chat():
     with obs.run_context(kind="chat") as run_id:
-        result = _evaluate_interactive_workbench_turn(payload())
+        # The Ask box sends the operator's question, which is not a customer
+        # statement; only the channel-record route stores a customer claim.
+        result = _evaluate_interactive_workbench_turn(
+            payload(), record_claim=request.path == "/api/session/channel/record")
         result["run_id"] = run_id
         result["tool_trajectory"] = _measured_tool_trajectory(run_id)
         return jsonify(result)
@@ -1684,7 +1688,7 @@ def get_knowledge_catalog_overview():
 def get_memory_bank():
     customer_id = arg_customer()
     try:
-        memories = memory_client().retrieve(scope_for(customer_id))
+        memories = memory_write_path.retrieve_for_agents(memory_client(), customer_id)
     except MemoryBankError as exc:
         return _upstream_error(exc, "reasoningEngines.memories:retrieve")
     records = [memory_record(m) for m in memories]
@@ -1705,7 +1709,7 @@ def retrieve_relevant_memory():
     query = body.get("query")
     top_k = int(body.get("top_k", 5))
     try:
-        memories = memory_client().retrieve(scope_for(customer_id), query=query, top_k=top_k)
+        memories = memory_write_path.retrieve_for_agents(memory_client(), customer_id, query=query, top_k=top_k)
     except MemoryBankError as exc:
         return _upstream_error(exc, "reasoningEngines.memories:retrieve")
     records = [memory_record(m) for m in memories]
@@ -1778,144 +1782,116 @@ def get_memory_source(memory_id: str):
     })
 
 
-@app.route("/api/memory/quarantine", methods=["GET"])
-def get_quarantined_memories():
-    """Memories generated from contradicted claims. Agents never read this scope."""
+@app.route("/api/memory/scope/<standing>", methods=["GET"])
+def get_memories_by_standing(standing: str):
+    """Memories in one scope: trusted, pending_review (agents see these labelled
+    unverified) or quarantine (agents never see these)."""
+    try:
+        chosen = memory_write_path.Standing(standing)
+    except ValueError:
+        return jsonify({"status": "BAD_REQUEST",
+                        "error": "standing must be one of %s" % [s.value for s in memory_write_path.Standing]}), 400
     customer_id = arg_customer()
     try:
-        memories = memory_client().retrieve(memory_write_path.quarantine_scope(customer_id), top_k=100)
+        memories = memory_client().retrieve(memory_write_path.scope_for(customer_id, chosen), top_k=100)
     except MemoryBankError as exc:
         return _upstream_error(exc, "reasoningEngines.memories:retrieve")
     records = [memory_record(m) for m in memories]
     return jsonify({
         "customer_id": customer_id,
+        "standing": chosen.value,
         "count": len(records),
-        "memories": live(records, "reasoningEngines.memories:retrieve (quarantine scope)"),
+        "memories": live(records, "reasoningEngines.memories:retrieve (%s scope)" % chosen.value),
     })
 
 
-@app.route("/api/memory/seed", methods=["POST"])
-def seed_memory_bank():
-    """Seeds the Lisbon corpus by handing raw turns to the service to extract."""
-    body = payload()
-    customer_id = body_customer(body)
-    turns = [{"role": t["role"], "text": t["text"]} for t in LISBON_THEFT_TURNS]
+# ---------------------------------------------------------------------------
+# Action Board: claims and follow-ups for a human (backend/action_board.py)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/action-board", methods=["GET"])
+def get_action_board():
+    customer_id = request.args.get("customer_id") or None
+    include_closed = request.args.get("include_closed") == "1"
     try:
-        operation = memory_client().generate_from_contents(
-            turns=turns, scope=scope_for(customer_id), wait=False
-        )
+        items = action_board.list_items(memory_client(), customer_id, include_closed)
     except MemoryBankError as exc:
-        return _upstream_error(exc, "reasoningEngines.memories:generate")
-    return jsonify(
-        {
-            "status": "SUCCESS",
-            "customer_id": customer_id,
-            "turns_submitted": computed(len(turns), "backend.memory_bank.LISBON_THEFT_TURNS"),
-            "operation": live(operation.get("name", NOT_RECORDED), "reasoningEngines.memories:generate"),
-            "note": "Extraction is asynchronous. Memories appear once the operation completes.",
-        }
-    )
+        return _upstream_error(exc, "reasoningEngines.sessions.list")
+    return jsonify({"count": len(items), "items": live(items, "sessionState.action_board")})
 
 
-@app.route("/api/memory/ingest", methods=["POST"])
-def ingest_memory_event():
-    """Submits one observation. What gets stored is the service's decision."""
+@app.route("/api/action-board/<session_id>/action", methods=["POST"])
+def post_action_board_action(session_id: str):
     body = payload()
-    customer_id = body_customer(body)
-    summary = body.get("summary")
-    if not summary:
-        return jsonify({"status": "BAD_REQUEST", "error": "summary is required"}), 400
-    channel = as_channel(body.get("channel", "FRAUD_DETECTION"), BankChannel.FRAUD_DETECTION)
     try:
-        operation = memory_client().generate_from_contents(
-            turns=[{"role": "user", "text": summary}],
-            scope=scope_for(customer_id),
-            wait=False,
-        )
-    except MemoryBankError as exc:
-        return _upstream_error(exc, "reasoningEngines.memories:generate")
-    return jsonify(
-        {
-            "status": "SUCCESS",
-            "fragment": {
-                "customer_id": computed(customer_id, "request payload customer_id"),
-                "channel": identity(channel.value, "request payload channel", "ingesting channel"),
-                "severity": identity(
-                    as_severity(body.get("severity", "MEDIUM")).value,
-                    "request payload severity",
-                    "caller-declared severity",
-                ),
-                "summary": computed(summary, "request payload summary"),
-                "operation": live(operation.get("name", NOT_RECORDED), "reasoningEngines.memories:generate"),
-                # The service assigns the id after extraction completes.
-                "memory_id": unmeasured("assigned asynchronously by memories:generate"),
-            },
-        }
-    )
+        action = action_board.Action(str(body.get("action", "")).upper())
+    except ValueError:
+        return jsonify({"status": "BAD_REQUEST",
+                        "error": "action must be one of %s" % [a.value for a in action_board.Action]}), 400
+    client = memory_client()
+    session_name = "%s/sessions/%s" % (client.parent, session_id)
+    with obs.run_context(kind="chat") as run_id:
+        try:
+            item = action_board.act(
+                client, session_name, action,
+                actor=str(body.get("actor") or action_board.ADMIN_AUTHOR),
+                note=str(body.get("note") or ""),
+                reply=str(body.get("reply") or ""),
+                tags=[str(t) for t in body.get("tags") or []],
+            )
+        except action_board.BoardError as exc:
+            return jsonify({"status": "CONFLICT", "error": str(exc)}), 409
+        except MemoryBankError as exc:
+            return _upstream_error(exc, "action_board.act")
+    return jsonify({"status": "SUCCESS", "run_id": run_id, "item": live(item, "sessionState.action_board"),
+                    # There is no customer messaging client in this process; the
+                    # reply is added to the session transcript, not sent.
+                    "reply_delivery": unmeasured("no customer messaging client; reply recorded in the session only")})
 
 
-def _compaction_report(body: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
-    """Memory consolidation, reported honestly.
+def _newest_session(client: MemoryBankClient, customer_id: str) -> Optional[Dict[str, Any]]:
+    mine = [s for s in client.list_sessions() if s.get("userId") == customer_id]
+    return max(mine, key=lambda s: s.get("updateTime", ""), default=None)
 
-    There is no local compaction any more. Consolidation happens inside the
-    managed Memory Bank when `memories:generate` runs, so this route triggers
-    that and reports what the service returned. Compression ratio and token
-    counts are not values the API exposes, so they read "n/r" instead of a
-    number that would look convincing and mean nothing.
+
+def _session_turns(client: MemoryBankClient, session_name: str) -> List[Dict[str, str]]:
+    return [{"author": t["author"], "text": t["text"]} for t in _transcript(client, session_name)]
+
+
+@app.route("/api/compaction/run", methods=["POST"])
+def run_consolidation():
+    """The "Run consolidation" button: re-runs the newest session for the
+    customer through the verified write path (backend/memory_write_path.py:
+    verify_and_record), so consolidation never bypasses the veracity gate.
+
+    Compression and token counts are not values the API exposes, so they read
+    n/r rather than a number that would look convincing and mean nothing.
     """
+    body = payload()
     with obs.run_context(kind="chat") as run_id:
         customer_id = body_customer(body)
-        session_name = body.get("session_name")
         client = memory_client()
-
-        if _adk is not None and hasattr(_adk, "list_memory_topics_tool"):
-            try:
-                _adk.list_memory_topics_tool()
-            except Exception:  # noqa: BLE001
-                pass
-
-        with obs.turn("memory.retrieve", LOG, agent="consumer_credit_synthesizer_agent",
-                      scope=customer_id, query="all_in_scope") as _r_span:
-            try:
-                before = client.retrieve(scope_for(customer_id))
-                _r_span.detail(memories=len(before))
-            except MemoryBankError as exc:
-                _r_span.detail(error=str(exc))
-                return {
-                    "status": "UPSTREAM_ERROR",
-                    "run_id": run_id,
-                    "source": "reasoningEngines.memories:retrieve",
-                    "error": "%s: %s" % (type(exc).__name__, exc),
-                }, 502
-
-        if not session_name:
-            try:
-                for s in client.list_sessions():
-                    scoped = s.get("sessionState", {}).get("customer_id") or s.get("userId")
-                    if scoped == customer_id and s.get("name"):
-                        session_name = s.get("name")
-                        break
-            except Exception:  # noqa: BLE001
-                session_name = None
-
-        with obs.turn("memory.consolidate", LOG, agent="consumer_credit_synthesizer_agent",
-                      scope=customer_id, session=str(session_name or NOT_RECORDED).split("/")[-1]) as _c_span:
-            if session_name:
-                try:
-                    operation = client.generate_from_session(session_name, scope_for(customer_id), wait=False)
-                    op_name = operation.get("name", NOT_RECORDED)
-                    triggered = live(op_name, "reasoningEngines.memories:generate")
-                    _c_span.detail(operation=op_name, status="TRIGGERED")
-                except MemoryBankError as exc:
-                    triggered = unmeasured("reasoningEngines.memories:generate (%s)" % exc)
-                    _c_span.detail(error=str(exc))
+        try:
+            before = memory_write_path.retrieve_for_agents(client, customer_id, top_k=100)
+            session = ({"name": body["session_name"]} if body.get("session_name")
+                       else _newest_session(client, customer_id))
+            if session is None:
+                lineage = unmeasured("no session stored for this customer")
             else:
-                triggered = unmeasured(
-                    "no session_name supplied; consolidation runs server side when a session is generated from"
-                )
-                _c_span.detail(status="no_session_in_scope")
-
-        return {
+                name = session["name"]
+                state = client.get_session(name).get("sessionState") or {}
+                channel = str(state.get("channel") or "UNKNOWN")
+                verify = (_adk._claim_verifier(customer_id, channel) if _adk is not None
+                          else (lambda said: None))
+                recorded = memory_write_path.verify_and_record(
+                    client, name, customer_id, _session_turns(client, name), channel, verify,
+                    name_lookup=getattr(_adk, "customer_display_name", None))
+                lineage = live(dict(recorded, session_name=name),
+                               "memories:generate + sessions.appendEvent(stateDelta)")
+        except MemoryBankError as exc:
+            return _upstream_error(exc, "verified write path")
+        return jsonify({
             "status": "SUCCESS",
             "run_id": run_id,
             "customer_id": customer_id,
@@ -1923,34 +1899,18 @@ def _compaction_report(body: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
             "compaction_report": {
                 "consolidation_location": identity(
                     "Vertex AI Agent Engine Memory Bank (server side)",
-                    "backend/memory_bank.py:MemoryBankClient.generate_from_session",
+                    "backend/memory_write_path.py:verify_and_record",
                     "states where the work runs; not a measurement",
                 ),
                 "memories_in_scope_before": live(len(before), "reasoningEngines.memories:retrieve"),
-                "generate_operation": triggered,
+                "memory_lineage": lineage,
                 "tokens_before": unmeasured("Memory Bank does not report token counts"),
                 "tokens_after": unmeasured("Memory Bank does not report token counts"),
                 "compression_ratio": unmeasured("depends on two unmeasured token counts"),
                 "token_reduction_pct": unmeasured("depends on two unmeasured token counts"),
-                "nodes_consolidated": unmeasured(
-                    "the generate operation is asynchronous and does not return a consolidation count"
-                ),
             },
             "memories": live([memory_record(m) for m in before], "reasoningEngines.memories:retrieve"),
-        }, 200
-
-
-@app.route("/api/memory/compact", methods=["POST"])
-def compact_memory_bank():
-    body, code = _compaction_report(payload())
-    return jsonify(body), code
-
-
-@app.route("/api/compaction/run", methods=["POST"])
-def run_compaction_alias():
-    """Same work as /api/memory/compact. Kept because the UI calls this path."""
-    body, code = _compaction_report(payload())
-    return jsonify(body), code
+        })
 
 
 @app.route("/api/standalone/external-agent", methods=["POST"])

@@ -803,33 +803,7 @@ function openAgentCardModal(agentKey) {
     $("agentModalDesc").textContent = spec.description || "";
   }
 
-  const topics = Array.isArray(spec.memory_topics_scoped) ? spec.memory_topics_scoped : [];
-  if ($("agentModalTopics")) {
-    $("agentModalTopics").innerHTML = topics.length
-      ? topics.map((t) => `<span class="tag on">${escapeHtml(t)}</span>`).join("")
-      : `<span class="tag">${NOT_RECORDED}</span>`;
-  }
-
-  // Catalog verdicts are decided live on each run, so the card lists what gets
-  // checked with no colour that would imply an outcome.
-  const gov = Array.isArray(spec.catalog_governance) ? spec.catalog_governance : [];
-  if ($("agentModalGovernance")) {
-    $("agentModalGovernance").innerHTML = gov.length
-      ? gov.map((g) => `<span class="tag">${escapeHtml(g)}</span>`).join("") +
-        `<span class="tag-note">checked by the catalog at run time</span>`
-      : `<span class="tag">${NOT_RECORDED}</span>`;
-  }
-
-  const gq = Array.isArray(spec.authorized_golden_queries) ? spec.authorized_golden_queries : [];
-  const bound = new Set(Array.isArray(spec.bound_golden_queries) ? spec.bound_golden_queries : []);
-  if ($("agentModalGoldenQueries")) {
-    $("agentModalGoldenQueries").innerHTML = gq.length
-      ? gq.map((q) => bound.has(q)
-          ? `<span class="tag ok" title="authorized and bound as a tool">${escapeHtml(q)} · bound</span>`
-          : `<span class="tag" title="authorized in INDEX.md, not bound as a tool">${escapeHtml(q)}</span>`
-        ).join("")
-      : `<span class="tag">${NOT_RECORDED}</span>`;
-  }
+  renderSourceChips(spec);
 
   const tools = Array.isArray(spec.tools) ? spec.tools : [];
   if ($("agentModalToolsCount")) {
@@ -875,8 +849,804 @@ function openAgentCardModal(agentKey) {
 }
 
 function closeAgentCardModal() {
+  closeSrcPop(false);
   const modal = $("agentCardModal");
   if (modal) modal.hidden = true;
+}
+
+// =========================================================================
+// Agent card source chips: Memory Bank / Knowledge Catalog / BigQuery.
+// Card fields come from the descriptor (/api/channels/summary). Topic text,
+// channel queries, catalog verdicts and golden query tables come from
+// backend/ui_insights.py. Run data comes from recorded trace spans. Anything
+// not measured is drawn as n/r with the reason.
+// =========================================================================
+
+const SRC = {
+  topics: null,
+  topicsError: "",
+  contracts: null,
+  contractsError: "",
+  verdicts: {},
+  verdictsState: "idle",
+  verdictsError: "",
+  goldenRuns: {},
+  goldenState: "idle",
+  spec: null,
+  token: 0,
+  openId: null,
+  pinned: false,
+  closeTimer: null,
+};
+
+const SRC_POPS = [
+  ["mem", "Memory Bank"],
+  ["cat", "Knowledge Catalog"],
+  ["bq", "BigQuery"],
+];
+
+const VERDICT_BADGES = {
+  ALLOW: ["v-allow", "✓ ALLOW"],
+  ALLOW_TO_OWNER_ONLY: ["v-owner", "◐ ALLOW_TO_OWNER_ONLY"],
+  MASK: ["v-owner", "◐ MASK"],
+  REFUSE: ["v-refuse", "✕ REFUSE"],
+};
+
+async function fetchJson(url) {
+  const resp = await fetch(url);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+  return data;
+}
+
+function nrSpan(reason) {
+  return `<span class="nr">n/r · ${escapeHtml(reason)}</span>`;
+}
+
+function srcList(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function contractById(id) {
+  return SRC.contracts ? SRC.contracts.find((c) => c.id === id) : null;
+}
+
+function goldenShortId(id) {
+  return String(id).split("_")[0];
+}
+
+function memoryPopBody(spec) {
+  const scoped = srcList(spec.memory_topics_scoped);
+  const engineTopics = SRC.topics ? srcList(pvValue(SRC.topics.topics)) : null;
+  const channel = SRC.topics ? srcList(SRC.topics.channel_agents).find((c) => c.name === spec.name) : null;
+  const readsAll = scoped.some((t) => /^ALL\b/.test(t));
+  const readsNone = scoped.some((t) => /^NONE\b/.test(t));
+
+  let topicsHtml;
+  if (readsNone) {
+    topicsHtml = `<div class="val">${escapeHtml(scoped.join(", "))}</div>`;
+  } else if (!engineTopics) {
+    topicsHtml = SRC.topicsError
+      ? `<div class="val">${nrSpan("topic list failed: " + SRC.topicsError)}</div>`
+      : `<div class="val">Loading topics from the engine…</div>`;
+  } else {
+    const byLabel = Object.fromEntries(engineTopics.map((t) => [t.label, t]));
+    const labels = readsAll ? engineTopics.map((t) => t.label) : scoped;
+    const items = labels.map((label) => {
+      const topic = byLabel[label];
+      const desc = !topic
+        ? nrSpan("not configured on the engine")
+        : topic.description && topic.description !== NOT_RECORDED
+          ? escapeHtml(topic.description)
+          : nrSpan(`${topic.kind || "managed"} topic, no description on the engine`);
+      return `<li><span class="t">${escapeHtml(label)}</span>${desc}</li>`;
+    }).join("");
+    topicsHtml = (readsAll ? `<p class="row-note">${escapeHtml(scoped.join(", "))}</p>` : "") +
+      `<ul class="topic-list">${items || `<li>${nrSpan("no topics")}</li>`}</ul>`;
+  }
+
+  let queryHtml;
+  if (channel) queryHtml = escapeHtml(pvText(channel.query));
+  else if (readsNone) queryHtml = nrSpan("doesn't read Memory Bank");
+  else if (SRC.topics) queryHtml = nrSpan("no fixed query; it's chosen per call");
+  else queryHtml = SRC.topicsError ? nrSpan("query lookup failed") : "Loading…";
+
+  const scope = readsNone ? nrSpan("doesn't read Memory Bank") : `<code>customer_id = ${escapeHtml(STATE.customerId)}</code>`;
+  return `<div class="lbl first">Topics this agent reads</div>${topicsHtml}
+    <div class="lbl">Fixed query it sends</div><div class="val">${queryHtml}</div>
+    <div class="lbl">Scope</div><div class="val">${scope}</div>
+    <p class="src">source: live engine config (<code>GET /api/memory/topics</code>) + <code>AGENT_MEMORY_TOPICS</code></p>`;
+}
+
+function catalogUse(name, spec) {
+  if (!SRC.contracts) return "";
+  const mine = srcList(spec.authorized_golden_queries);
+  const readers = mine.filter((id) => (contractById(id) || {}).tables?.includes(name)).map(goldenShortId);
+  const checkers = mine.filter((id) => (contractById(id) || {}).columns?.includes(name)).map(goldenShortId);
+  const parts = [];
+  if (readers.length) parts.push(`read by golden ${readers.join(", ")}`);
+  if (checkers.length) parts.push(`checked by golden ${checkers.join(", ")}`);
+  return parts.join(" · ");
+}
+
+function verdictBadge(name) {
+  if (SRC.verdictsState === "loading") return `<span class="verdict v-nr">checking…</span>`;
+  const decision = SRC.verdicts[name];
+  if (!decision) {
+    const why = SRC.verdictsState === "error" ? "lookup failed" : "not checked";
+    return `<span class="verdict v-nr">n/r · ${why}</span>`;
+  }
+  const [cls, label] = VERDICT_BADGES[decision.action] || ["v-nr", `? ${decision.action || NOT_RECORDED}`];
+  return `<span class="verdict ${cls}">${escapeHtml(label)}</span>`;
+}
+
+function catalogPopBody(spec) {
+  const names = srcList(spec.catalog_governance);
+  const rows = names.map((name) => {
+    const decision = SRC.verdicts[name];
+    const why = decision
+      ? `decided by: ${escapeHtml(decision.evidence || NOT_RECORDED)}`
+      : SRC.verdictsState === "error" ? nrSpan(SRC.verdictsError) : "";
+    const use = catalogUse(name, spec);
+    return `<li><div class="cat-top"><span class="t">${escapeHtml(name)}</span>${verdictBadge(name)}</div>
+      ${why ? `<div class="cat-why">${why}</div>` : ""}
+      ${use ? `<div class="cat-use">${escapeHtml(use)}</div>` : ""}</li>`;
+  }).join("");
+  return `<div class="lbl first">Tables and columns its golden queries touch</div>
+    ${names.length ? `<ul class="cat-list">${rows}</ul>` : `<div class="val">${nrSpan("this agent has no golden queries, so nothing is checked")}</div>`}
+    <div class="advisory">On the golden-query path the catalog is advisory today: a refusal is recorded and the query still runs.</div>
+    <p class="src">source: live Dataplex lookup per name (<code>GET /api/catalog/verdicts</code>)</p>`;
+}
+
+function goldenRunFields(id) {
+  const run = SRC.goldenRuns[id];
+  if (!run) {
+    const why = SRC.goldenState === "loading" ? "reading traces…" : "not in this session's latest traces";
+    return ["last run", "rows", "job id"].map((k) => `<dt>${k}</dt><dd class="nr">n/r · ${why}</dd>`).join("");
+  }
+  const lastRun = `run ${escapeHtml(run.run_id)}${run.state === "error" ? " · failed" : ""}`;
+  const rows = run.rows === undefined || run.rows === null
+    ? `<dd class="nr">n/r · ${escapeHtml(run.error || "not recorded on the span")}</dd>`
+    : `<dd>${escapeHtml(run.rows)}</dd>`;
+  const job = run.job_id && run.job_id !== NOT_RECORDED
+    ? `<dd><code>${escapeHtml(run.job_id)}</code></dd>`
+    : `<dd class="nr">n/r · not recorded on the span</dd>`;
+  return `<dt>last run</dt><dd>${lastRun}</dd><dt>rows</dt>${rows}<dt>job id</dt>${job}`;
+}
+
+function bigqueryPopBody(spec) {
+  const authorized = srcList(spec.authorized_golden_queries);
+  const bound = new Set(srcList(spec.bound_golden_queries));
+  const cards = authorized.map((id) => {
+    const contract = contractById(id);
+    const tables = contract
+      ? escapeHtml(contract.tables.join(", "))
+      : SRC.contractsError ? nrSpan("contracts failed: " + SRC.contractsError) : "Loading…";
+    const boundTag = bound.has(id)
+      ? `<span class="tag ok" title="bound to this agent as a tool">bound</span>`
+      : `<span class="tag" title="authorized in INDEX.md, not bound as a tool">not bound</span>`;
+    return `<div class="gq"><div class="cat-top"><span class="t">golden ${escapeHtml(id)}</span>${boundTag}</div>
+      ${contract ? `<p class="q">${escapeHtml(contract.question)}</p>` : ""}
+      <dl><dt>reads</dt><dd>${tables}</dd>${goldenRunFields(id)}</dl></div>`;
+  }).join("");
+  return `<div class="lbl first">Golden queries this agent may call</div>
+    ${cards || `<div class="val">${nrSpan("this agent has no golden queries")}</div>`}
+    ${authorized.length ? `<p class="row-note">${bound.size} of ${authorized.length} bound as tools on this agent.</p>` : ""}
+    <p class="src">source: agent descriptor + <code>GOLDEN_QUERY_CONTRACTS</code>; run data from <code>bigquery.query</code> trace spans</p>`;
+}
+
+function srcChipSummary(id, spec) {
+  if (id === "mem") {
+    const scoped = srcList(spec.memory_topics_scoped);
+    if (scoped.some((t) => /^NONE\b/.test(t))) return "not read";
+    if (scoped.some((t) => /^ALL\b/.test(t))) return "all topics";
+    return `${scoped.length} ${scoped.length === 1 ? "topic" : "topics"}`;
+  }
+  if (id === "cat") {
+    const names = srcList(spec.catalog_governance);
+    if (SRC.verdictsState !== "done") return `${names.length} checked`;
+    const refused = names.filter((n) => (SRC.verdicts[n] || {}).action === "REFUSE").length;
+    return `${names.length} checked · ${refused} refused`;
+  }
+  const n = srcList(spec.authorized_golden_queries).length;
+  return `${n} ${n === 1 ? "query" : "queries"} · ${srcList(spec.bound_golden_queries).length} bound`;
+}
+
+function srcPopBody(id, spec) {
+  const body = id === "mem" ? memoryPopBody(spec) : id === "cat" ? catalogPopBody(spec) : bigqueryPopBody(spec);
+  const title = SRC_POPS.find(([key]) => key === id)[1];
+  return `<div class="pop-hd"><h3 id="srcpop-${id}-h">${escapeHtml(title)}</h3>
+    <button type="button" class="pop-x" data-close aria-label="Close ${escapeHtml(title)} card">Close ×</button></div>${body}`;
+}
+
+function renderSourceChips(spec) {
+  const host = $("agentModalSrcChips");
+  if (!host) return;
+  closeSrcPop(false);
+  SRC.spec = spec;
+  // Each popover sits right after its chip in the DOM, so Tab goes chip -> its card -> next chip.
+  host.innerHTML = SRC_POPS.map(([id, name]) => `
+    <span class="src-wrap" data-pop="${id}">
+      <button type="button" class="src-chip" id="srcchip-${id}" aria-expanded="false" aria-controls="srcpop-${id}">
+        <b>${escapeHtml(name)}</b><small></small>
+      </button>
+      <div class="src-pop" id="srcpop-${id}" role="dialog" aria-labelledby="srcpop-${id}-h" hidden></div>
+    </span>`).join("");
+  host.querySelectorAll(".src-wrap").forEach(wireSrcWrap);
+  refreshSourceChips();
+  loadSourceData(spec);
+}
+
+function refreshSourceChips() {
+  const spec = SRC.spec;
+  if (!spec) return;
+  SRC_POPS.forEach(([id]) => {
+    const chip = $(`srcchip-${id}`);
+    const pop = $(`srcpop-${id}`);
+    if (!chip || !pop) return;
+    chip.querySelector("small").textContent = srcChipSummary(id, spec);
+    const html = srcPopBody(id, spec);
+    if (pop.dataset.html !== html) {
+      pop.innerHTML = html;
+      pop.dataset.html = html;
+    }
+  });
+  if (SRC.openId) placeSrcPop($(`srcchip-${SRC.openId}`), $(`srcpop-${SRC.openId}`));
+}
+
+function goldenRunsFromSpans(spans, runId) {
+  const runs = {};
+  spans.forEach((span) => {
+    const sql = span.label === "bigquery.query" && span.fields ? String(span.fields.sql || "") : "";
+    if (!sql) return;
+    const id = sql.replace(/\.sql$/, "");
+    if (runs[id] && runs[id].started_ms > span.started_ms) return;
+    const outcome = span.outcome || {};
+    runs[id] = {
+      run_id: runId,
+      started_ms: span.started_ms,
+      rows: outcome.rows,
+      job_id: outcome.job_id,
+      state: span.state,
+      error: span.error,
+    };
+  });
+  return runs;
+}
+
+async function loadGoldenRuns() {
+  // The trace on screen wins, then the latest chat run, then any latest run.
+  const sources = [];
+  if (LAST_TRACED_SPANS.length) sources.push({ run_id: LAST_TRACED_RUN_ID, spans: LAST_TRACED_SPANS });
+  for (const url of ["/api/trace/latest?kind=chat", "/api/trace/latest"]) {
+    try {
+      const data = await fetchJson(url);
+      if (!sources.some((s) => s.run_id === data.run_id)) sources.push(data);
+    } catch (err) {
+      // 404 means no trace of that kind yet, which is a normal state.
+    }
+  }
+  const runs = {};
+  sources.forEach((src) => {
+    const found = goldenRunsFromSpans(srcList(src.spans), src.run_id);
+    Object.keys(found).forEach((id) => {
+      if (!runs[id]) runs[id] = found[id];
+    });
+  });
+  return runs;
+}
+
+function loadSourceData(spec) {
+  const token = ++SRC.token;
+  const stillCurrent = () => token === SRC.token;
+
+  if (!SRC.topics) {
+    SRC.topicsError = "";
+    fetchJson("/api/memory/topics")
+      .then((data) => { SRC.topics = data; })
+      .catch((err) => { SRC.topicsError = err.message; })
+      .finally(() => stillCurrent() && refreshSourceChips());
+  }
+  if (!SRC.contracts) {
+    SRC.contractsError = "";
+    fetchJson("/api/golden/contracts")
+      .then((data) => { SRC.contracts = srcList(data.contracts); })
+      .catch((err) => { SRC.contractsError = err.message; })
+      .finally(() => stillCurrent() && refreshSourceChips());
+  }
+
+  const names = srcList(spec.catalog_governance);
+  SRC.verdicts = {};
+  SRC.verdictsError = "";
+  SRC.verdictsState = names.length ? "loading" : "done";
+  if (names.length) {
+    fetchJson(`/api/catalog/verdicts?names=${encodeURIComponent(names.join(","))}`)
+      .then((data) => {
+        if (!stillCurrent()) return;
+        srcList(data.verdicts).forEach((v) => { SRC.verdicts[v.name] = pvValue(v.decision); });
+        SRC.verdictsState = "done";
+      })
+      .catch((err) => {
+        if (!stillCurrent()) return;
+        SRC.verdictsState = "error";
+        SRC.verdictsError = err.message;
+      })
+      .finally(() => stillCurrent() && refreshSourceChips());
+  }
+
+  SRC.goldenRuns = {};
+  SRC.goldenState = "loading";
+  loadGoldenRuns()
+    .then((runs) => { if (stillCurrent()) SRC.goldenRuns = runs; })
+    .finally(() => {
+      if (!stillCurrent()) return;
+      SRC.goldenState = "done";
+      refreshSourceChips();
+    });
+  refreshSourceChips();
+}
+
+function placeSrcPop(chip, pop) {
+  if (!chip || !pop) return;
+  const margin = 12;
+  const vw = document.documentElement.clientWidth;
+  const vh = window.innerHeight;
+  pop.style.maxHeight = "";
+  const r = chip.getBoundingClientRect();
+  const w = pop.offsetWidth;
+  // Clamp horizontally so the card never runs off the right edge.
+  const left = Math.max(margin, Math.min(r.left, vw - margin - w));
+  let h = pop.offsetHeight;
+  const below = vh - r.bottom - 8 - margin;
+  const above = r.top - 8 - margin;
+  let top;
+  if (h <= below) top = r.bottom + 8;
+  else if (h <= above) top = r.top - 8 - h;
+  else if (below >= above) { pop.style.maxHeight = `${below}px`; top = r.bottom + 8; }
+  else { pop.style.maxHeight = `${above}px`; h = above; top = r.top - 8 - h; }
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function openSrcPop(id, pin) {
+  clearTimeout(SRC.closeTimer);
+  const keepPinned = SRC.pinned && SRC.openId === id;
+  if (SRC.openId && SRC.openId !== id) closeSrcPop(false);
+  const chip = $(`srcchip-${id}`);
+  const pop = $(`srcpop-${id}`);
+  if (!chip || !pop) return;
+  pop.hidden = false;
+  chip.setAttribute("aria-expanded", "true");
+  SRC.openId = id;
+  SRC.pinned = keepPinned || !!pin;
+  placeSrcPop(chip, pop);
+}
+
+function closeSrcPop(returnFocus) {
+  clearTimeout(SRC.closeTimer);
+  if (!SRC.openId) return;
+  const chip = $(`srcchip-${SRC.openId}`);
+  const pop = $(`srcpop-${SRC.openId}`);
+  if (pop) pop.hidden = true;
+  if (chip) {
+    chip.setAttribute("aria-expanded", "false");
+    if (returnFocus) chip.focus();
+  }
+  SRC.openId = null;
+  SRC.pinned = false;
+}
+
+function softCloseSrcPop() {
+  if (SRC.pinned) return;
+  clearTimeout(SRC.closeTimer);
+  SRC.closeTimer = setTimeout(() => closeSrcPop(false), 180);
+}
+
+function wireSrcWrap(wrap) {
+  const id = wrap.dataset.pop;
+  const chip = wrap.querySelector(".src-chip");
+  wrap.addEventListener("mouseenter", () => openSrcPop(id, false));
+  wrap.addEventListener("mouseleave", softCloseSrcPop);
+  chip.addEventListener("click", () => {
+    if (SRC.openId === id && SRC.pinned) closeSrcPop(false);
+    else openSrcPop(id, true);
+  });
+  chip.addEventListener("focus", () => { if (SRC.openId !== id) openSrcPop(id, false); });
+  wrap.addEventListener("focusout", (e) => {
+    if (!wrap.contains(e.relatedTarget)) {
+      SRC.pinned = false;
+      softCloseSrcPop();
+    }
+  });
+  // Delegated because the popover body is re-rendered as data arrives.
+  wrap.addEventListener("click", (e) => {
+    if (e.target.closest("[data-close]")) closeSrcPop(true);
+  });
+}
+
+function wireSourcePopoverGlobals() {
+  // Capture phase so Esc closes an open card before the modal's own Esc handler closes the modal.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && SRC.openId) {
+      closeSrcPop(true);
+      e.stopPropagation();
+    }
+  }, true);
+  document.addEventListener("click", (e) => {
+    if (SRC.openId && !e.target.closest(".src-wrap")) closeSrcPop(false);
+  });
+  const reposition = () => {
+    if (SRC.openId) placeSrcPop($(`srcchip-${SRC.openId}`), $(`srcpop-${SRC.openId}`));
+  };
+  window.addEventListener("resize", reposition);
+  window.addEventListener("scroll", reposition, true);
+}
+
+// =========================================================================
+// Topic scoping panel (Memory A/B column). Filled from
+// GET /api/memory/topic-ab (backend/ui_insights.py:topic_ab). Only runs on
+// click: each run makes about 10 Memory Bank retrieve calls.
+// =========================================================================
+
+function signedMs(ms) {
+  const n = Number(ms);
+  return `${n >= 0 ? "+" : "−"}${Math.abs(n).toFixed(1)} ms`;
+}
+
+function pct(part, whole) {
+  return whole ? Math.round((100 * part) / whole) : 0;
+}
+
+function tsSegBar(label, own, total, topK) {
+  const other = total - own;
+  // Width is out of top_k so a 4/4 row reads as a shorter bar, not a full one.
+  const unit = 100 / Math.max(topK, total, 1);
+  const parts = [`<b class="own" style="width:${own * unit}%"></b>`];
+  if (other) parts.push(`<b class="other" style="width:${other * unit}%"></b>`);
+  const aria = `${label}: ${own} of ${total} on own topics` + (other ? `, ${other} from other channels' topics` : "");
+  return `<div class="ts-bar"><span class="lbl">${label}</span>
+    <span class="seg" role="img" aria-label="${escapeHtml(aria)}">${parts.join("")}</span>
+    <span class="val">${own}/${total}</span></div>`;
+}
+
+function tsSideCounts(side) {
+  return side && side.on_topic ? [pvValue(side.on_topic), pvValue(side.returned)] : null;
+}
+
+function tsRow(agent, topK) {
+  const idx = String(pvValue(agent.agent_id)).slice(0, 2);
+  const topics = srcList(pvValue(agent.topics));
+  const base = tsSideCounts(agent.baseline);
+  const filt = tsSideCounts(agent.filtered);
+  const extra = pvValue(agent.extra_ms);
+  const msTag = extra === NOT_RECORDED
+    ? `<span class="tag ms-tag" title="${escapeHtml(pvSource(agent.extra_ms))}">n/r</span>`
+    : `<span class="tag ms-tag" title="time with the filter on minus time without it, one call each">${signedMs(extra)}</span>`;
+
+  const notes = [];
+  if (!filt) notes.push(`Filter not applied: ${pvSource(agent.filtered)}.`);
+  else if (filt[1] < topK) notes.push(`Returned ${filt[1]}, not ${topK}: only ${filt[1]} of this customer's memories carry these topics.`);
+
+  const dropped = srcList(pvValue(agent.dropped));
+  const added = srcList(pvValue(agent.added));
+  let details = "";
+  if (filt) {
+    const items = dropped.length
+      ? dropped.map((m) => {
+          const tags = m.topics.length ? m.topics.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("") : `<span class="tag">no topic</span>`;
+          return `<li>"${escapeHtml(m.fact)}" ${tags}</li>`;
+        }).join("")
+      : `<li class="none">Nothing dropped: every unfiltered result was already on topic.</li>`;
+    const replaced = added.length
+      ? `<p class="row-note">${added.length} on-topic ${added.length === 1 ? "memory" : "memories"} took their place.</p>`
+      : "";
+    details = `<details><summary>${dropped.length} ${dropped.length === 1 ? "memory" : "memories"} dropped by the filter</summary>
+      <ul class="dropped">${items}</ul>${replaced}</details>`;
+  }
+
+  return `<div class="item scope-row">
+    <div class="item-top"><span class="nm">${escapeHtml(idx)} · ${escapeHtml(pvText(agent.name))}</span>${msTag}</div>
+    <div class="ts-topics">${topics.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("")}</div>
+    ${base ? tsSegBar("query only", base[0], base[1], topK) : ""}
+    ${filt ? tsSegBar("with filter", filt[0], filt[1], topK) : `<div class="ts-bar"><span class="lbl">with filter</span><span class="nr">n/r</span><span></span></div>`}
+    ${notes.map((n) => `<p class="row-note">${escapeHtml(n)}</p>`).join("")}
+    ${details}
+  </div>`;
+}
+
+function renderTopicScoping(data) {
+  const topK = Number(pvValue(data.top_k));
+  const agents = srcList(data.agents);
+  const t = data.totals || {};
+  const ranAt = String(pvValue(data.ran_at)).replace("T", " ").replace("+00:00", " UTC");
+  $("tsMeta").innerHTML =
+    `Customer <b>${escapeHtml(pvText(data.customer_id))}</b> · top ${topK} per agent · ` +
+    `same query and scope on both sides · ran ${escapeHtml(ranAt)}`;
+  $("tsRows").innerHTML = agents.map((a) => tsRow(a, topK)).join("");
+
+  const measured = pvValue(t.measured_agents) || 0;
+  const total = $("tsTotal");
+  const caption = $("tsCaption");
+  if (!measured) {
+    total.hidden = true;
+    caption.hidden = true;
+    return;
+  }
+  const [bh, bn, fh, fn] = ["baseline_on_topic", "baseline_returned", "filtered_on_topic", "filtered_returned"].map((k) => pvValue(t[k]));
+  const other = pvValue(t.baseline_other_topics);
+  const who = measured === agents.length ? `All ${measured} agents` : `${measured} of ${agents.length} agents (the rest had no filter)`;
+  total.innerHTML =
+    `<div>${who}, memories on their own topics:</div>` +
+    `<div class="big">${bh}/${bn} (${pct(bh, bn)}%) → ${fh}/${fn} (${pct(fh, fn)}%)</div>` +
+    `<div>Average time change with the filter on: <b>${signedMs(pvValue(t.avg_extra_ms))}</b> per call.</div>`;
+  total.hidden = false;
+  caption.innerHTML =
+    `<b>How to read this.</b> The filter only lets through memories tagged with the agent's own topics, ` +
+    `so everything after it should be on topic by design (this run: ${fh}/${fn}). That part is not a result. ` +
+    `The useful part is the "before" side: without the filter, ${other} of ${bn} memories (${pct(other, bn)}%) ` +
+    `the agents read came from other channels' topics. This does <b>not</b> show that answers got better yet. ` +
+    `We haven't checked answer quality. Timings are one run per side, so treat them as rough.`;
+  caption.hidden = false;
+}
+
+async function runTopicAb() {
+  const btn = $("btnRunTopicAb");
+  const status = $("tsStatus");
+  const customer = STATE.customerId;
+  btn.disabled = true;
+  btn.textContent = "⏳ Running live A/B…";
+  status.textContent = `Calling Memory Bank for ${customer}: 5 agents × 2 retrieve calls…`;
+  try {
+    const data = await fetchJson(`/api/memory/topic-ab?customer_id=${encodeURIComponent(customer)}`);
+    renderTopicScoping(data);
+    status.textContent = "Done. Run it again to take a fresh measurement.";
+  } catch (err) {
+    $("tsMeta").textContent = "n/r · the last run failed";
+    $("tsRows").innerHTML = `<div class="ts-error">Couldn't run the A/B: ${escapeHtml(err.message)}. Nothing here is from that attempt.</div>`;
+    $("tsTotal").hidden = true;
+    $("tsCaption").hidden = true;
+    status.textContent = "Failed. Try again once Memory Bank is reachable.";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "▶ Run live A/B";
+  }
+}
+
+// =========================================================================
+// ACTION BOARD
+// Items come from GET /api/action-board (backend/action_board.py:list_items).
+// Buttons only appear when backend/action_board.py:act would accept them, so a
+// 409 means the item changed underneath us, not that we offered a bad button.
+// =========================================================================
+const BOARD = { items: [], customer: null, busy: new Set() };
+
+const BOARD_KIND_LABEL = {
+  UNVERIFIED_CLAIM: "Unverified claim",
+  CONSENT_DISPUTE: "Consent dispute",
+  CONTRADICTED_CLAIM: "Claim contradicted by telemetry",
+  SUSPICIOUS_CLAIM: "Suspicious claim",
+  QUARANTINED_CLAIM: "Quarantined claim",
+  CHECK_FAILED: "Veracity check failed",
+  FOLLOW_UP: "Bank follow-up",
+  FRAUD_ESCALATION: "Fraud escalation",
+};
+const BOARD_STANDING = {
+  trusted: ["b-ok", "Trusted"],
+  pending_review: ["b-amb", "Pending review"],
+  quarantine: ["b-no", "Quarantined"],
+};
+const BOARD_STATUS = { OPEN: "b-amb", ESCALATED: "b-no", CLOSED: "b-ok" };
+const BOARD_ACTION_LABEL = {
+  APPROVE: "✓ Approve claim",
+  REJECT: "✕ Reject claim",
+  ESCALATE: "↑ Escalate",
+  FULFIL: "✓ Mark fulfilled",
+  CLOSE: "Close",
+};
+const SLOW_BOARD_ACTIONS = new Set(["APPROVE", "REJECT"]);
+
+function boardCustomer() {
+  const chip = $("customerSelect");
+  return (chip && chip.dataset.value) || STATE.customerId;
+}
+
+function boardActionsFor(item) {
+  if (item.status === "CLOSED") return [];
+  const actions = [];
+  if (item.standing !== "trusted") actions.push("APPROVE", "REJECT");
+  if (item.kind === "FOLLOW_UP") actions.push("FULFIL");
+  if (item.status !== "ESCALATED") actions.push("ESCALATE");
+  actions.push("CLOSE");
+  return actions;
+}
+
+function boardText(value) {
+  return value === undefined || value === null || value === "" ? NOT_RECORDED : String(value);
+}
+
+function boardWhen(iso) {
+  return iso ? String(iso).slice(0, 16).replace("T", " ") + " UTC" : NOT_RECORDED;
+}
+
+function boardBadge(cls, text) {
+  return `<span class="bd ${cls}">${escapeHtml(text)}</span>`;
+}
+
+function renderBoardHistory(history) {
+  if (!history.length) return "";
+  const rows = history.map((h) => {
+    const note = h.note ? ` · “${escapeHtml(h.note)}”` : "";
+    const reply = h.reply ? `<div class="bh-reply">Reply added to transcript: “${escapeHtml(h.reply)}”</div>` : "";
+    return `<li><b>${escapeHtml(boardText(h.action))}</b> by ${escapeHtml(boardText(h.actor))} · ${boardWhen(h.at)}${note}${reply}</li>`;
+  }).join("");
+  return `<details class="bi-history"><summary>History (${history.length})</summary><ul>${rows}</ul></details>`;
+}
+
+function renderBoardItem(item) {
+  const sid = String(item.session_id || "");
+  const actions = boardActionsFor(item);
+  const busy = BOARD.busy.has(sid);
+  const [standingCls, standingText] = BOARD_STANDING[item.standing] || ["b-nr", boardText(item.standing)];
+  const facts = Array.isArray(item.facts) ? item.facts : [];
+  const tags = Array.isArray(item.tags) ? item.tags : [];
+  const history = Array.isArray(item.history) ? item.history : [];
+  const claim = item.claim_text && item.claim_text !== NOT_RECORDED
+    ? `<blockquote class="bi-claim">${escapeHtml(item.claim_text)}</blockquote>` : "";
+  const factList = facts.length
+    ? `<ul class="bi-facts">${facts.map((f) => `<li>${escapeHtml(f)}</li>`).join("")}</ul>` : "";
+  const body = claim || factList || `<p class="bi-line">${nrSpan("no claim text or facts on this item")}</p>`;
+  const resolution = item.resolution ? ` · ${escapeHtml(item.resolution)}` : "";
+
+  let controls = "";
+  if (actions.length) {
+    const buttons = actions.map((a) =>
+      `<button type="button" class="chip bi-act${a === "REJECT" ? " danger" : ""}" data-board-action="${a}" ${busy ? "disabled" : ""}>${BOARD_ACTION_LABEL[a]}</button>`
+    ).join("");
+    controls = `
+      <div class="bi-controls">
+        <label class="bi-field">Note for the audit trail
+          <input type="text" class="bi-note" maxlength="500" placeholder="Why you're taking this action" ${busy ? "disabled" : ""}></label>
+        <label class="bi-field">Reply (used by Close)
+          <textarea class="bi-reply" rows="2" maxlength="2000" placeholder="What you'd tell the customer" ${busy ? "disabled" : ""}></textarea></label>
+        <p class="bi-honest">Reply is added to the session transcript. It is not sent to the customer (no messaging client).</p>
+        <div class="bi-buttons">${buttons}</div>
+        <div class="bi-tagrow">
+          <input type="text" class="bi-tags" placeholder="tags, comma separated" aria-label="Tags" ${busy ? "disabled" : ""}>
+          <button type="button" class="chip bi-act" data-board-action="TAG" ${busy ? "disabled" : ""}>+ Tag</button>
+        </div>
+      </div>`;
+  }
+
+  return `
+    <article class="bi${item.priority === "HIGH" ? " high" : ""}" data-session="${escapeHtml(sid)}">
+      <div class="bi-top">
+        ${boardBadge(item.priority === "HIGH" ? "b-no" : "b-nr", boardText(item.priority))}
+        <span class="bi-kind">${escapeHtml(BOARD_KIND_LABEL[item.kind] || boardText(item.kind))}</span>
+        ${boardBadge(BOARD_STATUS[item.status] || "b-nr", boardText(item.status))}
+      </div>
+      <p class="bi-line"><b>${escapeHtml(boardText(item.customer_name))}</b> (${escapeHtml(boardText(item.customer_id))}) · ${escapeHtml(boardText(item.channel))} · ${boardWhen(item.created_at)}</p>
+      ${body}
+      <p class="bi-line">Memory standing: ${boardBadge(standingCls, standingText)} · Veracity verdict: <b>${escapeHtml(boardText(item.verdict))}</b>${resolution}</p>
+      ${tags.length ? `<p class="bi-line">Tags: ${tags.map((t) => `<span class="bi-tag">${escapeHtml(t)}</span>`).join(" ")}</p>` : ""}
+      <p class="bi-line bi-sid">session ${escapeHtml(sid || NOT_RECORDED)}</p>
+      ${renderBoardHistory(history)}
+      ${controls}
+      <div class="bi-msg" role="status"></div>
+    </article>`;
+}
+
+function renderBoard() {
+  const list = $("boardList");
+  if (!list) return;
+  const open = BOARD.items.filter((i) => i.status !== "CLOSED").length;
+  $("boardCount").textContent = `${open} open · ${BOARD.items.length} shown`;
+  list.innerHTML = BOARD.items.length
+    ? BOARD.items.map(renderBoardItem).join("")
+    : `<p class="board-empty">Nothing on the board for ${escapeHtml(BOARD.customer)}${$("boardShowClosed").checked ? "" : " (closed items hidden)"}.</p>`;
+}
+
+async function loadActionBoard() {
+  const status = $("boardStatus");
+  const btn = $("btnBoardRefresh");
+  if (!status) return;
+  BOARD.customer = boardCustomer();
+  $("boardScope").textContent = `Customer: ${BOARD.customer}`;
+  const closed = $("boardShowClosed").checked ? "&include_closed=1" : "";
+  btn.disabled = true;
+  status.textContent = "Loading from Memory Bank sessions…";
+  try {
+    const data = await fetchJson(`/api/action-board?customer_id=${encodeURIComponent(BOARD.customer)}${closed}`);
+    const items = pvValue(data.items);
+    BOARD.items = Array.isArray(items) ? items : [];
+    renderBoard();
+    status.textContent = `Read live from ${pvSource(data.items)}.`;
+  } catch (err) {
+    BOARD.items = [];
+    $("boardCount").textContent = "n/r · load failed";
+    $("boardList").innerHTML = `<div class="board-error">Couldn't load the Action Board: ${escapeHtml(err.message)}. Nothing shown here is from that attempt.</div>`;
+    status.textContent = "";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runBoardAction(card, action) {
+  const sid = card.dataset.session;
+  const msg = () => document.querySelector(`.bi[data-session="${CSS.escape(sid)}"] .bi-msg`);
+  const body = {
+    action,
+    note: card.querySelector(".bi-note")?.value.trim() || "",
+    reply: action === "CLOSE" ? card.querySelector(".bi-reply")?.value.trim() || "" : "",
+    tags: action === "TAG"
+      ? (card.querySelector(".bi-tags")?.value || "").split(",").map((t) => t.trim()).filter(Boolean)
+      : [],
+  };
+  if (action === "TAG" && !body.tags.length) {
+    card.querySelector(".bi-msg").textContent = "Type at least one tag first.";
+    return;
+  }
+
+  BOARD.busy.add(sid);
+  card.querySelectorAll("button, input, textarea").forEach((el) => { el.disabled = true; });
+  const started = Date.now();
+  const slow = SLOW_BOARD_ACTIONS.has(action);
+  const tick = () => {
+    const secs = Math.round((Date.now() - started) / 1000);
+    const m = msg();
+    if (m) m.innerHTML = `<span class="bi-busy">${escapeHtml(action)} in progress · ${secs}s` +
+      (slow ? " · this moves the session's memories to a new scope, usually 10-20 s" : "") + "</span>";
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+
+  let note = "";
+  try {
+    const resp = await fetch(`/api/action-board/${encodeURIComponent(sid)}/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      note = `<span class="bi-err">${resp.status === 409 ? "Not applied" : "Failed"}: ${escapeHtml(data.error || `HTTP ${resp.status}`)}</span>`;
+    } else {
+      const updated = pvValue(data.item);
+      if (updated && typeof updated === "object") {
+        BOARD.items = BOARD.items.map((i) => (i.session_id === sid ? { ...updated, session_id: sid } : i));
+      }
+      const delivery = body.reply
+        ? ` Reply delivery: ${escapeHtml(pvText(data.reply_delivery))} · ${escapeHtml(pvSource(data.reply_delivery))}.` : "";
+      note = `<span class="bi-ok">${escapeHtml(action)} recorded in the session.${delivery}</span>`;
+    }
+  } catch (err) {
+    note = `<span class="bi-err">Failed: ${escapeHtml(err.message)}</span>`;
+  } finally {
+    clearInterval(timer);
+    BOARD.busy.delete(sid);
+    renderBoard();
+    const m = msg();
+    if (m) m.innerHTML = note;
+  }
+}
+
+function wireActionBoard() {
+  const list = $("boardList");
+  if (!list) return;
+  list.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-board-action]");
+    if (!btn || btn.disabled) return;
+    runBoardAction(btn.closest(".bi"), btn.dataset.boardAction);
+  });
+  $("btnBoardRefresh").addEventListener("click", loadActionBoard);
+  $("boardShowClosed").addEventListener("change", loadActionBoard);
+  // The mast customer chip has no change handler of its own yet; watching its
+  // data-value keeps the board on whichever customer it shows.
+  const chip = $("customerSelect");
+  if (chip) {
+    new MutationObserver(() => {
+      if (boardCustomer() !== BOARD.customer) loadActionBoard();
+    }).observe(chip, { attributes: true, attributeFilter: ["data-value"] });
+  }
 }
 
 async function runSingleAgentLiveFromModal() {
@@ -2130,49 +2900,77 @@ function renderGovernanceTraps(spans) {
     }
   }
 
+  function renderCompactionResult(report) {
+    const out = $("compactionResult");
+    if (!out) return;
+    const lineageItem = report.memory_lineage;
+    const lineage = pvValue(lineageItem);
+    const before = `<div>Memories in scope before: <b>${escapeHtml(pvText(report.memories_in_scope_before))}</b> · token saving: ${escapeHtml(pvText(report.token_reduction_pct))} <span class="nr">(${escapeHtml(pvSource(report.token_reduction_pct))})</span></div>`;
+    if (!lineage || typeof lineage !== "object") {
+      out.innerHTML = before + `<div>${nrSpan(pvSource(lineageItem))}</div>`;
+      return;
+    }
+    const [standingCls, standingText] = BOARD_STANDING[lineage.standing] || ["b-nr", boardText(lineage.standing)];
+    const generated = Array.isArray(lineage.generated) ? lineage.generated : [];
+    const genList = generated.length
+      ? `<ul>${generated.map((g) => `<li>${escapeHtml(boardText(g.action))} · <code>${escapeHtml(String(g.name || NOT_RECORDED).split("/").pop())}</code></li>`).join("")}</ul>`
+      : ` ${nrSpan("the generate call returned no memories")}`;
+    const record = lineage.claim_record;
+    const recordLine = record && record.fact
+      ? `<div>Claim record written: “${escapeHtml(record.fact)}”</div>`
+      : `<div>Claim record: ${nrSpan("none; trusted sessions don't get one")}</div>`;
+    const board = lineage.action_board;
+    const boardLine = board && board.kind
+      ? `<div>Action Board: new ${escapeHtml(BOARD_KIND_LABEL[board.kind] || board.kind)} item (${escapeHtml(boardText(board.priority))}).</div>`
+      : `<div>Action Board: no item raised.</div>`;
+    const error = lineage.check_error ? `<div class="bi-err">Veracity check failed: ${escapeHtml(lineage.check_error)}</div>` : "";
+    out.innerHTML = before +
+      `<div>Session <code>${escapeHtml(String(lineage.session_name || NOT_RECORDED).split("/").pop())}</code> · standing ${boardBadge(standingCls, standingText)} · verdict <b>${escapeHtml(boardText(lineage.verdict))}</b></div>` +
+      `<div>Generated (${generated.length}):${genList}</div>` + recordLine + boardLine + error;
+  }
+
   async function runMemoryCompaction() {
     const btn = $("btnRunCompaction");
+    const out = $("compactionResult");
+    const customer = boardCustomer();
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Triggering consolidation...";
+      btn.textContent = "Running consolidation…";
     }
+    if (out) out.textContent = `Re-running ${customer}'s newest session through the verified write path…`;
     setLivePulseState("running");
 
     try {
       const resp = await fetch("/api/compaction/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ customer_id: DEFAULT_CUSTOMER_ID }),
+        body: JSON.stringify({ customer_id: customer }),
       });
-      const data = await resp.json();
+      const data = await resp.json().catch(() => ({}));
 
       if (!resp.ok) {
-        if (btn) btn.textContent = `✗ ${data.status || resp.status}`;
         setLivePulseState(AGENTS.length ? "done" : "idle");
-        console.error("Compaction failed:", data);
+        if (out) out.innerHTML = `<span class="bi-err">Consolidation failed: ${escapeHtml(data.error || data.status || `HTTP ${resp.status}`)}</span>`;
         return;
       }
 
-      const report = data.compaction_report || {};
-      const pct = pvText(report.token_reduction_pct);
-      const before = pvText(report.memories_in_scope_before);
-      if (btn) {
-        btn.textContent = `Consolidation requested · ${before} in scope · saved ${pct}`;
-        btn.title = `${pvTag(report.token_reduction_pct)} · ${pvSource(report.token_reduction_pct)}`;
-      }
+      renderCompactionResult(data.compaction_report || {});
       if (data.run_id) {
         await fetchAndRenderTrace(data.run_id);
       }
       if (data.tool_trajectory) {
         renderToolTrajectoryTags(data.tool_trajectory, data.run_id);
       }
-      await loadLiveTestbed(DEFAULT_CUSTOMER_ID);
+      loadActionBoard();
+      await loadLiveTestbed(customer);
     } catch (err) {
       setLivePulseState(AGENTS.length ? "done" : "idle");
-      console.error("Compaction error:", err);
-      if (btn) btn.textContent = `✗ ${err.message}`;
+      if (out) out.innerHTML = `<span class="bi-err">Consolidation failed: ${escapeHtml(err.message)}</span>`;
     } finally {
-      if (btn) btn.disabled = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "▶ Run consolidation";
+      }
     }
   }
 
@@ -2417,6 +3215,15 @@ function renderGovernanceTraps(spans) {
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") closeAgentCardModal();
     });
+    wireSourcePopoverGlobals();
+
+    // 11. Topic scoping panel: runs only when asked, never on load.
+    const btnTopicAb = $("btnRunTopicAb");
+    if (btnTopicAb) btnTopicAb.addEventListener("click", runTopicAb);
+
+    // 12. Action Board (app.js:loadActionBoard): one sessions.list call, so it loads on open.
+    wireActionBoard();
+    loadActionBoard();
 
     // Hydrate the 8-agent Pipeline immediately at 0ms using FALLBACK_DESK_AGENTS
     ALL_DESK_AGENTS = buildDeskAgentEntries({ agents: FALLBACK_DESK_AGENTS }, [], "");

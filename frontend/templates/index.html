@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
-<link rel="stylesheet" href="/static/css/styles.css?v=20260924e">
+<link rel="stylesheet" href="/static/css/styles.css?v=20260924g">
 </head>
 <body>
 
@@ -165,6 +165,28 @@
         <p class="fine">Loading the off-vs-on comparison…</p>
       </div>
 
+      <!-- Topic scoping: filled by renderTopicScoping() in app.js from
+           GET /api/memory/topic-ab (backend/ui_insights.py:topic_ab). Not run on
+           load because each run makes about 10 Memory Bank retrieve calls. -->
+      <section class="ts-panel" aria-labelledby="tsTitle">
+        <div class="colhead">
+          <h2 id="tsTitle">Topic scoping</h2>
+          <span class="n">5 channel agents</span>
+        </div>
+        <p class="ts-meta" id="tsMeta">n/r · not run yet</p>
+        <div class="ts-legend" aria-hidden="true">
+          <span><i class="sw-own"></i>own topics</span>
+          <span><i class="sw-other"></i>other channels' topics</span>
+        </div>
+        <div id="tsRows" aria-live="polite"></div>
+        <div class="ts-total" id="tsTotal" hidden></div>
+        <p class="ts-caption" id="tsCaption" hidden></p>
+        <div class="ts-actions">
+          <button type="button" class="chip" id="btnRunTopicAb">▶ Run live A/B</button>
+          <span class="ts-status" id="tsStatus">Runs each channel agent's query twice, without and with its topic filter.</span>
+        </div>
+      </section>
+
       <p class="fine" id="abFootnote"></p>
     </div>
 
@@ -210,6 +232,26 @@
       </div>
     </div>
   </div>
+
+  <!-- Action Board: claims and follow-ups waiting for a person. Filled by
+       loadActionBoard() in app.js from GET /api/action-board
+       (backend/action_board.py:list_items); actions go to
+       POST /api/action-board/<session_id>/action (backend/action_board.py:act). -->
+  <section class="deck board-deck" id="actionBoard" aria-labelledby="boardTitle">
+    <div class="col">
+      <div class="colhead">
+        <h2 id="boardTitle">Action Board</h2>
+        <span class="n" id="boardCount">n/r · not loaded</span>
+      </div>
+      <div class="board-bar">
+        <span class="board-scope" id="boardScope">Customer: n/r</span>
+        <label class="board-check"><input type="checkbox" id="boardShowClosed"> Show closed items</label>
+        <button type="button" class="chip" id="btnBoardRefresh">↻ Refresh</button>
+        <span class="board-status" id="boardStatus" aria-live="polite"></span>
+      </div>
+      <div class="board-list" id="boardList" aria-live="polite"></div>
+    </div>
+  </section>
 
   <!-- ============ COLLAPSIBLE LIVE RESPONSE & OPERATIONS DRAWER ============ -->
   <div class="deck drawer-deck" id="consoleDrawer" style="display:none;">
@@ -287,6 +329,7 @@
                count, so the saving is filled in from the response or left n/r.
                The label used to assert 68.8% before the click. -->
           <button type="button" class="chip" id="btnRunCompaction">▶ Run consolidation</button>
+          <div class="compaction-result" id="compactionResult" aria-live="polite"></div>
         </div>
       </div>
 
@@ -361,21 +404,15 @@
     <p class="agent-modal-desc" id="agentModalDesc"></p>
 
     <div class="agent-modal-grid">
-      <div class="agent-spec-row">
-        <div class="spec-label">🧠 Memory Bank Topics Scoped</div>
-        <div class="spec-pills" id="agentModalTopics"></div>
-      </div>
-      <div class="agent-spec-row">
-        <div class="spec-label">🛡️ Dataplex Catalog Governance</div>
-        <div class="spec-pills" id="agentModalGovernance"></div>
-      </div>
-      <div class="agent-spec-row">
-        <div class="spec-label">🏛️ Authorized BigQuery Golden Queries</div>
-        <div class="spec-pills" id="agentModalGoldenQueries"></div>
+      <!-- Chips and popovers are drawn by renderSourceChips() in app.js. -->
+      <div class="agent-spec-row src-row">
+        <div class="spec-label">Where this agent's inputs come from</div>
+        <p class="src-hint">Hover, tap, or tab to a card to see details. Esc closes it.</p>
+        <div class="src-chips" id="agentModalSrcChips"></div>
       </div>
       <div class="agent-spec-row">
         <div class="spec-label">🔧 Bound ADK Tools <span id="agentModalToolsCount"></span></div>
-        <div class="spec-pills" id="agentModalBoundTools"></div>
+        <div class="spec-pills pill-row" id="agentModalBoundTools"></div>
       </div>
     </div>
 
@@ -391,6 +428,6 @@
   </div>
 </div>
 
-<script src="/static/js/app.js?v=20260924e"></script>
+<script src="/static/js/app.js?v=20260924g"></script>
 </body>
 </html>

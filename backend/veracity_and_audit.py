@@ -682,7 +682,12 @@ RULES:
 2. An avenue whose rows are "n/r" is not evidence for or against the claim. Do not treat an unread source as a clean bill of health.
 3. Amounts, deadlines and dispute ids come from BigQuery rows only. If the claim quotes a figure, check amount_cross_check.match_by_amount and state the result.
 4. Where catalog_authorization shows a declined table or column, say the agent declined it and cite the aspect in aspect_cited. Never imply Dataplex blocked the read.
-5. Choose the veracity status the rows support. If the rows are thin, UNVERIFIED_PENDING_INVESTIGATION is the correct answer, not a confident one.
+5. Choose the veracity status the rows support. If the rows are thin, UNVERIFIED_PENDING_INVESTIGATION is the correct answer, not a confident one. The statuses mean:
+   - VERIFIED_TRUE: rows directly confirm what the customer said.
+   - CONTRADICTED_BY_TELEMETRY: rows directly contradict a specific detail of the claim (date, place, amount, card).
+   - SUSPICIOUS_FALSE_CLAIM: rows contradict the claim and the claim asks for money, credit, a limit or an entitlement the rows show is not owed.
+   - PARTIALLY_VERIFIED_CONSENT_DISPUTE: rows confirm the transaction happened, but the customer says they did not authorise it, and the rows cannot settle who did.
+   - UNVERIFIED_PENDING_INVESTIGATION: no row confirms or denies the claim, for example because no table records that kind of fact.
 6. Each corroborating_telemetry entry must name its table and golden query id.
 """.format(
             customer_id=customer_id,
@@ -751,7 +756,7 @@ RULES:
 
         The claim is stored as a Memory Bank session and memories are generated
         from it into the scope the verdict picks (trusted or quarantine), via
-        backend/memory_write_path.py:generate_with_lineage.
+        backend/memory_write_path.py:record.
         """
         evaluation = self.validate_claim_against_telemetry(
             customer_id=customer_id,
@@ -766,8 +771,15 @@ RULES:
                            "intent": "CLAIM_VALIDATION"},
         )
         self.memory.append_event(session_name, "customer", claim_text)
-        lineage = memory_write_path.generate_with_lineage(
-            self.memory, session_name, customer_id, evaluation.veracity_status.value)
+        # Imported here because adk_agents imports this module at load time.
+        from backend.adk_agents import customer_display_name
+
+        lineage = memory_write_path.record(
+            self.memory, session_name,
+            memory_write_path.Claim(customer_id, claim_text, channel.value),
+            evaluation.veracity_status.value,
+            name_lookup=customer_display_name,
+        )
 
         fragment = MemoryFragment(
             fragment_id="MEM-%s" % uuid.uuid4().hex[:10].upper(),
@@ -783,12 +795,13 @@ RULES:
             veracity_evaluation=evaluation,
         )
 
-        if "corpus" in lineage["scope"]:
+        if lineage["standing"] != memory_write_path.Standing.TRUSTED:
             LOG.warning(
-                "Claim %s for %s is %s; its memories went to the quarantine scope.",
+                "Claim %s for %s is %s; its memories went to %s and the Action Board.",
                 evaluation.claim_id,
                 customer_id,
                 evaluation.veracity_status.value,
+                lineage["standing"],
             )
         return fragment
 

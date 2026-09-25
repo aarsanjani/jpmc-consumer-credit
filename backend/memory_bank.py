@@ -375,7 +375,7 @@ class MemoryBankClient:
     # -- memories ----------------------------------------------------------
 
     def generate_from_session(self, session_name: str, scope: Dict[str, str],
-                              ignore_consolidation: bool = False,
+                              disable_consolidation: bool = False,
                               wait: bool = True) -> Dict[str, Any]:
         """Asks the service to extract memories from a session.
 
@@ -387,14 +387,14 @@ class MemoryBankClient:
             "vertexSessionSource": {"session": session_name},
             "scope": scope,
         }
-        if ignore_consolidation:
-            body["ignoreConsolidation"] = True
+        if disable_consolidation:
+            body["disableConsolidation"] = True
 
         operation = self._request("POST", self.base_url + "/memories:generate", body)
         return self.wait_for_operation(operation) if wait else operation
 
     def generate_from_contents(self, turns: Iterable[Dict[str, str]], scope: Dict[str, str],
-                               ignore_consolidation: bool = False,
+                               disable_consolidation: bool = False,
                                wait: bool = True) -> Dict[str, Any]:
         """Extracts memories from raw turns, with no session involved.
 
@@ -413,8 +413,8 @@ class MemoryBankClient:
             "directContentsSource": {"events": [{"content": c} for c in contents]},
             "scope": scope,
         }
-        if ignore_consolidation:
-            body["ignoreConsolidation"] = True
+        if disable_consolidation:
+            body["disableConsolidation"] = True
 
         operation = self._request("POST", self.base_url + "/memories:generate", body)
         return self.wait_for_operation(operation) if wait else operation
@@ -558,6 +558,11 @@ class MemoryBankClient:
                 "not a bare id."
             )
         return self._request("DELETE", "https://%s/%s/%s" % (self.host, self.api_version, memory_name))
+
+    def get_memory(self, memory_name: str) -> Dict[str, Any]:
+        if not memory_name or "/memories/" not in memory_name:
+            raise ValueError("memory_name must be the full resource name the service returned.")
+        return self._request("GET", "https://%s/%s/%s" % (self.host, self.api_version, memory_name))
 
     def update_memory(self, memory_name: str, fact: str) -> Dict[str, Any]:
         """Corrects the fact of one memory in place; the service keeps the old

@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock for review: topic scoping and agent card</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="../css/styles.css?v=20260924d">
+<style>
+  /* Mock-only styles. Every text/background pair here is dark-on-light or
+     white-on-ink, because light-blue or white text on cream was hard to read before. */
+  :root {
+    --ok-bg: #e2f2e8;  --ok-ink: #0d5530;
+    --amb-bg: #fdf0cf; --amb-ink: #6b3f00; --amb-line: #b5651d;
+    --no-bg: #fbe1dc;  --no-ink: #8f1a0d;
+    --nr-ink: #3f3e39;
+  }
+
+  .mock-banner {
+    background: var(--warn-bg);
+    color: var(--ink);
+    border-bottom: 2px solid var(--line);
+    font-family: var(--mono);
+    font-size: 12.5px;
+    font-weight: 700;
+    padding: 10px 20px;
+    text-align: center;
+  }
+  .mock-banner span { font-weight: 400; }
+
+  .sec-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 30px 0 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .where {
+    font-size: 11px;
+    color: var(--ink);
+    background: var(--rail);
+    border: 1px solid var(--hair);
+    padding: 3px 8px;
+  }
+  .intro { max-width: 78ch; font-size: 12.5px; margin: 16px 0 0; }
+
+  /* Stand-ins for the parts of the real page this mock does not change. */
+  .placeholder {
+    border: 1px dashed var(--muted);
+    background: var(--paper);
+    color: var(--ink);
+    font-size: 11px;
+    padding: 10px 12px;
+  }
+
+  /* ---------- Piece 1: topic scoping ---------- */
+  .ts-panel { margin-top: 14px; }
+  .ts-meta { font-size: 10.5px; color: var(--ink); margin: 0 0 10px; line-height: 1.5; }
+  .ts-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 10.5px; color: var(--ink); margin-bottom: 10px; }
+  .ts-legend i { display: inline-block; width: 10px; height: 10px; vertical-align: -1px; margin-right: 5px; border: 1px solid var(--line); }
+  .sw-own { background: var(--ink); }
+  .sw-other { background: repeating-linear-gradient(45deg, var(--pink) 0 3px, #f7e6d4 3px 6px); }
+
+  .scope-row { padding: 10px 11px; }
+  .scope-row .item-top { justify-content: space-between; }
+  .scope-row .nm { flex: 1 1 auto; }
+  .ms-tag { color: var(--ink); border-color: var(--line); }
+  .topics { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 8px; }
+  .topics .tag { color: var(--ink); border-color: var(--hair); background: var(--paper); font-weight: 500; }
+
+  .bar {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr) 30px;
+    gap: 8px;
+    align-items: center;
+    font-size: 10.5px;
+    padding: 2px 0;
+  }
+  .bar .lbl { color: var(--ink); }
+  .bar .val { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .seg { display: flex; height: 9px; border: 1px solid var(--line); background: var(--rail); }
+  .seg b { display: block; height: 100%; }
+  .seg .own { background: var(--ink); }
+  .seg .other { background: repeating-linear-gradient(45deg, var(--pink) 0 3px, #f7e6d4 3px 6px); }
+  .seg b + b { border-left: 1px solid var(--line); }
+
+  .scope-row details { margin-top: 6px; border-top: 1px solid var(--hair); padding-top: 5px; }
+  .scope-row summary { cursor: pointer; font-size: 10.5px; color: var(--ink); font-weight: 700; }
+  .dropped { list-style: none; margin: 6px 0 0; padding: 0; }
+  .dropped li { font-size: 10.5px; line-height: 1.45; padding: 5px 0; border-bottom: 1px solid var(--hair); color: var(--ink); }
+  .dropped li:last-child { border-bottom: 0; }
+  .dropped .tag { margin-left: 4px; color: var(--ink); border-color: var(--pink); background: var(--pink-soft); }
+  .dropped .none { color: var(--nr-ink); font-style: italic; }
+  .row-note { font-size: 10px; color: var(--ink); margin: 4px 0 0; }
+
+  .ts-total {
+    background: var(--ink);
+    color: #fff;
+    padding: 10px 12px;
+    margin-top: 9px;
+    font-size: 11px;
+    line-height: 1.55;
+  }
+  .ts-total b { color: #fff; }
+  .ts-total .big { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+  .ts-caption {
+    margin: 10px 0 0;
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--ink);
+    background: var(--paper);
+    border-left: 3px solid var(--line);
+    padding: 8px 10px;
+  }
+
+  .ts-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  /* A disabled button swallows hover in some browsers, so the tooltip lives on a wrapper. */
+  .tip-wrap { display: inline-block; cursor: not-allowed; }
+  .btn-off {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    background: var(--hair);
+    color: var(--nr-ink);
+    border: 1px dashed var(--nr-ink);
+    padding: 7px 12px;
+    pointer-events: none;
+  }
+  .wired-note { font-size: 10.5px; color: var(--ink); }
+
+  /* ---------- Piece 2: agent card ---------- */
+  .agent-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .agent-tabs .chip[aria-selected="true"] { background: var(--ink); color: #fff; }
+  .agent-tabs .chip[aria-selected="true"]:hover { background: var(--ink); }
+
+  /* Looks like the real modal backdrop but sits in the page flow, so reviewers can scroll past it. */
+  .fake-backdrop { background: rgba(11, 11, 10, 0.58); padding: 26px 20px; display: flex; justify-content: center; }
+  .fake-backdrop .agent-modal-card { max-height: none; }
+
+  .src-row { background: #fff; border: 1px solid var(--line); }
+  .src-hint { font-size: 10.5px; color: var(--ink); margin: 0 0 8px; }
+  .src-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .src-chip {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--card);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    padding: 7px 11px;
+    cursor: pointer;
+    text-align: left;
+    box-shadow: 3px 3px 0 var(--ink);
+  }
+  .src-chip b { display: block; font-size: 11.5px; letter-spacing: 0.04em; }
+  .src-chip small { font-size: 10px; color: var(--ink); }
+  .src-chip:hover, .src-chip[aria-expanded="true"] { background: var(--lime); }
+  .src-chip:focus-visible { outline: 2px solid var(--pink); outline-offset: 2px; }
+
+  .pop {
+    position: fixed;
+    z-index: 120;
+    width: min(440px, calc(100vw - 24px));
+    background: #fff;
+    color: var(--ink);
+    border: 2px solid var(--line);
+    box-shadow: 4px 4px 0 var(--ink);
+    padding: 12px 14px 10px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .pop[hidden] { display: none; }
+  .pop-hd { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; border-bottom: 1px solid var(--line); padding-bottom: 6px; margin-bottom: 8px; }
+  .pop-hd h3 { font-family: var(--display); font-size: 15px; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
+  .pop-x { background: none; border: 1px solid var(--line); color: var(--ink); font-size: 10px; padding: 2px 7px; cursor: pointer; flex: none; }
+  .pop-x:hover { background: var(--lime); }
+  .pop .lbl { font-size: 9.5px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink); margin: 10px 0 4px; }
+  .pop .val { background: var(--paper); border: 1px solid var(--hair); padding: 5px 8px; overflow-wrap: anywhere; }
+  .pop .src { font-size: 10px; color: var(--muted); margin: 10px 0 0; border-top: 1px solid var(--hair); padding-top: 6px; }
+  .pop .src code { font-size: 10px; }
+
+  .topic-list { list-style: none; margin: 0; padding: 0; }
+  .topic-list li { padding: 6px 0; border-bottom: 1px solid var(--hair); }
+  .topic-list li:last-child { border-bottom: 0; }
+  .topic-list .t { font-weight: 700; display: block; }
+
+  .cat-list { list-style: none; margin: 0; padding: 0; }
+  .cat-list li { padding: 7px 0; border-bottom: 1px solid var(--hair); }
+  .cat-list li:last-child { border-bottom: 0; }
+  .cat-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cat-top .t { font-weight: 700; overflow-wrap: anywhere; }
+  .cat-why { color: var(--ink); font-size: 10.5px; }
+  .cat-use { color: var(--muted); font-size: 10px; }
+
+  .verdict { font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; padding: 2px 6px; border: 1px solid; white-space: nowrap; }
+  .v-allow { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--good); }
+  .v-owner { background: var(--amb-bg); color: var(--amb-ink); border-color: var(--amb-line); }
+  .v-refuse { background: var(--no-bg); color: var(--no-ink); border-color: var(--bad); }
+  .v-nr { background: var(--rail); color: var(--nr-ink); border-color: var(--nr-ink); border-style: dashed; }
+
+  .advisory { margin-top: 10px; background: var(--warn-bg); border: 1px solid var(--amb-line); color: var(--ink); padding: 7px 9px; font-size: 10.5px; }
+
+  .gq { border: 1px solid var(--hair); background: var(--paper); padding: 8px 10px; margin-bottom: 8px; }
+  .gq .t { font-weight: 700; overflow-wrap: anywhere; }
+  .gq .q { margin: 2px 0 6px; }
+  .gq dl { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; font-size: 10.5px; }
+  .gq dt { color: var(--ink); font-weight: 700; }
+  .gq dd { margin: 0; overflow-wrap: anywhere; }
+  .gq dd.nr { color: var(--nr-ink); font-style: italic; }
+
+  .pill-row .tag { color: var(--ink); border-color: var(--hair); background: #fff; }
+</style>
+</head>
+<body>
+
+<div class="mock-banner" role="note">
+  STATIC MOCK for review. Numbers are a one-time snapshot from 2026-09-24, not live.
+  <span>Nothing on this page talks to the backend.</span>
+</div>
+
+<div class="page">
+  <header class="mast">
+    <span class="brand">CCB Fraud Desk</span>
+    <span class="tagline">Proposed UI · two pieces for approval</span>
+  </header>
+
+  <p class="intro">
+    Two proposed additions. <b>Piece 1</b> shows how much of each channel agent's Memory Bank input
+    was about its own topics, with and without the topic filter. <b>Piece 2</b> adds three hover cards
+    to the agent card, showing where each agent's inputs come from.
+  </p>
+
+  <!-- ================= PIECE 1 ================= -->
+  <div class="sec-head">
+    <h2>Piece 1 · Topic scoping</h2>
+    <span class="where">Sits in: Memory A/B column, right under <code>#abComparison</code></span>
+  </div>
+
+  <div class="deck">
+    <div class="col">
+      <div class="colhead"><h2>Memory A/B</h2><span class="n">03 / off vs on</span></div>
+      <div class="placeholder">Existing off-vs-on table (<code>#abComparison</code>) stays here, unchanged.</div>
+
+      <section class="ts-panel" aria-labelledby="tsTitle">
+        <div class="colhead" style="margin-bottom:10px;">
+          <h2 id="tsTitle" style="font-size:17px;">Topic scoping</h2>
+          <span class="n">5 channel agents</span>
+        </div>
+        <p class="ts-meta">
+          Customer <b>CUST00001</b> · 12 memories in the bank · top 5 per agent ·
+          same query on both sides · snapshot 2026-09-24
+        </p>
+        <div class="ts-legend" aria-hidden="true">
+          <span><i class="sw-own"></i>own topics</span>
+          <span><i class="sw-other"></i>other channels' topics</span>
+        </div>
+
+        <div id="tsRows"></div>
+
+        <div class="ts-total">
+          <div>All five agents, memories on their own topics:</div>
+          <div class="big">15/25 (60%) → 24/24 (100%)</div>
+          <div>Filter adds about <b>+88 ms</b> per call on average.</div>
+        </div>
+
+        <p class="ts-caption">
+          <b>How to read this.</b> The filter only lets through memories tagged with the agent's own
+          topics, so 100% after is guaranteed by design. That part is not a result. The useful part is
+          the "before" side: without the filter, 10 of 25 memories (40%) the agents read came from
+          other channels' topics. This does <b>not</b> show that answers got better yet. We haven't
+          checked answer quality. Timings are one run per side, so treat them as rough.
+        </p>
+
+        <div class="ts-actions">
+          <span class="tip-wrap" title="wired after approval">
+            <button type="button" class="btn-off" disabled aria-describedby="abNote">▶ Run live A/B</button>
+          </span>
+          <span class="wired-note" id="abNote">Disabled in the mock: wired after approval.</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <div class="colhead"><h2>Event stream</h2><span class="n">04 / 5 live channels</span></div>
+      <div class="placeholder">Unchanged. Shown only so the Memory A/B column has its real width.</div>
+    </div>
+    <div class="col">
+      <div class="colhead"><h2>Governance</h2><span class="n">05 / catalog &amp; audit</span></div>
+      <div class="placeholder">Unchanged. Shown only so the Memory A/B column has its real width.</div>
+    </div>
+  </div>
+
+  <!-- ================= PIECE 2 ================= -->
+  <div class="sec-head">
+    <h2>Piece 2 · Agent card with three source cards</h2>
+    <span class="where">Sits in: <code>#agentCardModal</code>, opened by clicking an agent in the pipeline</span>
+  </div>
+
+  <div class="agent-tabs" role="tablist" aria-label="Pick an agent to preview">
+    <button type="button" class="chip" role="tab" id="tab-fraud" data-agent="fraud" aria-selected="true">01 · fraud_monitoring_agent</button>
+    <button type="button" class="chip" role="tab" id="tab-web" data-agent="web" aria-selected="false">04 · web_portal_agent</button>
+  </div>
+
+  <div class="fake-backdrop">
+    <div class="agent-modal-card" role="tabpanel" id="agentPanel" aria-labelledby="tab-fraud">
+      <div class="agent-modal-hd">
+        <div>
+          <div class="eyebrow" style="color:var(--ink);">ADK LlmAgent · google.adk.runners.InMemoryRunner · gemini-2.5-flash</div>
+          <h2 id="cardTitle"></h2>
+          <p class="rd" id="cardRole" style="margin:4px 0 0;font-weight:700;font-size:11px;"></p>
+        </div>
+        <button type="button" class="chip" disabled title="mock only">Close ×</button>
+      </div>
+
+      <div class="agent-modal-actions">
+        <span class="tip-wrap" title="mock only"><button type="button" class="btn-off" disabled>▶ Run Agent Live</button></span>
+        <span class="tag ok">READY · InMemoryRunner</span>
+      </div>
+
+      <p class="agent-modal-desc" id="cardDesc"></p>
+
+      <div class="agent-modal-grid">
+        <div class="agent-spec-row src-row">
+          <div class="spec-label">Where this agent's inputs come from <span class="tag" style="color:var(--ink);border-color:var(--line);margin-left:6px;">new</span></div>
+          <p class="src-hint">Hover, tap, or tab to a card to see details. Esc closes it.</p>
+          <div class="src-chips" id="srcChips"></div>
+        </div>
+        <div class="agent-spec-row">
+          <div class="spec-label">🔧 Bound ADK Tools <span id="toolCount"></span></div>
+          <div class="spec-pills pill-row" id="cardTools"></div>
+        </div>
+      </div>
+
+      <div class="agent-modal-runner">
+        <div class="spec-label" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>⚡ Live ADK <code>InMemoryRunner</code> Execution</span>
+          <small>Existing box, unchanged</small>
+        </div>
+        <div class="runner-out">Idle. Running the agent is not wired in this mock.</div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="foot">
+    <span>Mock file: <code>frontend/static/mock/topic_scoping_mock.html</code></span>
+    <span>Snapshot 2026-09-24 · not live</span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+const NR = "n/r (wired after approval)";
+
+const TOPIC_TEXT = {
+  TRAVEL_STATUS: "Where the customer is or will be, and between which dates, when it changes how their card should behave.",
+  CARD_LIFECYCLE: "Which card is live right now, what replaced what, and why a card was frozen, closed or reissued.",
+  SPENDING_CONTEXT: "A life event or known reason that explains an unusual run of spending, with the window it applies to.",
+  DISPUTE_HISTORY: "Disputes and fraud claims the customer has raised, including the merchant, the amount, the outcome and whether provisional credit was given.",
+  AGENT_COMMITMENTS: "Things the bank promised this customer on a previous contact, with who promised it, by when, and whether it has been done.",
+};
+
+// Snapshot from 2026-09-24. "before"/"after" are [own-topic hits, results returned].
+const SCOPING = [
+  { ix: "01", ch: "fraud", topics: ["CARD_LIFECYCLE", "TRAVEL_STATUS", "SPENDING_CONTEXT"], before: [3, 5], after: [5, 5], ms: 157,
+    dropped: [
+      ["I raised a dispute for unauthorized charges in Lisbon...", "DISPUTE_HISTORY"],
+      ["I added my card ending in 7702 to Google Pay...", "DEVICE_WALLET_INVENTORY"],
+    ] },
+  { ix: "02", ch: "IVR", topics: ["CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "TRAVEL_STATUS"], before: [3, 5], after: [5, 5], ms: 58, dropped: null },
+  { ix: "03", ch: "mobile", topics: ["DEVICE_WALLET_INVENTORY", "CARD_LIFECYCLE"], before: [4, 5], after: [5, 5], ms: 84, dropped: null },
+  { ix: "04", ch: "web", topics: ["DISPUTE_HISTORY", "AGENT_COMMITMENTS"], before: [2, 5], after: [4, 4], ms: 9,
+    note: "Returned 4, not 5: only 4 of the 12 memories carry web's topics.",
+    dropped: [
+      ["My bag and wallet were stolen while I was in Lisbon...", "CARD_LIFECYCLE"],
+      ["I prefer to receive notifications via SMS...", "CONTACT_PREFERENCE"],
+      ["My bag, wallet, personal mobile phone, and card ending in 4417 were stolen...", "CARD_LIFECYCLE"],
+    ] },
+  { ix: "05", ch: "branch", topics: ["CONTACT_PREFERENCE", "AGENT_COMMITMENTS", "CARD_LIFECYCLE"], before: [3, 5], after: [5, 5], ms: 130, dropped: null },
+];
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function segBar(label, [own, total]) {
+  const other = total - own;
+  // Width is out of 5 so the web row's 4/4 reads as a shorter bar, not a full one.
+  const unit = 100 / 5;
+  const parts = [`<b class="own" style="width:${own * unit}%"></b>`];
+  if (other) parts.push(`<b class="other" style="width:${other * unit}%"></b>`);
+  const aria = `${label}: ${own} of ${total} on own topics` + (other ? `, ${other} from other channels' topics` : "");
+  return `<div class="bar"><span class="lbl">${label}</span>
+    <span class="seg" role="img" aria-label="${esc(aria)}">${parts.join("")}</span>
+    <span class="val">${own}/${total}</span></div>`;
+}
+
+function renderScoping() {
+  document.getElementById("tsRows").innerHTML = SCOPING.map((r) => {
+    const droppedCount = r.before[1] - r.before[0];
+    const list = r.dropped
+      ? r.dropped.map(([text, topic]) => `<li>"${esc(text)}" <span class="tag">${esc(topic)}</span></li>`).join("")
+      : `<li class="none">The text of these wasn't kept in this snapshot. The live version will list them.</li>`;
+    return `<div class="item scope-row">
+      <div class="item-top">
+        <span class="nm">${r.ix} · ${esc(r.ch)}</span>
+        <span class="tag ms-tag" title="extra time with the filter on">+${r.ms} ms</span>
+      </div>
+      <div class="topics">${r.topics.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</div>
+      ${segBar("query only", r.before)}
+      ${segBar("with filter", r.after)}
+      ${r.note ? `<p class="row-note">${esc(r.note)}</p>` : ""}
+      <details>
+        <summary>${droppedCount} ${droppedCount === 1 ? "memory" : "memories"} dropped by the filter</summary>
+        <ul class="dropped">${list}</ul>
+      </details>
+    </div>`;
+  }).join("");
+}
+
+const CATALOG = {
+  pan_full: { name: "cards.pan_full", v: "REFUSE", why: "sensitivity-class = RESTRICTED" },
+  pan_masked: { name: "cards.pan_masked", v: "ALLOW_TO_OWNER_ONLY", why: "sensitivity-class = CONFIDENTIAL" },
+  deprecated: { name: "authorizations_deprecated_v1", v: "REFUSE", why: "lifecycle-status: deprecated" },
+  disputes: { name: "disputes", v: "ALLOW", why: "lifecycle-status.status = ACTIVE" },
+  c360: { name: "v_customer_360", v: "ALLOW", why: "lifecycle-status.status = ACTIVE" },
+  auths: { name: "authorizations", v: "NR", why: "No verdict for this table in the snapshot logs" },
+};
+
+const AGENTS = {
+  fraud: {
+    title: "01 · fraud_monitoring_agent",
+    role: "Fraud Velocity & Geo-Anomaly Specialist (CHANNEL_PRODUCER · FRAUD_OPS_OUTBOUND)",
+    desc: "Watches for card use that doesn't fit: spending too fast, or in two places too far apart. It can lock the card or escalate.",
+    topics: ["CARD_LIFECYCLE", "TRAVEL_STATUS", "SPENDING_CONTEXT"],
+    query: "fraud velocity alert, concurrent logins from different cities, card lock or restriction",
+    snapshot: "3/5 on own topics without the filter, 5/5 with it",
+    catalog: [
+      { ...CATALOG.auths, use: "read by golden 03 and 04" },
+      { ...CATALOG.deprecated, use: "found next to authorizations during catalog lookup" },
+      { ...CATALOG.pan_full, use: "checked by golden 03 and 04" },
+    ],
+    golden: [
+      { id: "03", name: "suspicious_activity_on_card_window", q: "Between these two moments, what on this card is worth a second look, and why?", tables: "authorizations, cards, merchants" },
+      { id: "04", name: "geo_impossible_travel", q: "Was this card used in two places too far apart to travel between in the time available?", tables: "authorizations, merchants" },
+    ],
+    goldenNote: "Only these two are bound as tools. The current card lists 02, 03, 04, 05, 06 and 12, which comes from a static fallback list.",
+    tools: ["query_fraud_velocity_alerts", "golden_03_suspicious_activity_on_card_window", "golden_04_geo_impossible_travel", "execute_fraud_card_control_or_escalate"],
+  },
+  web: {
+    title: "04 · web_portal_agent",
+    role: "Online Banking & Statutory Dispute Policy Specialist (CHANNEL_PRODUCER · WEB_PORTAL)",
+    desc: "Handles online banking: disputes the customer filed on the web, and promises the bank made to them before.",
+    topics: ["DISPUTE_HISTORY", "AGENT_COMMITMENTS"],
+    query: "online banking web session, browser login, dispute filed, card controls toggled",
+    snapshot: "2/5 on own topics without the filter, 4/4 with it",
+    catalog: [
+      { ...CATALOG.disputes, use: "read by golden 07" },
+      { ...CATALOG.c360, use: "seen in logs for this agent; not in golden 07's table list" },
+      { ...CATALOG.pan_masked, use: "checked by golden 07" },
+      { ...CATALOG.pan_full, use: "checked by golden 07" },
+    ],
+    golden: [
+      { id: "07", name: "open_disputes_for_customer", q: "What disputes does this customer already have running?", tables: "disputes, cards, accounts" },
+    ],
+    goldenNote: "Only golden 07 is bound as a tool. The current card lists 07, 08 and 09, which comes from a static fallback list.",
+    tools: ["query_web_portal_activity", "golden_07_open_disputes_for_customer"],
+  },
+};
+
+const VERDICT = {
+  ALLOW: ["v-allow", "✓ ALLOW"],
+  ALLOW_TO_OWNER_ONLY: ["v-owner", "◐ ALLOW_TO_OWNER_ONLY"],
+  REFUSE: ["v-refuse", "✕ REFUSE"],
+  NR: ["v-nr", "n/r · not recorded"],
+};
+
+function popHead(title, id) {
+  return `<div class="pop-hd"><h3 id="${id}-h">${esc(title)}</h3>
+    <button type="button" class="pop-x" data-close aria-label="Close ${esc(title)} card">Close ×</button></div>`;
+}
+
+function memoryPop(a) {
+  return popHead("Memory Bank", "pop-mem") + `
+    <div class="lbl" style="margin-top:0;">Topics this agent reads</div>
+    <ul class="topic-list">${a.topics.map((t) => `<li><span class="t">${t}</span>${esc(TOPIC_TEXT[t])}</li>`).join("")}</ul>
+    <div class="lbl">Fixed query it sends</div>
+    <div class="val">${esc(a.query)}</div>
+    <div class="lbl">Scope</div>
+    <div class="val"><code>customer_id = CUST00001</code></div>
+    <div class="lbl">Snapshot result</div>
+    <div class="val">${esc(a.snapshot)}</div>
+    <p class="src">source: live engine config + <code>AGENT_MEMORY_TOPICS</code></p>`;
+}
+
+function catalogPop(a) {
+  const rows = a.catalog.map((c) => {
+    const [cls, label] = VERDICT[c.v];
+    return `<li><div class="cat-top"><span class="t">${esc(c.name)}</span><span class="verdict ${cls}">${label}</span></div>
+      <div class="cat-why">decided by: ${esc(c.why)}</div>
+      <div class="cat-use">${esc(c.use)}</div></li>`;
+  }).join("");
+  return popHead("Knowledge Catalog", "pop-cat") + `
+    <div class="lbl" style="margin-top:0;">Tables and columns its golden queries touch</div>
+    <ul class="cat-list">${rows}</ul>
+    <div class="advisory">On the golden-query path the catalog is advisory today: a refusal is recorded and the query still runs.</div>
+    <p class="src">source: knowledge_catalog decisions (verdicts copied from logs for this snapshot)</p>`;
+}
+
+function bigqueryPop(a) {
+  const cards = a.golden.map((g) => `<div class="gq">
+      <div class="t">golden ${g.id} · ${esc(g.name)}</div>
+      <p class="q">${esc(g.q)}</p>
+      <dl>
+        <dt>reads</dt><dd>${esc(g.tables)}</dd>
+        <dt>last run</dt><dd class="nr">${NR}</dd>
+        <dt>rows</dt><dd class="nr">${NR}</dd>
+        <dt>job id</dt><dd class="nr">${NR}</dd>
+      </dl></div>`).join("");
+  return popHead("BigQuery", "pop-bq") + `
+    <div class="lbl" style="margin-top:0;">Golden queries this agent can call</div>
+    ${cards}
+    <p class="row-note">${esc(a.goldenNote)}</p>
+    <p class="src">source: agent's bound tools + golden query contracts; run data from <code>bigquery.query</code> spans once wired</p>`;
+}
+
+function chipSummary(a) {
+  const refused = a.catalog.filter((c) => c.v === "REFUSE").length;
+  return {
+    mem: `${a.topics.length} topics`,
+    cat: `${a.catalog.length} checked · ${refused} refused`,
+    bq: `${a.golden.length} ${a.golden.length === 1 ? "query" : "queries"}`,
+  };
+}
+
+function renderAgent(key) {
+  const a = AGENTS[key];
+  closePop(false);
+  document.getElementById("cardTitle").textContent = a.title;
+  document.getElementById("cardRole").textContent = a.role;
+  document.getElementById("cardDesc").textContent = a.desc;
+  document.getElementById("toolCount").textContent = `(${a.tools.length})`;
+  document.getElementById("cardTools").innerHTML = a.tools.map((t) => `<span class="tag">${esc(t)}</span>`).join("");
+  document.getElementById("agentPanel").setAttribute("aria-labelledby", `tab-${key}`);
+
+  const s = chipSummary(a);
+  const defs = [
+    ["mem", "Memory Bank", s.mem, memoryPop(a)],
+    ["cat", "Knowledge Catalog", s.cat, catalogPop(a)],
+    ["bq", "BigQuery", s.bq, bigqueryPop(a)],
+  ];
+  // Each popover sits right after its chip in the DOM, so Tab moves chip -> its card -> next chip.
+  document.getElementById("srcChips").innerHTML = defs.map(([id, name, sub, body]) => `
+    <span class="src-wrap" data-pop="${id}">
+      <button type="button" class="src-chip" id="chip-${id}" aria-expanded="false" aria-controls="pop-${id}">
+        <b>${name}</b><small>${esc(sub)}</small>
+      </button>
+      <div class="pop" id="pop-${id}" role="dialog" aria-labelledby="pop-${id}-h" hidden>${body}</div>
+    </span>`).join("");
+  wirePops();
+}
+
+// ---------- popover behaviour ----------
+let openId = null;
+let pinned = false;
+let closeTimer = null;
+
+function placePop(chip, pop) {
+  const m = 12;
+  const vw = document.documentElement.clientWidth;
+  const vh = window.innerHeight;
+  pop.style.maxHeight = "";
+  const r = chip.getBoundingClientRect();
+  const w = pop.offsetWidth;
+  // Clamp horizontally so the card never runs off the right edge.
+  const left = Math.max(m, Math.min(r.left, vw - m - w));
+  let h = pop.offsetHeight;
+  const below = vh - r.bottom - 8 - m;
+  const above = r.top - 8 - m;
+  let top;
+  if (h <= below) top = r.bottom + 8;
+  else if (h <= above) top = r.top - 8 - h;
+  else if (below >= above) { pop.style.maxHeight = `${below}px`; top = r.bottom + 8; }
+  else { pop.style.maxHeight = `${above}px`; h = above; top = r.top - 8 - h; }
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function openPop(id, pin) {
+  clearTimeout(closeTimer);
+  const keepPinned = pinned && openId === id;
+  if (openId && openId !== id) closePop(false);
+  const chip = document.getElementById(`chip-${id}`);
+  const pop = document.getElementById(`pop-${id}`);
+  pop.hidden = false;
+  chip.setAttribute("aria-expanded", "true");
+  openId = id;
+  pinned = keepPinned || !!pin;
+  placePop(chip, pop);
+}
+
+function closePop(returnFocus) {
+  clearTimeout(closeTimer);
+  if (!openId) return;
+  const chip = document.getElementById(`chip-${openId}`);
+  const pop = document.getElementById(`pop-${openId}`);
+  if (pop) pop.hidden = true;
+  if (chip) {
+    chip.setAttribute("aria-expanded", "false");
+    if (returnFocus) chip.focus();
+  }
+  openId = null;
+  pinned = false;
+}
+
+function softClose() {
+  if (pinned) return;
+  clearTimeout(closeTimer);
+  closeTimer = setTimeout(() => closePop(false), 180);
+}
+
+function wirePops() {
+  document.querySelectorAll(".src-wrap").forEach((wrap) => {
+    const id = wrap.dataset.pop;
+    const chip = wrap.querySelector(".src-chip");
+    wrap.addEventListener("mouseenter", () => openPop(id, false));
+    wrap.addEventListener("mouseleave", softClose);
+    chip.addEventListener("click", () => {
+      if (openId === id && pinned) closePop(false);
+      else openPop(id, true);
+    });
+    chip.addEventListener("focus", () => { if (openId !== id) openPop(id, false); });
+    wrap.addEventListener("focusout", (e) => {
+      if (!wrap.contains(e.relatedTarget)) { pinned = false; softClose(); }
+    });
+    wrap.querySelector("[data-close]").addEventListener("click", () => closePop(true));
+  });
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && openId) closePop(true);
+});
+document.addEventListener("click", (e) => {
+  if (openId && !e.target.closest(".src-wrap")) closePop(false);
+});
+const reposition = () => {
+  if (!openId) return;
+  placePop(document.getElementById(`chip-${openId}`), document.getElementById(`pop-${openId}`));
+};
+window.addEventListener("resize", reposition);
+window.addEventListener("scroll", reposition, true);
+
+// ---------- agent tabs ----------
+document.querySelectorAll(".agent-tabs [role=tab]").forEach((tab) => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".agent-tabs [role=tab]").forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+    renderAgent(tab.dataset.agent);
+  });
+});
+
+renderScoping();
+renderAgent("fraud");
+</script>
+</body>
+</html>
